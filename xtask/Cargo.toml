@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+description = "Repository-local verification tasks"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+

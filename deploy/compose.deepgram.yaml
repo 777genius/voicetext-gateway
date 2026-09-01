@@ -1,0 +1,11 @@
+services:
+  gateway:
+    environment:
+      VOICETEXT_ELEVENLABS_API_KEY_FILE: !reset null
+    secrets: !override
+      - gateway_token
+      - postgres_url
+      - deepgram_api_key
+
+secrets:
+  elevenlabs_api_key: !reset null

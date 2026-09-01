@@ -1,0 +1,22 @@
+# boundary|root|allowed first-party boundaries
+speech.domain|crates/voicetext-speech/src/domain|
+speech.application|crates/voicetext-speech/src/application|speech.domain
+speech.entrypoint|crates/voicetext-speech/src/lib.rs|speech.domain,speech.application
+providers.deepgram|crates/voicetext-providers/src/deepgram|speech.application,speech.domain
+providers.elevenlabs|crates/voicetext-providers/src/elevenlabs|speech.application,speech.domain
+providers.entrypoint|crates/voicetext-providers/src/lib.rs|providers.deepgram,providers.elevenlabs
+audio.discord-opus|crates/voicetext-audio/src/discord_opus.rs|
+audio.ogg-opus|crates/voicetext-audio/src/ogg_opus.rs|
+audio.ogg-opus-tests|crates/voicetext-audio/src/ogg_opus_tests.rs|audio.ogg-opus
+audio.entrypoint|crates/voicetext-audio/src/lib.rs|audio.discord-opus,audio.ogg-opus
+gateway.contracts|crates/voicetext-gateway/src/contracts|
+gateway.auth|crates/voicetext-gateway/src/auth.rs|
+gateway.config|crates/voicetext-gateway/src/config.rs|
+gateway.identity|crates/voicetext-gateway/src/identity.rs|speech.domain
+gateway.profiles|crates/voicetext-gateway/src/profiles.rs|gateway.contracts,speech.application
+gateway.secret|crates/voicetext-gateway/src/secret.rs|
+gateway.server|crates/voicetext-gateway/src/server|audio.discord-opus,audio.ogg-opus,gateway.auth,gateway.contracts,gateway.identity,gateway.profiles,gateway.secret,gateway.storage,speech.application,speech.domain
+gateway.composition|crates/voicetext-gateway/src/main.rs|gateway.config,gateway.contracts,gateway.profiles,gateway.secret,gateway.server,gateway.storage,providers.deepgram,providers.elevenlabs
+gateway.storage|crates/voicetext-gateway/src/storage|speech.application,speech.domain
+gateway.entrypoint|crates/voicetext-gateway/src/lib.rs|gateway.auth,gateway.config,gateway.contracts,gateway.identity,gateway.profiles,gateway.secret,gateway.server,gateway.storage
+tooling.xtask|xtask/src|

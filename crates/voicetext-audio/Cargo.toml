@@ -1,0 +1,15 @@
+[package]
+name = "voicetext-audio"
+description = "Bounded audio codec adapters for VoiceText live transcription"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ogg.workspace = true
+opus.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,83 @@
+name: voicetext-gateway
+
+services:
+  postgres:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    init: true
+    environment:
+      POSTGRES_DB: voicetext
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_USER: voicetext
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicetext -d voicetext"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+    pids_limit: 256
+
+  gateway:
+    image: voicetext-gateway:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      VOICETEXT_BEARER_TOKEN_FILE: /run/secrets/gateway_token
+      VOICETEXT_DEEPGRAM_API_KEY_FILE: /run/secrets/deepgram_api_key
+      VOICETEXT_ELEVENLABS_API_KEY_FILE: /run/secrets/elevenlabs_api_key
+      VOICETEXT_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      VOICETEXT_SPOOL_DIR: /var/lib/voicetext/spool
+    secrets:
+      - gateway_token
+      - postgres_url
+      - deepgram_api_key
+      - elevenlabs_api_key
+    volumes:
+      - gateway-spool:/var/lib/voicetext
+    ports:
+      - "127.0.0.1:${VOICETEXT_HOST_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks:
+      - backend
+      - egress
+    pids_limit: 256
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  postgres_url:
+    file: ./secrets/postgres_url
+  gateway_token:
+    file: ./secrets/gateway_token
+  deepgram_api_key:
+    file: ./secrets/deepgram_api_key
+  elevenlabs_api_key:
+    file: ./secrets/elevenlabs_api_key
+
+volumes:
+  postgres-data:
+  gateway-spool:
+
+networks:
+  backend:
+    internal: true
+  egress:

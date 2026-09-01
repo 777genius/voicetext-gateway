@@ -1,0 +1,37 @@
+[package]
+name = "voicetext-gateway"
+description = "VoiceText HTTP and WebSocket boundary contracts"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+uuid.workspace = true
+voicetext-audio.workspace = true
+voicetext-providers.workspace = true
+voicetext-speech.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+ogg.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

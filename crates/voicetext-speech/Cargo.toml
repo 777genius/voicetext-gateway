@@ -1,0 +1,11 @@
+[package]
+name = "voicetext-speech"
+description = "Provider-neutral batch and live speech-to-text domain and application ports"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
