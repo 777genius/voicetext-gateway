@@ -10,6 +10,8 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/777genius/voicetext-gateway"
 rust-version = "1.94"
 version = "0.1.0"
 

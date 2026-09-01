@@ -10,4 +10,3 @@ acknowledgement. An adapter that cannot prove a capability must not advertise it
 
 No fork is assumed. If an upstream library does not expose a required terminal event, the adapter
 remains experimental until a narrow wrapper or accepted upstream change passes conformance.
-

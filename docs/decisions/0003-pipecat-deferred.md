@@ -11,4 +11,3 @@ A future Pipecat bridge may implement the public batch/live application ports on
 the same conformance suite for language, keyterms, timestamps, raw Discord Opus normalization,
 partial/final events, provider identity, and explicit finalize completion. Python and Pipecat types
 cannot enter domain or application code.
-

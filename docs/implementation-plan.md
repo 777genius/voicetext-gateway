@@ -20,4 +20,3 @@
    and the isolated private-guild Discord campaign.
 10. Publish the approved license, crates, image, SBOM, compatibility documentation, migration and
     rollback runbooks, language-capability wording, and future Pipecat adapter guide.
-

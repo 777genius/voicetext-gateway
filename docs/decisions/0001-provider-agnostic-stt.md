@@ -16,4 +16,3 @@ SaaS user, license, quota, billing, or payment model.
 
 Discord Meeting Assistant can self-host the gateway with user-owned provider credentials. The
 private SaaS can reuse the same provider mechanics without becoming an OSS dependency.
-

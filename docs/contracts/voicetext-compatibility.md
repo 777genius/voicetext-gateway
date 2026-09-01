@@ -27,4 +27,3 @@ not sufficient.
 
 Legacy protocol v1, base64 audio, public-user auth, quota messages, and live resume are not part of
 the Discord compatibility surface for V1.
-

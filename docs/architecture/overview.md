@@ -29,4 +29,3 @@ its own users, licensing, quota, billing, and PostgreSQL composition private.
 - Live transcription is a bounded, best-effort projection and cannot replace batch evidence.
 - Provider failure never deletes or invalidates the source recording.
 - A bound provider/model identity is immutable for one batch job or live session.
-

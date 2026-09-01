@@ -176,6 +176,6 @@ product stay outside this STT bounded context.
 
 ## Publication and license
 
-The intended OSS license is `MIT OR Apache-2.0`. Publishing remains disabled until the repository
-owner confirms the license and the provenance, secret, dependency, SBOM and real-canary gates pass.
-The private SaaS Git history is never imported.
+The source is licensed under Apache-2.0. Crate and container publication remains disabled until the
+provenance, secret, dependency, SBOM and real-canary gates pass. The private SaaS Git history is
+never imported.

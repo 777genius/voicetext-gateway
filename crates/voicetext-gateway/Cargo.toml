@@ -2,7 +2,9 @@
 name = "voicetext-gateway"
 description = "VoiceText HTTP and WebSocket boundary contracts"
 edition.workspace = true
+license.workspace = true
 publish = false
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

@@ -16,4 +16,3 @@ changing domain or provider adapters.
 The Discord deployment reuses its existing PostgreSQL service. A standalone Compose deployment
 starts PostgreSQL beside the gateway. Gateway V1 remains single-replica for live sessions; batch
 persistence does not imply live takeover support.
-

@@ -2,7 +2,9 @@
 name = "voicetext-providers"
 description = "Deepgram and ElevenLabs speech-to-text adapters"
 edition.workspace = true
+license.workspace = true
 publish = false
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 

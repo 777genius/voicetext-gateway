@@ -28,4 +28,3 @@ profiles. No request can choose an unconfigured profile. There is no implicit pr
 
 `cargo xtask verify` classifies every production Rust file fail-closed and rejects forbidden
 directional imports or oversized files.
-

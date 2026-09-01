@@ -84,4 +84,3 @@ DISCORD_MEETING_ASSISTANT_ROOT=/absolute/path/to/discord-voice-bot \
 The production-composition gate from the testing strategy must pass before a release. A real paid
 canary uses a test-only key, synthetic audio, one planned effect, a fresh identity, and retained
 non-secret evidence. Provider documentation alone is not qualification evidence.
-
