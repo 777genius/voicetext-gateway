@@ -1,11 +1,20 @@
 services:
+  secret-init:
+    environment:
+      VOICETEXT_SECRET_FILES: gateway_token elevenlabs_api_key
+    volumes: !override
+      - type: bind
+        source: ./secrets/gateway_token
+        target: /source/gateway_token
+        read_only: true
+      - type: bind
+        source: ./secrets/elevenlabs_api_key
+        target: /source/elevenlabs_api_key
+        read_only: true
+      - type: volume
+        source: gateway-secrets
+        target: /secrets
+
   gateway:
     environment:
       VOICETEXT_DEEPGRAM_API_KEY_FILE: !reset null
-    secrets: !override
-      - gateway_token
-      - postgres_url
-      - elevenlabs_api_key
-
-secrets:
-  deepgram_api_key: !reset null

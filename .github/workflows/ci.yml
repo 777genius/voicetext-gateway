@@ -9,28 +9,86 @@ permissions:
   contents: read
 
 jobs:
-  rust:
+  exact-head:
     runs-on: ubuntu-latest
+    env:
+      SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      SOURCE_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
     steps:
-      - name: Check out source
+      - name: Check out the exact source head with history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
-      - name: Install native audio build tools
-        run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends build-essential cmake
-      - name: Install dependency policy checker
-        run: cargo install cargo-deny --version 0.20.2 --locked
-      - name: Verify architecture
-        run: cargo xtask verify
-      - name: Verify dependency policy
-        run: cargo deny check
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Lint
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features --locked
-      - name: Build documentation
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Assert exact head and clean tracked tree
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - name: Install pinned Rust toolchain and native build tools
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy,rustfmt
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends build-essential cmake
+
+      - name: Install pinned security and policy tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          go install github.com/gitleaks/gitleaks/v8@v8.28.0
+          go install github.com/anchore/syft/cmd/syft@v1.33.0
+
+      - name: Scan the tracked tree and complete history for secrets
+        run: |
+          tracked_tree="$RUNNER_TEMP/tracked-tree"
+          mkdir -p "$tracked_tree"
+          git archive "$SOURCE_SHA" | tar -x -C "$tracked_tree"
+          gitleaks dir --no-banner --redact "$tracked_tree"
+          gitleaks git --no-banner --redact --log-opts=--all .
+
+      - name: Verify Rust architecture and dependency policy
+        run: |
+          cargo xtask verify
+          cargo deny check
+
+      - name: Format, lint, test, and document
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps --locked
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-features --locked
+          cargo doc --workspace --no-deps --locked
+
+      - name: Validate Compose, Caddy semantics, secrets, and runtime hardening
+        run: |
+          docker pull caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+          scripts/verify-deploy.sh
+
+      - name: Check and build the pinned image from exact remote Git source
+        run: |
+          remote_context="https://github.com/${SOURCE_REPOSITORY}.git?ref=refs/heads/${SOURCE_REF}&checksum=${SOURCE_SHA}"
+          docker buildx build --check "$remote_context"
+          docker buildx build --target verification --progress plain "$remote_context"
+          docker buildx build --target runtime --load \
+            --tag "voicetext-gateway:${SOURCE_SHA}" "$remote_context"
+
+      - name: Test portable non-root secret custody
+        run: scripts/test-secret-custody.sh "voicetext-gateway:${SOURCE_SHA}"
+
+      - name: Assert image identity and generate a checked SBOM
+        run: |
+          image="voicetext-gateway:${SOURCE_SHA}"
+          docker image inspect "$image" | jq -e '
+            .[0].Config.User == "10001:10001" and
+            (.[0].Config.Env | map(select(test("(TOKEN|PASSWORD|API_KEY)="))) | length == 0) and
+            (.[0].Config.Healthcheck.Test | tostring | contains("VOICETEXT_HEALTHCHECK_URL"))
+          '
+          syft "$image" -o cyclonedx-json=voicetext-gateway.sbom.cdx.json
+          jq -e '
+            .bomFormat == "CycloneDX" and
+            (.specVersion | test("^[0-9]+\\.[0-9]+$")) and
+            (.components | type == "array" and length > 0)
+          ' voicetext-gateway.sbom.cdx.json

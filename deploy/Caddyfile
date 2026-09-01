@@ -9,8 +9,13 @@
 		/health/live \
 		/health/ready
 
-	reverse_proxy @voicetext_contract gateway:8080
-	respond 404
+	handle @voicetext_contract {
+		reverse_proxy @voicetext_contract gateway:8080
+	}
+
+	handle {
+		respond 404
+	}
 
 	log {
 		output stdout

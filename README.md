@@ -61,8 +61,9 @@ Requirements: Docker Compose, one Deepgram and/or ElevenLabs API key, and a mach
 storage.
 
 1. Copy `deploy/.env.example` to `deploy/.env`.
-2. Create the files listed in [`deploy/secrets/README.md`](deploy/secrets/README.md), then set their
-   permissions to `0600`.
+2. Create the files listed in [`deploy/secrets/README.md`](deploy/secrets/README.md), owned by the
+   non-root Compose user with mode `0600`. The supplied no-network init service copies provider keys
+   and the service token into a UID/GID `10001`, mode-`0400` volume for the gateway.
 3. Start the private HTTP/WS gateway:
 
    ```bash
@@ -81,8 +82,13 @@ storage.
 
    ```text
    VOICETEXT_WS_URL=wss://voice.example.com/api/v1/transcribe/stream
-   VOICETEXT_TOKEN=<same contents as deploy/secrets/gateway_token>
+   VOICETEXT_SERVICE_TOKEN_FILE=/run/secrets/voicetext_service_token
    ```
+
+   Mount the same `deploy/secrets/gateway_token` file at
+   `/run/secrets/voicetext_service_token:ro` in the bot container (using the documented init-volume
+   pattern or a narrowly granted ACL when container IDs differ). Do not copy the token into
+   `VOICETEXT_TOKEN` or any other environment variable.
 
 The batch client derives `https://voice.example.com/api/v1/transcribe/batch` from the WSS URL.
 
@@ -121,6 +127,12 @@ Operational settings include `VOICETEXT_BIND_ADDR`, `VOICETEXT_FINALIZE_TIMEOUT_
 `VOICETEXT_MAX_CONNECTIONS`, `VOICETEXT_MAX_UPLOAD_BYTES` and the four documented provider endpoint
 overrides. Provider endpoints require HTTPS/WSS. Plain HTTP/WS is accepted only with the explicit
 local-test flag `VOICETEXT_ALLOW_INSECURE_PROVIDER_ENDPOINTS=true`.
+
+The image probe uses `VOICETEXT_HEALTHCHECK_URL`, defaulting to
+`http://127.0.0.1:8080/health/ready`. If `VOICETEXT_BIND_ADDR` changes the internal bind address or
+port, set the probe URL to a matching container-reachable loopback address. Compose passes both
+settings from `deploy/.env`. The host-published port does not change the probe URL; a custom
+internal port also requires a matching port mapping and TLS-upstream overlay.
 
 Endpoints:
 
@@ -163,6 +175,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo doc --workspace --no-deps
 cargo deny check
+scripts/verify-deploy.sh
 ```
 
 The ignored PostgreSQL integration test requires a new disposable test database. Real provider and
@@ -177,5 +190,7 @@ product stay outside this STT bounded context.
 ## Publication and license
 
 The source is licensed under Apache-2.0. Crate and container publication remains disabled until the
-provenance, secret, dependency, SBOM and real-canary gates pass. The private SaaS Git history is
-never imported.
+[`release acceptance checklist`](docs/security/release-acceptance.md) proves provenance, license,
+secret, dependency, SBOM and real-canary gates at the exact release commit. Private SaaS adoption
+and rollback are separately deferred behind the evidence prerequisites in that checklist. The
+private SaaS Git history is never imported.

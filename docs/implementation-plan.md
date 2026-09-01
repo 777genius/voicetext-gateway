@@ -14,8 +14,9 @@
    restart, Opus, finalize, resource-bound, and security tests.
 7. Add standalone and Discord Meeting Assistant Docker Compose deployment with non-root containers
    and secret files.
-8. Adopt tagged public crates in the private VoiceText SaaS and remove duplicated provider
-   mechanics without publishing SaaS features.
+8. Only after the evidence-backed adoption prerequisites and rollback rehearsal in
+   `docs/security/release-acceptance.md`, pin tagged public crates and image digests in the private
+   VoiceText SaaS and remove duplicated provider mechanics without publishing SaaS features.
 9. Run exactly one bounded test-only canary for each provider/mode, both mixed-profile combinations,
    and the isolated private-guild Discord campaign.
 10. Publish the approved license, crates, image, SBOM, compatibility documentation, migration and

@@ -19,6 +19,11 @@ quality for any row. The canaries remain opt-in publication gates. Accordingly, 
 `en-US`, and `ru` below describe configured or accepted routing, not a universal language-quality
 claim.
 
+The exact mapping from each claim to checked-in conformance tests and the additional bounded canary
+record required for publication is maintained in the
+[`release acceptance checklist`](security/release-acceptance.md). Missing real-provider evidence
+means “unqualified,” never “implicitly supported.”
+
 ## Current native adapters
 
 | Provider / model | Mode and contract | Gateway input | Timestamps exposed | Partials and finals | Finalize | Keyterms | Diarization / speakers | Language selection and qualification |

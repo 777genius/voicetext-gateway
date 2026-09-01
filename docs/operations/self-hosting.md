@@ -22,6 +22,14 @@ The Discord process never receives a provider key. The gateway reads the machine
 URL, and provider keys from mounted files. Secret contents are not accepted through ordinary
 environment variables, command arguments, health responses, metrics, or logs.
 
+For portable non-root Compose custody, source secret files remain owned by the Compose user at mode
+`0600`. The no-network `secret-init` container installs only the service token and selected provider
+keys into a private named volume as UID/GID `10001` and mode `0400`, exits, and the gateway mounts
+the result read-only. Its temporary root and `CHOWN`/`DAC_OVERRIDE`/`FOWNER` capabilities are
+limited to this copy step; the long-running gateway has no capabilities. Direct bind mounts require a verified
+host/container UID mapping or a narrow POSIX ACL and are not the portable default. See
+[`deploy/secrets/README.md`](../../deploy/secrets/README.md).
+
 Batch input is authoritative derived evidence from the retained recording. The gateway durably
 spools accepted batch audio so recovery can finish a known-safe pre-egress job. A submitting job
 interrupted without a proven provider outcome becomes terminally unknown and is never submitted a
@@ -57,6 +65,13 @@ after measuring memory, provider concurrency, PostgreSQL capacity, and spool dis
 - `/health` projects the exact configured VoiceText profiles expected by Meeting Platform.
 - `/metrics` uses fixed-cardinality labels and contains no job, transcript, request, or secret
   values. The supplied TLS overlays keep it internal.
+
+The container probe reads `VOICETEXT_HEALTHCHECK_URL` and defaults to the internal
+`http://127.0.0.1:8080/health/ready` endpoint. When `VOICETEXT_BIND_ADDR` changes the internal
+address or port, change the probe URL in lockstep; Compose passes both from `deploy/.env`. A host
+port mapping is irrelevant inside the container. A custom internal port also needs a matching
+Compose port mapping and Caddy upstream overlay. Prefer a loopback probe address and never put
+credentials in the URL.
 
 Readiness does not perform a paid provider request. Qualify credentials with the explicit canary
 workflow and synthetic audio. Alert on readiness loss, connection saturation, provider failure
@@ -129,3 +144,7 @@ previous known-good image/profile after readiness is proven.
 
 For a clean shutdown, let the container receive `SIGTERM` and wait for its bounded graceful drain.
 After restart, inspect recovery metrics and outcome-unknown jobs before launching new paid canaries.
+
+Private SaaS adoption and rollback require the evidence bundle and stop/drain/restore criteria in
+the [`release acceptance checklist`](../security/release-acceptance.md). A green deterministic test
+suite alone does not authorize adoption.
