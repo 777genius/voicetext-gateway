@@ -29,7 +29,7 @@ fn recognition_request() -> LiveRecognitionRequest {
         },
         sample_rate_hz: 48_000,
         channels: CHANNELS,
-        keyterms: vec![" Craig ".into(), "release train".into()],
+        keyterms: vec!["Craig".into(), "release train".into()],
     }
 }
 fn audio_frame() -> LiveAudioFrame {
@@ -188,7 +188,7 @@ async fn rejected_handshake(status: StatusCode) -> RecognitionFailure {
             headers.insert("x-dg-request-id", HeaderValue::from_static("reject-1"));
             Err(response)
         };
-        let _expected_rejection = accept_hdr_async(stream, callback).await;
+        assert!(accept_hdr_async(stream, callback).await.is_err());
     });
     let endpoint = Url::parse(&format!("ws://{address}/v1/listen")).unwrap();
     let error = DeepgramLiveRecognizer::new("key", endpoint)
@@ -202,6 +202,7 @@ async fn rejected_handshake(status: StatusCode) -> RecognitionFailure {
 }
 #[tokio::test]
 async fn classifies_handshake_status_and_rejects_profile_before_connect() {
+    assert!(capabilities_match(&recognition_request()));
     let limited = rejected_handshake(StatusCode::TOO_MANY_REQUESTS).await;
     assert_eq!(
         limited.class(),
