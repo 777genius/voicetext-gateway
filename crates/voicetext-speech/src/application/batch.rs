@@ -1,6 +1,6 @@
 //! Runtime-independent orchestration for durable batch recognition.
 
-use std::fmt;
+use std::{fmt, num::NonZeroUsize};
 
 use crate::application::batch_models::apply_recognition_outcome;
 pub use crate::application::batch_models::{
@@ -10,12 +10,11 @@ pub use crate::application::batch_models::{
 use crate::application::ports::{
     BatchAudioHandle, BatchAudioSpool, BatchAudioStoreOutcome, BatchJobId, BatchJobInsertOutcome,
     BatchJobSnapshot, BatchJobStore, BatchJobStoreFailure, BatchJobUpdateOutcome,
-    BatchRecognitionRequest, BatchRecognizer, BoxFuture,
+    BatchRecognitionRequest, BatchRecognizer, BatchResultProjection, BoxFuture,
 };
 use crate::domain::batch::{BatchJob, BatchJobState};
 
-pub(super) const RECOVERY_BATCH_LIMIT: std::num::NonZeroUsize =
-    std::num::NonZeroUsize::new(100).unwrap();
+pub(super) const RECOVERY_BATCH_LIMIT: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 
 /// Coordinates admission, a single fenced provider call, and startup recovery.
 pub struct BatchCoordinator<'a> {
@@ -119,11 +118,12 @@ impl<'a> BatchCoordinator<'a> {
         classify_existing(existing, request)
     }
 
-    /// Claims an actionable state with CAS before invoking recognition exactly once.
-    pub fn execute(
-        &self,
+    /// Claims an actionable state and validates a provider result before durable completion.
+    pub fn execute<'b>(
+        &'b self,
         id: &BatchJobId,
-    ) -> BoxFuture<'_, Result<BatchExecutionOutcome, BatchCoordinatorFailure>> {
+        projection: &'b dyn BatchResultProjection,
+    ) -> BoxFuture<'b, Result<BatchExecutionOutcome, BatchCoordinatorFailure>> {
         let id = id.clone();
         Box::pin(async move {
             let Some(snapshot) = self.jobs.load(&id).await.map_err(store)? else {
@@ -172,7 +172,7 @@ impl<'a> BatchCoordinator<'a> {
                     keyterms: claimed.keyterms.clone(),
                 })
                 .await;
-            let replacement = apply_recognition_outcome(claimed.clone(), recognition)
+            let replacement = apply_recognition_outcome(claimed.clone(), recognition, projection)
                 .map_err(BatchCoordinatorFailure::Transition)?;
             match self
                 .jobs
@@ -226,8 +226,8 @@ mod tests {
 
     use super::*;
     use crate::application::ports::{
-        BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchRecognitionResult, BatchSegment,
-        RecognitionFailure,
+        BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchRecognitionResult,
+        BatchResultProjectionFailure, BatchSegment, RecognitionFailure,
     };
     use crate::domain::batch::{BatchProfile, BatchRequestFingerprint};
 
@@ -275,6 +275,15 @@ mod tests {
         }
     }
 
+    impl BatchResultProjection for Fake {
+        fn validate(
+            &self,
+            _id: &BatchJobId,
+            _result: &BatchRecognitionResult,
+        ) -> Result<(), BatchResultProjectionFailure> {
+            Ok(())
+        }
+    }
     impl BatchAudioSpool for Fake {
         fn store(
             &self,
@@ -488,10 +497,10 @@ mod tests {
         let coordinator = BatchCoordinator::new(&fake, &fake, &fake);
         run(coordinator.admit(request(1))).unwrap();
         fake.conflict_at.store(1, Ordering::SeqCst);
-        let loser = run(coordinator.execute(&BatchJobId::new("job"))).unwrap();
+        let loser = run(coordinator.execute(&BatchJobId::new("job"), &fake)).unwrap();
         assert!(matches!(loser, BatchExecutionOutcome::NotClaimed(_)));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
-        let winner = run(coordinator.execute(&BatchJobId::new("job"))).unwrap();
+        let winner = run(coordinator.execute(&BatchJobId::new("job"), &fake)).unwrap();
         assert!(matches!(winner, BatchExecutionOutcome::Persisted(_)));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
         assert_eq!(fake.removes.load(Ordering::SeqCst), 1);
@@ -506,7 +515,7 @@ mod tests {
 
         fake.conflict_at.store(2, Ordering::SeqCst);
         assert_eq!(
-            run(coordinator.execute(&BatchJobId::new("job"))),
+            run(coordinator.execute(&BatchJobId::new("job"), &fake)),
             Err(BatchCoordinatorFailure::PostEgressConflict)
         );
         assert!(fake.audio.lock().unwrap().is_some());
@@ -527,7 +536,7 @@ mod tests {
         fake.fail_cas_at.store(2, Ordering::SeqCst);
 
         assert!(matches!(
-            run(coordinator.execute(&BatchJobId::new("job"))),
+            run(coordinator.execute(&BatchJobId::new("job"), &fake)),
             Err(BatchCoordinatorFailure::PostEgressStore(_))
         ));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);

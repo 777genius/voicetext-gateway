@@ -7,6 +7,7 @@ use std::time::Duration;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
 use voicetext_gateway::contracts::batch::BatchIdentity;
+use voicetext_gateway::contracts::batch_projection::GatewayBatchResultProjection;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::MachineSecret;
 use voicetext_gateway::server::{
@@ -110,7 +111,10 @@ async fn durable_startup_recovery_is_exactly_once() {
         .await
         .unwrap();
     assert!(matches!(
-        coordinator.execute(&completed).await.unwrap(),
+        coordinator
+            .execute(&completed, &GatewayBatchResultProjection)
+            .await
+            .unwrap(),
         BatchExecutionOutcome::Persisted(_)
     ));
     assert_eq!(recognizer.calls(), 1);

@@ -11,6 +11,7 @@ use voicetext_speech::application::ports::{
 use voicetext_speech::domain::batch::BatchJobState;
 
 use crate::contracts::batch::BatchIdentity;
+use crate::contracts::batch_projection::GatewayBatchResultProjection;
 
 use super::state::GatewayState;
 
@@ -25,7 +26,7 @@ pub(crate) async fn execute_fenced(
         recognizer: recognizer.as_ref(),
     };
     let coordinator = BatchCoordinator::new(&observed, state.jobs(), state.spool());
-    let outcome = coordinator.execute(id).await;
+    let outcome = coordinator.execute(id, &GatewayBatchResultProjection).await;
     observe_outcome(state, &outcome);
     Some(outcome)
 }

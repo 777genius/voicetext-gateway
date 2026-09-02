@@ -154,6 +154,20 @@ pub struct BatchRecognitionResult {
     pub provider_reference: Option<ProviderReference>,
 }
 
+/// A completed provider result cannot be represented by the consumer-owned outbound contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchResultProjectionFailure;
+
+/// Consumer-owned check performed before a successful provider result becomes durable completion.
+pub trait BatchResultProjection: Send + Sync {
+    /// Validates the exact externally served projection without exposing serialization here.
+    fn validate(
+        &self,
+        id: &BatchJobId,
+        result: &BatchRecognitionResult,
+    ) -> Result<(), BatchResultProjectionFailure>;
+}
+
 /// Paid pre-recorded recognition capability.
 pub trait BatchRecognizer: Send + Sync {
     /// Returns the immutable identity and limitations implemented by this adapter.

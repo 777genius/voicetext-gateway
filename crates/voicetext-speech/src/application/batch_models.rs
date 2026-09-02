@@ -2,7 +2,7 @@
 
 use crate::application::ports::{
     BatchAudioSpoolFailure, BatchJobId, BatchJobSnapshot, BatchJobStoreFailure,
-    BatchRecognitionResult, RecognitionFailure,
+    BatchRecognitionResult, BatchResultProjection, RecognitionFailure,
 };
 use crate::domain::batch::{
     BatchFailure, BatchProfile, BatchRequestFingerprint, BatchTransitionError,
@@ -86,22 +86,28 @@ pub enum BatchCoordinatorFailure {
 pub(crate) fn apply_recognition_outcome(
     mut snapshot: BatchJobSnapshot,
     recognition: Result<BatchRecognitionResult, RecognitionFailure>,
+    projection: &dyn BatchResultProjection,
 ) -> Result<BatchJobSnapshot, BatchTransitionError> {
     snapshot.retry_after_millis = None;
     match recognition {
-        Ok(result) if valid_result(&snapshot, &result) => {
+        Ok(result) => {
+            let valid = valid_result(&snapshot, &result);
+            let projectable = valid && projection.validate(&snapshot.id, &result).is_ok();
             snapshot
                 .provider_reference
                 .clone_from(&result.provider_reference);
-            snapshot.result = Some(result);
-            snapshot.job.complete()
-        }
-        Ok(result) => {
-            snapshot.provider_reference = result.provider_reference;
-            snapshot.result = None;
-            snapshot
-                .job
-                .fail(batch_failure("INVALID_RECOGNITION_RESULT"))
+            if projectable {
+                snapshot.result = Some(result);
+                snapshot.job.complete()
+            } else {
+                snapshot.result = None;
+                let code = if valid {
+                    "PROVIDER_RESULT_PROJECTION_FAILED"
+                } else {
+                    "INVALID_RECOGNITION_RESULT"
+                };
+                snapshot.job.fail(batch_failure(code))
+            }
         }
         Err(RecognitionFailure::KnownNotAccepted {
             retryable,
@@ -221,7 +227,7 @@ fn valid_result(snapshot: &BatchJobSnapshot, result: &BatchRecognitionResult) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::ports::{BatchAudioHandle, BatchSegment};
+    use crate::application::ports::{BatchAudioHandle, BatchResultProjectionFailure, BatchSegment};
     use crate::domain::batch::{BatchJob, BatchJobStatus};
 
     fn profile() -> BatchProfile {
@@ -261,7 +267,17 @@ mod tests {
             revision: 1,
         };
         snapshot.job.begin_submission().unwrap();
-        let outcome = apply_recognition_outcome(snapshot, recognition).unwrap();
+        struct AcceptProjection;
+        impl BatchResultProjection for AcceptProjection {
+            fn validate(
+                &self,
+                _id: &BatchJobId,
+                _result: &BatchRecognitionResult,
+            ) -> Result<(), BatchResultProjectionFailure> {
+                Ok(())
+            }
+        }
+        let outcome = apply_recognition_outcome(snapshot, recognition, &AcceptProjection).unwrap();
         (outcome.job.state().status(), outcome.retry_after_millis)
     }
 

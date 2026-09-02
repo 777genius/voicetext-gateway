@@ -2,6 +2,7 @@
 
 pub mod batch;
 pub mod batch_outbound;
+pub mod batch_projection;
 pub mod live;
 pub mod live_outbound;
 

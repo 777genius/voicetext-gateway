@@ -1,4 +1,4 @@
-mod batch;
+pub(crate) mod batch;
 mod fixture;
 mod live;
 

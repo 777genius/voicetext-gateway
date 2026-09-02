@@ -21,10 +21,8 @@ use super::error::GatewayHttpError;
 use super::state::GatewayState;
 use crate::auth::authenticate;
 use crate::contracts::batch::{BatchIdentity, BatchResponseStatus, NextAction};
-use crate::contracts::batch_outbound::{
-    OutboundBatchResponse, OutboundReadableSegment, OutboundSegment, OutboundTranscription,
-    serialize_response,
-};
+use crate::contracts::batch_outbound::{OutboundBatchResponse, serialize_response};
+use crate::contracts::batch_projection::completed_response;
 use crate::identity::{
     IdempotencyKey, canonicalize_keyterms, deterministic_job_id, request_fingerprint,
 };
@@ -232,43 +230,7 @@ fn response_for_snapshot(
                 .result
                 .as_ref()
                 .ok_or_else(|| GatewayHttpError::unavailable("INVALID_JOB_SNAPSHOT"))?;
-            OutboundBatchResponse::Completed {
-                job_id,
-                result: OutboundTranscription {
-                    text: result.text.clone(),
-                    duration_millis: result.duration_millis,
-                    segments: result
-                        .segments
-                        .iter()
-                        .map(|segment| OutboundSegment {
-                            start_millis: segment.start_millis,
-                            end_millis: segment.end_millis,
-                            text: segment.text.clone(),
-                            confidence: segment.confidence.map(f64::from),
-                        })
-                        .collect(),
-                    readable_segments: result
-                        .readable_segments
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|segment| OutboundReadableSegment {
-                            start_millis: segment.start_millis,
-                            end_millis: segment.end_millis,
-                            text: segment.text.clone(),
-                            source_segment_indices: segment.source_segment_indices.clone(),
-                        })
-                        .collect(),
-                    provider_request_id: (identity == BatchIdentity::ElevenlabsScribeV2MultiV3)
-                        .then(|| {
-                            result
-                                .provider_reference
-                                .as_ref()
-                                .map(|value| value.as_str().into())
-                        })
-                        .flatten(),
-                },
-            }
+            completed_response(identity, job_id, result)
         }
     };
     let serialized = serialize_response(identity, &outbound)
