@@ -99,9 +99,7 @@ fn validate_public_tls_surface(repository_root: &Path, errors: &mut Vec<String>)
         "/api/v1/transcribe/batch",
         "/api/v1/transcribe/batch/*",
         "/api/v1/transcribe/stream",
-        "/health",
         "/health/live",
-        "/health/ready",
     ] {
         if !source
             .lines()
@@ -114,7 +112,12 @@ fn validate_public_tls_surface(repository_root: &Path, errors: &mut Vec<String>)
     }
     if !source.contains("reverse_proxy @voicetext_contract gateway:8080")
         || !source.lines().any(|line| line.trim() == "respond 404")
-        || source.lines().any(|line| line.trim() == "/metrics")
+        || source.lines().any(|line| {
+            matches!(
+                line.trim().trim_end_matches('\\').trim(),
+                "/health" | "/health/ready" | "/metrics"
+            )
+        })
     {
         errors.push("deploy/Caddyfile public route allowlist is unsafe".to_owned());
     }

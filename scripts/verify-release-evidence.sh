@@ -30,11 +30,14 @@ jq -e '
   (.image.digest | test("^sha256:[0-9a-f]{64}$")) and
   .sbom.format == "CycloneDX" and
   .vulnerability_policy.result == "pass" and
+  (.protected_acceptance.reviewer_sha256 | test("^[0-9a-f]{64}$")) and
+  (.protected_acceptance.canary_sha256 | test("^[0-9a-f]{64}$")) and
   .composition_gate.result == "pass"
 ' "$predicate" >/dev/null
 
 source_sha=$(jq -r .source.git_sha "$predicate")
 image_digest=$(jq -r .image.digest "$predicate")
+scripts/verify-release-acceptance.sh "$source_sha" "$image_digest" "$evidence_dir"
 jq -e --arg source_sha "$source_sha" --arg image_digest "$image_digest" '
   .bomFormat == "CycloneDX" and
   (.components | type == "array" and length > 0) and
@@ -62,3 +65,7 @@ jq -e '
   "$(sha256sum "$evidence_dir/distribution/NOTICE" | cut -d' ' -f1)" ]
 [ "$(jq -r .composition_gate.fixture_sha256 "$predicate")" = \
   "$(sha256sum "$evidence_dir/composition/voicetext-gateway-contract.ts" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.reviewer_sha256 "$predicate")" = \
+  "$(sha256sum "$evidence_dir/acceptance/reviewer-approval.json" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.canary_sha256 "$predicate")" = \
+  "$(sha256sum "$evidence_dir/acceptance/provider-canary.json" | cut -d' ' -f1)" ]

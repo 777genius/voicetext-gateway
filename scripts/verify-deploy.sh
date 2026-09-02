@@ -36,10 +36,14 @@ for route in \
   /api/v1/transcribe/batch \
   '/api/v1/transcribe/batch/*' \
   /api/v1/transcribe/stream \
-  /health /health/live /health/ready
+  /health/live
 do
   grep -Fq "$route" deploy/Caddyfile || fail "Caddy contract matcher omits $route"
 done
+
+if awk '$1 == "/health" || $1 == "/health/ready" { bad = 1 } END { exit !bad }' deploy/Caddyfile; then
+  fail "Caddy must keep dependency health routes internal"
+fi
 
 proxy_line=$(grep -n '^[[:space:]]*handle @voicetext_contract {' deploy/Caddyfile | cut -d: -f1)
 fallback_line=$(grep -n '^[[:space:]]*handle {$' deploy/Caddyfile | cut -d: -f1)

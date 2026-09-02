@@ -17,6 +17,7 @@ case "$source_sha" in *[!0-9a-f]*|'') usage ;; esac
 [ "${#source_sha}" -eq 40 ] || usage
 case "$image_digest" in sha256:[0-9a-f]* ) ;; *) usage ;; esac
 [ "${#image_digest}" -eq 71 ] || usage
+scripts/verify-release-acceptance.sh "$source_sha" "$image_digest" "$evidence_dir"
 
 for required in voicetext-gateway.sbom.cdx.json vulnerabilities.grype.json
 do
@@ -47,6 +48,8 @@ policy_sha=$(sha256sum "$evidence_dir/policy/vulnerability-policy.json" | cut -d
 license_sha=$(sha256sum "$evidence_dir/distribution/LICENSE" | cut -d' ' -f1)
 notice_sha=$(sha256sum "$evidence_dir/distribution/NOTICE" | cut -d' ' -f1)
 fixture_sha=$(sha256sum "$evidence_dir/composition/voicetext-gateway-contract.ts" | cut -d' ' -f1)
+reviewer_sha=$(sha256sum "$evidence_dir/acceptance/reviewer-approval.json" | cut -d' ' -f1)
+canary_sha=$(sha256sum "$evidence_dir/acceptance/provider-canary.json" | cut -d' ' -f1)
 
 jq -S -n \
   --arg source_sha "$source_sha" \
@@ -58,6 +61,8 @@ jq -S -n \
   --arg license_sha "$license_sha" \
   --arg notice_sha "$notice_sha" \
   --arg fixture_sha "$fixture_sha" \
+  --arg reviewer_sha "$reviewer_sha" \
+  --arg canary_sha "$canary_sha" \
   '{
     predicate_type: "https://voicetext.dev/attestations/release-evidence/v1",
     source: {git_sha: $source_sha},
@@ -70,6 +75,10 @@ jq -S -n \
       result_sha256: $vulnerability_sha
     },
     distribution: {license_sha256: $license_sha, notice_sha256: $notice_sha},
+    protected_acceptance: {
+      reviewer_sha256: $reviewer_sha,
+      canary_sha256: $canary_sha
+    },
     composition_gate: {
       result: "pass",
       fixture_sha256: $fixture_sha,

@@ -80,21 +80,32 @@ exists.
 
 ## Immutable release evidence and retention
 
-For a `v*` tag, `release-evidence` runs only after both required jobs succeed. It rebuilds the image
-from the exact remote Git ref plus checksum, publishes it to GHCR, and takes the registry digest as
-the sole subject identity. GitHub artifact attestations cryptographically bind that digest to SLSA
-build provenance, the digest-bearing CycloneDX SBOM, and the deterministic release predicate. The
-predicate records hashes of the exact source SHA, SBOM, Grype result and fail-closed policy,
-Apache-2.0 license, NOTICE, and TypeScript composition fixture. CI verifies the attestations against
-the repository identity before publication.
+For a `v*` tag, `release-evidence` runs only after both required jobs succeed and enters the
+protected `release-publication` environment. Configure that environment with required reviewers.
+Before the job starts, an authorized operator must create the draft GitHub Release for the exact
+tag and attach `reviewer-approval.json` plus `provider-canary.json`. Both bounded records must name
+the exact source SHA and quarantine image digest; the canary record must contain passing results for
+each provider/mode and both mixed-profile combinations. The workflow rejects a non-draft release,
+missing evidence, malformed identities, or incomplete canary coverage.
+
+The checked-in `scripts/verify-release-acceptance.sh` defines the fail-closed JSON schema, exact
+six-profile canary set, identity matching, and 64 KiB per-record bound.
+
+The job rebuilds the image from the exact remote Git ref plus checksum and first assigns only the
+deterministic `quarantine-<source-sha>` GHCR identity. GitHub artifact attestations
+cryptographically bind that digest to SLSA build provenance, the digest-bearing CycloneDX SBOM, and
+the deterministic release predicate. The predicate hashes the reviewer and canary records as well
+as the exact source SHA, SBOM, Grype result and fail-closed policy, Apache-2.0 license, NOTICE, and
+TypeScript composition fixture. CI verifies every attestation against the repository identity and
+uploads immutable evidence assets before creating the final source-SHA and version tags in one last
+publication step.
 
 GitHub Actions artifacts are a convenience copy retained for 90 days, the maximum generally
 available to public repositories; repository policy can further reduce that period. They are not
 the release-lifetime record. The digest-named archive, predicate, SBOM, vulnerability result,
-applied policy, exact image LICENSE/NOTICE, and pinned composition fixture are uploaded without
-overwrite to the GitHub Release for the exact tag. GitHub Release assets and GHCR
-attestations follow the release/package lifetime and remain until an authorized maintainer deletes
-them. The workflow creates a draft release when none exists, so human acceptance remains required
-before publication. Configure branch protection/rulesets to require the workflow jobs named
-`exact-head` and `production-composition`; only `release-evidence` is authorized to publish images
-or release evidence.
+applied policy, protected acceptance records, exact image LICENSE/NOTICE, and pinned composition
+fixture are uploaded without overwrite to the draft GitHub Release for the exact tag. GitHub
+Release assets and GHCR attestations follow the release/package lifetime and remain until an
+authorized maintainer deletes them. Configure branch protection/rulesets to require the workflow
+jobs named `exact-head` and `production-composition`; only the protected `release-evidence` job is
+authorized to stage or publish images and release evidence.

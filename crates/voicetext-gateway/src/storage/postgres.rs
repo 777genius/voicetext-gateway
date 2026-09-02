@@ -13,7 +13,7 @@ use super::records::{JobRecord, RecordError, WritableRecord};
 
 const COLUMNS: &str = "job_id, contract_version, provider, model, language, fingerprint, \
 audio_handle, authoritative_duration_millis, keyterms, state, attempt, failure_code, \
-unknown_reason, provider_reference, retry_after_millis, result_json, revision";
+unknown_reason, provider_reference, retry_after_millis, result_json, result_text, revision";
 
 /// PostgreSQL-backed durable batch ledger using optimistic revisions.
 #[derive(Clone, Debug)]
@@ -76,8 +76,8 @@ impl PostgresBatchJobStore {
                 job_id, contract_version, provider, model, language, fingerprint,
                 audio_handle, authoritative_duration_millis, keyterms, state, attempt,
                 failure_code, unknown_reason, provider_reference, retry_after_millis,
-                result_json, revision
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                result_json, result_text, revision
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
              ON CONFLICT (job_id) DO NOTHING",
         )
         .bind(record.job_id)
@@ -96,6 +96,7 @@ impl PostgresBatchJobStore {
         .bind(record.provider_reference)
         .bind(record.retry_after_millis)
         .bind(record.result_json)
+        .bind(record.result_text)
         .bind(record.revision)
         .execute(&self.pool)
         .await
@@ -126,9 +127,9 @@ impl PostgresBatchJobStore {
             "UPDATE voicetext_batch_jobs SET
                 state=$10, attempt=$11, failure_code=$12, unknown_reason=$13,
                 provider_reference=$14, retry_after_millis=$15, result_json=$16,
-                revision=revision+1,
+                result_text=$17, revision=revision+1,
                 updated_at=clock_timestamp()
-             WHERE job_id=$1 AND revision=$17
+             WHERE job_id=$1 AND revision=$18
                AND contract_version=$2 AND provider=$3 AND model=$4 AND language=$5
                AND fingerprint=$6 AND audio_handle=$7
                AND authoritative_duration_millis=$8 AND keyterms=$9
@@ -151,6 +152,7 @@ impl PostgresBatchJobStore {
             .bind(record.provider_reference)
             .bind(record.retry_after_millis)
             .bind(record.result_json)
+            .bind(record.result_text)
             .bind(expected)
             .fetch_optional(&self.pool)
             .await
@@ -384,6 +386,7 @@ mod tests {
             provider_reference: writable.provider_reference,
             retry_after_millis: writable.retry_after_millis,
             result_json: writable.result_json,
+            result_text: writable.result_text,
             revision: writable.revision,
         }
     }
@@ -410,7 +413,7 @@ mod tests {
         result.segments.clear();
         let encoded = WritableRecord::try_from(&boundary)
             .unwrap()
-            .result_json
+            .result_text
             .unwrap();
 
         assert!(encoded.len() > 16 * 1024 * 1024);
@@ -427,11 +430,27 @@ mod tests {
         );
 
         let mut writable = WritableRecord::try_from(&snapshot()).unwrap();
-        writable.result_json = Some(serde_json::json!({ "unexpected": true }).to_string());
+        writable.result_json = Some(serde_json::json!({ "unexpected": true }));
+        writable.result_text = Some(serde_json::json!({ "unexpected": true }).to_string());
         assert_eq!(
             BatchJobSnapshot::try_from(job_record(writable)),
             Err(RecordError("INVALID_RESULT_JSON"))
         );
+    }
+
+    #[test]
+    fn legacy_writes_remain_readable_after_expand_and_rollback() {
+        let expected = snapshot();
+        let writable = WritableRecord::try_from(&expected).unwrap();
+        let mut legacy_only = job_record(writable);
+        legacy_only.result_text = None;
+        assert_eq!(BatchJobSnapshot::try_from(legacy_only).unwrap(), expected);
+
+        let mut overwritten = job_record(WritableRecord::try_from(&expected).unwrap());
+        let mut stale = overwritten.result_json.clone().unwrap();
+        stale["text"] = serde_json::json!("stale-exact-column");
+        overwritten.result_text = Some(stale.to_string());
+        assert_eq!(BatchJobSnapshot::try_from(overwritten).unwrap(), expected);
     }
 
     #[test]
@@ -502,7 +521,7 @@ mod tests {
         boundary.job.complete().unwrap();
         let compact_bytes = WritableRecord::try_from(&boundary)
             .unwrap()
-            .result_json
+            .result_text
             .as_ref()
             .unwrap()
             .len();
@@ -518,7 +537,7 @@ mod tests {
             BatchJobState::Completed { .. }
         ));
         let stored_bytes: i32 = sqlx::query_scalar(
-            "SELECT octet_length(result_json) FROM voicetext_batch_jobs WHERE job_id=$1",
+            "SELECT octet_length(result_text) FROM voicetext_batch_jobs WHERE job_id=$1",
         )
         .bind(uuid::Uuid::parse_str(id.as_str()).unwrap())
         .fetch_one(&store.pool)

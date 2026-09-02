@@ -46,7 +46,8 @@ pub(crate) struct JobRecord {
     pub unknown_reason: Option<String>,
     pub provider_reference: Option<String>,
     pub retry_after_millis: Option<i64>,
-    pub result_json: Option<String>,
+    pub result_json: Option<Value>,
+    pub result_text: Option<String>,
     pub revision: i64,
 }
 
@@ -67,7 +68,8 @@ pub(crate) struct WritableRecord {
     pub unknown_reason: Option<&'static str>,
     pub provider_reference: Option<String>,
     pub retry_after_millis: Option<i64>,
-    pub result_json: Option<String>,
+    pub result_json: Option<Value>,
+    pub result_text: Option<String>,
     pub revision: i64,
 }
 
@@ -136,7 +138,7 @@ impl TryFrom<JobRecord> for BatchJobSnapshot {
             record.unknown_reason.as_deref(),
         )?;
         let result = restore_result(
-            record.result_json,
+            compatible_result_text(record.result_json, record.result_text)?,
             &profile,
             duration,
             provider_reference.clone(),
@@ -174,12 +176,18 @@ impl TryFrom<&BatchJobSnapshot> for WritableRecord {
         validate_reference(snapshot.provider_reference.as_ref())?;
         validate_retry_after(snapshot.job.state(), snapshot.retry_after_millis)?;
         let (state, attempt, failure_code, unknown_reason) = flatten_state(snapshot.job.state());
-        let result_json = snapshot
+        let result_text = snapshot
             .result
             .as_ref()
             .map(|result| serialize_result(snapshot, result))
             .transpose()?;
-        validate_result_presence(snapshot.job.state(), result_json.is_some())?;
+        validate_result_presence(snapshot.job.state(), result_text.is_some())?;
+        let result_json = result_text
+            .as_ref()
+            .map(|value| {
+                serde_json::from_str(value).map_err(|_| RecordError("INVALID_RESULT_JSON"))
+            })
+            .transpose()?;
         Ok(Self {
             job_id,
             contract_version: i16::try_from(snapshot.job.profile().contract_version())
@@ -207,9 +215,32 @@ impl TryFrom<&BatchJobSnapshot> for WritableRecord {
                 .transpose()
                 .map_err(|_| RecordError("INVALID_RETRY_AFTER"))?,
             result_json,
+            result_text,
             revision: i64::try_from(snapshot.revision)
                 .map_err(|_| RecordError("INVALID_REVISION"))?,
         })
+    }
+}
+
+fn compatible_result_text(
+    legacy: Option<Value>,
+    exact: Option<String>,
+) -> Result<Option<String>, RecordError> {
+    match (legacy, exact) {
+        (None, None) => Ok(None),
+        (Some(legacy), None) => Ok(Some(legacy.to_string())),
+        (Some(legacy), Some(exact)) => {
+            let exact_value: Value =
+                serde_json::from_str(&exact).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
+            if exact_value == legacy {
+                Ok(Some(exact))
+            } else {
+                // A rolled-back binary updates only the legacy column. Prefer that newer semantic
+                // value when this binary is deployed again instead of serving stale exact text.
+                Ok(Some(legacy.to_string()))
+            }
+        }
+        (None, Some(_)) => Err(RecordError("INVALID_RESULT_REPRESENTATION")),
     }
 }
 

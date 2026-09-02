@@ -142,9 +142,9 @@ Endpoints:
 - `POST /api/v1/transcribe/batch`
 - `GET /api/v1/transcribe/batch/{job_id}`
 - `GET /api/v1/transcribe/stream` (WebSocket upgrade)
-- `GET /health/live`
-- `GET /health/ready`
-- `GET /health` (current VoiceText provider-profile compatibility projection)
+- `GET /health/live` (the only health route exposed by the supplied public TLS edge)
+- `GET /health/ready` (internal gateway network only)
+- `GET /health` (internal provider-profile compatibility projection)
 - `GET /metrics` (internal gateway network; the TLS overlays do not publish it)
 
 ## Architecture

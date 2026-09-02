@@ -61,10 +61,10 @@ after measuring memory, provider concurrency, PostgreSQL capacity, and spool dis
 ## Health and observability
 
 - `/health/live` proves the process is serving.
-- `/health/ready` proves PostgreSQL and a writable spool are available.
-- `/health` projects the exact configured VoiceText profiles expected by Meeting Platform.
+- `/health/ready` proves PostgreSQL and a writable spool are available on the internal gateway network.
+- `/health` projects the exact configured VoiceText profiles expected by Meeting Platform on the internal gateway network.
 - `/metrics` uses fixed-cardinality labels and contains no job, transcript, request, or secret
-  values. The supplied TLS overlays keep it internal.
+  values. The supplied TLS overlays keep it internal; only cheap `/health/live` is public.
 
 The container probe reads `VOICETEXT_HEALTHCHECK_URL` and defaults to the internal
 `http://127.0.0.1:8080/health/ready` endpoint. When `VOICETEXT_BIND_ADDR` changes the internal
@@ -146,6 +146,14 @@ Back up PostgreSQL and the spool as one operational unit, while retaining the or
 recording separately. During upgrade, keep the previous image digest and exact configuration. Do
 not roll back by mutating in-flight job identity or switching a live session. New sessions may use a
 previous known-good image/profile after readiness is proven.
+
+Migration `0002_exact_result_representation` is an expand-only rollback boundary: it keeps the
+legacy `result_json jsonb` column, adds and backfills `result_text`, and the current gateway writes
+both. To roll back during this compatibility window, stop and drain the current gateway, deploy the
+previous image against the unchanged schema, and retain both columns. The previous image continues
+to read and write `result_json`; if it writes while rolled back, a later current gateway prefers the
+changed legacy value over stale exact text and re-synchronizes both on its next update. Do not drop
+or change either column until a separately reviewed contract migration closes the rollback window.
 
 For a clean shutdown, let the container receive `SIGTERM` and wait for its bounded graceful drain.
 After restart, inspect recovery metrics and outcome-unknown jobs before launching new paid canaries.

@@ -76,7 +76,7 @@ jobs:
         run: |
           sh -n scripts/create-release-evidence.sh scripts/verify-release-evidence.sh \
             scripts/run-production-composition-gate.sh scripts/test-release-evidence.sh \
-            scripts/test-release-workflow.sh
+            scripts/verify-release-acceptance.sh scripts/test-release-workflow.sh
           scripts/test-release-evidence.sh
           scripts/test-release-workflow.sh
 
@@ -166,6 +166,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends build-essential cmake
 
+      - name: Prove populated 0001 expand and previous-binary rollback compatibility
+        run: |
+          cargo test --locked --package voicetext-gateway --test postgres_expand_contract populated_0001_expands_without_breaking_previous_binary_reads_or_writes -- --ignored --exact
+
       - name: Build the shipped release-mode binary
         run: cargo build --locked --release --package voicetext-gateway --bin voicetext-gateway
 
@@ -178,6 +182,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [exact-head, production-composition]
     runs-on: ubuntu-latest
+    environment: release-publication
     services:
       quarantine-registry:
         image: registry:2.8.3@sha256:1fc7de654f2ac1247f0b67e8a459e273b0993be7d2beda1f3f56fbf1001ed3e7
@@ -300,6 +305,14 @@ jobs:
           mv image-LICENSE evidence/distribution/LICENSE
           mv image-NOTICE evidence/distribution/NOTICE
 
+      - name: Consume protected reviewer and provider-canary evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          mkdir -p evidence/acceptance
+          gh release download "$RELEASE_TAG" --dir evidence/acceptance --pattern reviewer-approval.json --pattern provider-canary.json
+          scripts/verify-release-acceptance.sh "$SOURCE_SHA" '${{ steps.quarantine.outputs.digest }}' evidence
       - name: Create and verify deterministic release predicate
         run: |
           scripts/create-release-evidence.sh "$SOURCE_SHA" \
@@ -307,18 +320,17 @@ jobs:
             '${{ steps.quarantine.outputs.digest }}' evidence
           scripts/verify-release-evidence.sh evidence
 
-      - name: Publish only the exact image that passed every quarantine gate
-        id: publish
+      - name: Stage the verified digest under a deterministic quarantine identity
+        id: stage
         env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           source='${{ steps.quarantine.outputs.image }}@${{ steps.quarantine.outputs.digest }}'
           image="ghcr.io/${SOURCE_REPOSITORY,,}/voicetext-gateway"
-          docker buildx imagetools create --tag "${image}:${SOURCE_SHA}" "$source"
-          test "$(crane digest "${image}:${SOURCE_SHA}")" = '${{ steps.quarantine.outputs.digest }}'
-          docker buildx imagetools create --tag "${image}:${RELEASE_TAG}" "$source"
-          test "$(crane digest "${image}:${RELEASE_TAG}")" = '${{ steps.quarantine.outputs.digest }}'
+          quarantine_tag="quarantine-${SOURCE_SHA}"
+          docker buildx imagetools create --tag "${image}:${quarantine_tag}" "$source"
+          test "$(crane digest "${image}:${quarantine_tag}")" = '${{ steps.quarantine.outputs.digest }}'
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "digest=${{ steps.quarantine.outputs.digest }}" >> "$GITHUB_OUTPUT"
           echo "digest_hex=${{ steps.quarantine.outputs.digest_hex }}" >> "$GITHUB_OUTPUT"
@@ -326,23 +338,23 @@ jobs:
       - name: Cryptographically attest source-to-image build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
+          subject-name: ${{ steps.stage.outputs.image }}
+          subject-digest: ${{ steps.stage.outputs.digest }}
           push-to-registry: true
 
       - name: Cryptographically attest the digest-bearing SBOM
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
+          subject-name: ${{ steps.stage.outputs.image }}
+          subject-digest: ${{ steps.stage.outputs.digest }}
           sbom-path: evidence/voicetext-gateway.sbom.cdx.json
           push-to-registry: true
 
       - name: Cryptographically bind all release policy evidence to the image digest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
+          subject-name: ${{ steps.stage.outputs.image }}
+          subject-digest: ${{ steps.stage.outputs.digest }}
           predicate-type: https://voicetext.dev/attestations/release-evidence/v1
           predicate-path: evidence/release-evidence.json
           push-to-registry: true
@@ -351,7 +363,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          subject='oci://${{ steps.publish.outputs.image }}@${{ steps.publish.outputs.digest }}'
+          subject='oci://${{ steps.stage.outputs.image }}@${{ steps.stage.outputs.digest }}'
           gh attestation verify "$subject" --repo "$SOURCE_REPOSITORY" \
             --predicate-type https://slsa.dev/provenance/v1
           gh attestation verify "$subject" --repo "$SOURCE_REPOSITORY" \
@@ -362,7 +374,7 @@ jobs:
       - name: Retain digest-named exact-head evidence for the repository limit
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: voicetext-release-evidence-${{ env.SOURCE_SHA }}-${{ steps.publish.outputs.digest_hex }}
+          name: voicetext-release-evidence-${{ env.SOURCE_SHA }}-${{ steps.stage.outputs.digest_hex }}
           path: evidence/
           if-no-files-found: error
           retention-days: 90
@@ -371,12 +383,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          archive="voicetext-release-evidence-${SOURCE_SHA}-${{ steps.publish.outputs.digest_hex }}.tar.gz"
+          archive="voicetext-release-evidence-${SOURCE_SHA}-${{ steps.stage.outputs.digest_hex }}.tar.gz"
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
             -czf "$archive" evidence
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "$RELEASE_TAG" --notes "Exact-head release awaiting human acceptance review."
-          fi
           gh release upload "$RELEASE_TAG" "$archive" evidence/release-evidence.json \
             evidence/voicetext-gateway.sbom.cdx.json evidence/vulnerabilities.grype.json
+
+      - name: Publish final public image tags as the last irreversible step
+        run: |
+          source='${{ steps.stage.outputs.image }}@${{ steps.stage.outputs.digest }}'
+          image='${{ steps.stage.outputs.image }}'
+          docker buildx imagetools create --tag "${image}:${SOURCE_SHA}" --tag "${image}:${RELEASE_TAG}" "$source"
+          test "$(crane digest "${image}:${SOURCE_SHA}")" = '${{ steps.stage.outputs.digest }}'
+          test "$(crane digest "${image}:${RELEASE_TAG}")" = '${{ steps.stage.outputs.digest }}'
