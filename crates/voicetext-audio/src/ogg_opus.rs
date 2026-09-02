@@ -404,5 +404,4 @@ fn read_u64_le(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
-#[path = "ogg_opus_tests.rs"]
 mod tests;

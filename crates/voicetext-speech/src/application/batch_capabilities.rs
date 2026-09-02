@@ -1,9 +1,5 @@
 //! Provider-neutral capability contract for one authoritative batch profile.
 
-use super::batch::BatchIdentity;
-
-const MEBIBYTE: usize = 1_024 * 1_024;
-
 /// Timestamp evidence exposed by an authoritative batch result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchTimestampCapability {
@@ -32,38 +28,51 @@ pub enum BatchInputFormat {
     WavePcm,
 }
 
-/// Deterministic provider-neutral batch lifecycle order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BatchLifecycleEvent {
-    Metadata,
-    Error,
-    FinalizedTranscript,
-    TerminalCompletion,
-}
-
 /// Exact public and provider bounds applied before paid batch egress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchProviderLimits {
+    /// Gateway admission bound, before durable storage.
+    pub maximum_public_input_bytes: usize,
+    /// Upstream provider bound checked again immediately before egress.
     pub maximum_input_bytes: usize,
     pub maximum_key_terms: usize,
     pub maximum_key_term_bytes: usize,
     pub maximum_key_term_characters: Option<usize>,
+    pub key_term_character_unit: Option<TextLengthUnit>,
     pub maximum_key_term_words: Option<usize>,
     pub normalize_key_term_whitespace: bool,
     pub restricted_key_term_punctuation: bool,
 }
 
+/// Explicit unit used by a provider text limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextLengthUnit {
+    UnicodeScalars,
+    Utf16CodeUnits,
+}
+
+/// Provenance of timestamps projected by the gateway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampProvenance {
+    ProviderNative,
+    GatewaySynthesizedFromAcceptedAudio,
+}
+
 /// Narrow reusable descriptor for one batch profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatchCapabilityDescriptor {
+    pub contract_version: u16,
+    pub provider: &'static str,
+    pub model: &'static str,
+    pub language: &'static str,
     pub timestamps: BatchTimestampCapability,
+    pub timestamp_provenance: TimestampProvenance,
     pub finalized_events: BatchFinalizedCapability,
     pub language_hints: BatchLanguageHints,
     pub diarization: bool,
     pub key_terms: bool,
     pub input_formats: &'static [BatchInputFormat],
     pub provider_limits: BatchProviderLimits,
-    pub lifecycle_order: &'static [BatchLifecycleEvent],
 }
 
 /// Features requested by a caller before a batch job is admitted.
@@ -90,54 +99,6 @@ pub enum BatchCapabilityError {
     InputLimitExceeded,
     KeyTermLimitExceeded,
     InvalidKeyTerm,
-}
-
-const INPUTS: &[BatchInputFormat] = &[BatchInputFormat::OggOpus];
-const ORDER: &[BatchLifecycleEvent] = &[
-    BatchLifecycleEvent::Metadata,
-    BatchLifecycleEvent::Error,
-    BatchLifecycleEvent::FinalizedTranscript,
-    BatchLifecycleEvent::TerminalCompletion,
-];
-
-const DEEPGRAM: BatchCapabilityDescriptor = BatchCapabilityDescriptor {
-    timestamps: BatchTimestampCapability::Segment,
-    finalized_events: BatchFinalizedCapability::TerminalTranscript,
-    language_hints: BatchLanguageHints::Fixed("multi"),
-    diarization: false,
-    key_terms: true,
-    input_formats: INPUTS,
-    provider_limits: BatchProviderLimits {
-        maximum_input_bytes: 64 * MEBIBYTE,
-        maximum_key_terms: 100,
-        maximum_key_term_bytes: 200,
-        maximum_key_term_characters: None,
-        maximum_key_term_words: None,
-        normalize_key_term_whitespace: false,
-        restricted_key_term_punctuation: false,
-    },
-    lifecycle_order: ORDER,
-};
-
-const ELEVENLABS: BatchCapabilityDescriptor = BatchCapabilityDescriptor {
-    provider_limits: BatchProviderLimits {
-        maximum_key_term_characters: Some(49),
-        maximum_key_term_words: Some(5),
-        normalize_key_term_whitespace: true,
-        restricted_key_term_punctuation: true,
-        ..DEEPGRAM.provider_limits
-    },
-    ..DEEPGRAM
-};
-
-impl BatchIdentity {
-    /// Returns the exact descriptor bound to this frozen batch identity.
-    pub const fn capability_descriptor(self) -> &'static BatchCapabilityDescriptor {
-        match self {
-            Self::DeepgramNova3MultiV2 => &DEEPGRAM,
-            Self::ElevenlabsScribeV2MultiV3 => &ELEVENLABS,
-        }
-    }
 }
 
 impl BatchCapabilityDescriptor {
@@ -171,6 +132,7 @@ impl BatchCapabilityDescriptor {
             return Err(BatchCapabilityError::UnsupportedInputFormat);
         }
         if request.input_bytes == 0
+            || request.input_bytes > self.provider_limits.maximum_public_input_bytes
             || request.input_bytes > self.provider_limits.maximum_input_bytes
         {
             return Err(BatchCapabilityError::InputLimitExceeded);
@@ -197,9 +159,11 @@ fn validate_key_terms(
         let invalid = term.is_empty()
             || term.trim() != *term
             || term.len() > limits.maximum_key_term_bytes
-            || limits
-                .maximum_key_term_characters
-                .is_some_and(|maximum| provider_term.chars().count() > maximum)
+            || exceeds_text_limit(
+                provider_term,
+                limits.maximum_key_term_characters,
+                limits.key_term_character_unit,
+            )
             || limits
                 .maximum_key_term_words
                 .is_some_and(|maximum| provider_term.split_whitespace().count() > maximum)
@@ -215,9 +179,49 @@ fn validate_key_terms(
     Ok(())
 }
 
+fn exceeds_text_limit(value: &str, maximum: Option<usize>, unit: Option<TextLengthUnit>) -> bool {
+    match (maximum, unit) {
+        (None, None) => false,
+        (Some(maximum), Some(TextLengthUnit::UnicodeScalars)) => value.chars().count() > maximum,
+        (Some(maximum), Some(TextLengthUnit::Utf16CodeUnits)) => {
+            value.encode_utf16().count() > maximum
+        }
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INPUTS: &[BatchInputFormat] = &[BatchInputFormat::OggOpus];
+
+    fn descriptor() -> BatchCapabilityDescriptor {
+        BatchCapabilityDescriptor {
+            contract_version: 1,
+            provider: "test",
+            model: "model",
+            language: "multi",
+            timestamps: BatchTimestampCapability::Segment,
+            timestamp_provenance: TimestampProvenance::ProviderNative,
+            finalized_events: BatchFinalizedCapability::TerminalTranscript,
+            language_hints: BatchLanguageHints::Fixed("multi"),
+            diarization: false,
+            key_terms: true,
+            input_formats: INPUTS,
+            provider_limits: BatchProviderLimits {
+                maximum_public_input_bytes: 64,
+                maximum_input_bytes: 128,
+                maximum_key_terms: 2,
+                maximum_key_term_bytes: 200,
+                maximum_key_term_characters: Some(5),
+                key_term_character_unit: Some(TextLengthUnit::UnicodeScalars),
+                maximum_key_term_words: Some(2),
+                normalize_key_term_whitespace: true,
+                restricted_key_term_punctuation: true,
+            },
+        }
+    }
 
     fn supported<'a>(key_terms: &'a [&'a str]) -> BatchCapabilityRequest<'a> {
         BatchCapabilityRequest {
@@ -232,31 +236,13 @@ mod tests {
     }
 
     #[test]
-    fn every_batch_profile_has_exact_supported_capabilities() {
-        for identity in [
-            BatchIdentity::DeepgramNova3MultiV2,
-            BatchIdentity::ElevenlabsScribeV2MultiV3,
-        ] {
-            let descriptor = identity.capability_descriptor();
-            assert_eq!(descriptor.timestamps, BatchTimestampCapability::Segment);
-            assert_eq!(
-                descriptor.finalized_events,
-                BatchFinalizedCapability::TerminalTranscript
-            );
-            assert_eq!(
-                descriptor.language_hints,
-                BatchLanguageHints::Fixed("multi")
-            );
-            assert_eq!(descriptor.input_formats, [BatchInputFormat::OggOpus]);
-            assert!(!descriptor.diarization);
-            assert!(descriptor.validate(&supported(&["VoiceText"])).is_ok());
-            assert_eq!(descriptor.lifecycle_order, ORDER);
-        }
+    fn checked_descriptor_accepts_its_supported_surface() {
+        assert!(descriptor().validate(&supported(&["Voice"])).is_ok());
     }
 
     #[test]
     fn unsupported_batch_features_fail_closed() {
-        let descriptor = BatchIdentity::DeepgramNova3MultiV2.capability_descriptor();
+        let descriptor = descriptor();
         let mut request = supported(&[]);
         request.diarization = true;
         assert_eq!(
@@ -278,22 +264,16 @@ mod tests {
     }
 
     #[test]
-    fn elevenlabs_batch_descriptor_matches_stricter_key_term_behavior() {
-        let deepgram = BatchIdentity::DeepgramNova3MultiV2.capability_descriptor();
-        assert!(deepgram.validate(&supported(&["<supported>"])).is_ok());
-        let descriptor = BatchIdentity::ElevenlabsScribeV2MultiV3.capability_descriptor();
-        assert!(
-            descriptor
-                .validate(&supported(&["one  two three four five"]))
-                .is_ok()
-        );
+    fn scalar_provider_limit_is_distinct_from_public_utf16_accounting() {
+        let descriptor = descriptor();
         assert_eq!(
-            descriptor.validate(&supported(&["one two three four five six"])),
+            descriptor.validate(&supported(&["one two three"])),
             Err(BatchCapabilityError::InvalidKeyTerm)
         );
         assert_eq!(
             descriptor.validate(&supported(&["<unsupported>"])),
             Err(BatchCapabilityError::InvalidKeyTerm)
         );
+        assert!(descriptor.validate(&supported(&["😀😀😀😀😀"])).is_ok());
     }
 }

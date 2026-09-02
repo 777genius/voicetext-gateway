@@ -36,6 +36,12 @@ impl CountingRecognizer {
 }
 
 impl BatchRecognizer for CountingRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+        support::batch_capabilities(BatchIdentity::DeepgramNova3MultiV2)
+    }
+
     fn recognize(
         &self,
         request: BatchRecognitionRequest,
@@ -108,8 +114,7 @@ async fn durable_startup_recovery_is_exactly_once() {
     ));
     assert_eq!(recognizer.calls(), 1);
 
-    let profiles =
-        ProfileRegistry::new().with_batch(BatchIdentity::DeepgramNova3MultiV2, recognizer.clone());
+    let profiles = ProfileRegistry::new().with_batch(recognizer.clone());
     let state = GatewayState::new(
         MachineSecret::from_token(b"recovery-e2e-token").unwrap(),
         store.clone(),
@@ -169,3 +174,5 @@ async fn admit(coordinator: &BatchCoordinator<'_>, identity: u8) -> BatchJobId {
     assert!(matches!(outcome, BatchAdmissionOutcome::Accepted(_)));
     id
 }
+#[allow(dead_code, unused_imports)]
+mod support;

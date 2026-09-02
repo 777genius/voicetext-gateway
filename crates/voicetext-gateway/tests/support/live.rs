@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use voicetext_gateway::contracts::live::LiveIdentity;
 
 use tokio::sync::{Mutex, mpsc};
 use voicetext_speech::application::ports::{
@@ -7,9 +8,15 @@ use voicetext_speech::application::ports::{
 };
 
 #[derive(Debug)]
-pub struct FakeLiveFactory;
+pub struct FakeLiveFactory(pub LiveIdentity);
 
 impl LiveRecognizerFactory for FakeLiveFactory {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+        super::live_capabilities(self.0)
+    }
+
     fn open(
         &self,
         _request: LiveRecognitionRequest,

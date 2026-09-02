@@ -1,6 +1,6 @@
 //! Provider-neutral capability contract for one derived live profile.
 
-use super::live::LiveIdentity;
+use super::batch_capabilities::{TextLengthUnit, TimestampProvenance};
 
 /// Timestamp evidence exposed by live transcript events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,38 +34,34 @@ pub enum LiveInputFormat {
     PcmS16Le48KhzMono,
 }
 
-/// Deterministic provider-neutral live lifecycle order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LiveLifecycleEvent {
-    Metadata,
-    Error,
-    Finalize,
-    FinalizedTranscript,
-    TerminalCompletion,
-}
-
 /// Exact public and provider bounds applied before live provider egress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveProviderLimits {
+    pub maximum_public_input_frame_bytes: usize,
     pub maximum_input_frame_bytes: usize,
     pub maximum_key_terms: usize,
     pub maximum_key_term_bytes: Option<usize>,
+    pub maximum_public_key_term_utf16_units: usize,
     pub maximum_key_term_characters: Option<usize>,
-    pub maximum_key_term_total_characters: usize,
+    pub key_term_character_unit: Option<TextLengthUnit>,
+    pub maximum_public_key_term_total_utf16_units: usize,
     pub normalize_key_term_whitespace: bool,
 }
 
 /// Narrow reusable descriptor for one live profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveCapabilityDescriptor {
+    pub protocol_version: u16,
+    pub provider: &'static str,
+    pub model: &'static str,
     pub timestamps: LiveTimestampCapability,
+    pub timestamp_provenance: TimestampProvenance,
     pub finalized_events: LiveFinalizedCapability,
     pub language_hints: LiveLanguageHints,
     pub diarization: bool,
     pub key_terms: bool,
     pub input_formats: &'static [LiveInputFormat],
     pub provider_limits: LiveProviderLimits,
-    pub lifecycle_order: &'static [LiveLifecycleEvent],
 }
 
 /// Features requested before opening a paid live provider session.
@@ -94,65 +90,6 @@ pub enum LiveCapabilityError {
     InvalidKeyTerm,
 }
 
-const INPUTS: &[LiveInputFormat] = &[
-    LiveInputFormat::Opus48KhzMono,
-    LiveInputFormat::PcmS16Le16KhzMono,
-];
-const ORDER: &[LiveLifecycleEvent] = &[
-    LiveLifecycleEvent::Metadata,
-    LiveLifecycleEvent::Error,
-    LiveLifecycleEvent::Finalize,
-    LiveLifecycleEvent::FinalizedTranscript,
-    LiveLifecycleEvent::TerminalCompletion,
-];
-
-const DEEPGRAM: LiveCapabilityDescriptor = LiveCapabilityDescriptor {
-    timestamps: LiveTimestampCapability::Segment,
-    finalized_events: LiveFinalizedCapability::SegmentAndUtterance,
-    language_hints: LiveLanguageHints::AsciiCode {
-        maximum_bytes: 10,
-        hyphen_at_edges: false,
-    },
-    diarization: false,
-    key_terms: true,
-    input_formats: INPUTS,
-    provider_limits: LiveProviderLimits {
-        maximum_input_frame_bytes: 64 * 1_024,
-        maximum_key_terms: 100,
-        maximum_key_term_bytes: Some(256),
-        maximum_key_term_characters: None,
-        maximum_key_term_total_characters: 8_192,
-        normalize_key_term_whitespace: false,
-    },
-    lifecycle_order: ORDER,
-};
-
-const ELEVENLABS: LiveCapabilityDescriptor = LiveCapabilityDescriptor {
-    timestamps: LiveTimestampCapability::None,
-    language_hints: LiveLanguageHints::AsciiCode {
-        maximum_bytes: 10,
-        hyphen_at_edges: true,
-    },
-    provider_limits: LiveProviderLimits {
-        maximum_key_terms: 50,
-        maximum_key_term_bytes: None,
-        maximum_key_term_characters: Some(20),
-        normalize_key_term_whitespace: true,
-        ..DEEPGRAM.provider_limits
-    },
-    ..DEEPGRAM
-};
-
-impl LiveIdentity {
-    /// Returns the exact descriptor bound to this frozen live identity.
-    pub const fn capability_descriptor(self) -> &'static LiveCapabilityDescriptor {
-        match self {
-            Self::DeepgramNova3 => &DEEPGRAM,
-            Self::ElevenlabsScribeV2Realtime => &ELEVENLABS,
-        }
-    }
-}
-
 impl LiveCapabilityDescriptor {
     /// Rejects unsupported or out-of-bound features before a provider can be called.
     pub fn validate(&self, request: &LiveCapabilityRequest<'_>) -> Result<(), LiveCapabilityError> {
@@ -175,33 +112,13 @@ impl LiveCapabilityDescriptor {
             return Err(LiveCapabilityError::UnsupportedInputFormat);
         }
         if request.input_frame_bytes == 0
+            || request.input_frame_bytes > self.provider_limits.maximum_public_input_frame_bytes
             || request.input_frame_bytes > self.provider_limits.maximum_input_frame_bytes
         {
             return Err(LiveCapabilityError::InputLimitExceeded);
         }
         validate_key_terms(request.key_terms, self.provider_limits)
     }
-}
-
-/// Validates the feature-bearing fields in a live client config before session opening.
-pub fn validate_client_profile(
-    identity: LiveIdentity,
-    language: &str,
-    key_terms: &[String],
-    input_format: LiveInputFormat,
-) -> Result<(), LiveCapabilityError> {
-    let terms = key_terms.iter().map(String::as_str).collect::<Vec<_>>();
-    identity
-        .capability_descriptor()
-        .validate(&LiveCapabilityRequest {
-            timestamps: false,
-            finalized_events: true,
-            language_hint: Some(language),
-            diarization: false,
-            key_terms: &terms,
-            input_format,
-            input_frame_bytes: 1,
-        })
 }
 
 fn validate_language(language: &str, policy: LiveLanguageHints) -> Result<(), LiveCapabilityError> {
@@ -234,13 +151,13 @@ fn validate_key_terms(
     }
     let mut total = 0_usize;
     for term in terms {
-        let characters = term.chars().count();
+        let characters = term.encode_utf16().count();
         let normalized;
         let provider_characters = if limits.normalize_key_term_whitespace {
             normalized = term.split_whitespace().collect::<Vec<_>>().join(" ");
-            normalized.chars().count()
+            text_length(&normalized, limits.key_term_character_unit)
         } else {
-            characters
+            text_length(term, limits.key_term_character_unit)
         };
         total = total
             .checked_add(characters)
@@ -248,6 +165,7 @@ fn validate_key_terms(
         let invalid = term.is_empty()
             || term.trim() != *term
             || term.chars().any(char::is_control)
+            || characters > limits.maximum_public_key_term_utf16_units
             || limits
                 .maximum_key_term_bytes
                 .is_some_and(|maximum| term.len() > maximum)
@@ -258,16 +176,57 @@ fn validate_key_terms(
             return Err(LiveCapabilityError::InvalidKeyTerm);
         }
     }
-    if total > limits.maximum_key_term_total_characters {
+    if total > limits.maximum_public_key_term_total_utf16_units {
         Err(LiveCapabilityError::KeyTermLimitExceeded)
     } else {
         Ok(())
     }
 }
 
+fn text_length(value: &str, unit: Option<TextLengthUnit>) -> usize {
+    match unit {
+        Some(TextLengthUnit::UnicodeScalars) => value.chars().count(),
+        Some(TextLengthUnit::Utf16CodeUnits) | None => value.encode_utf16().count(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const INPUTS: &[LiveInputFormat] = &[
+        LiveInputFormat::Opus48KhzMono,
+        LiveInputFormat::PcmS16Le16KhzMono,
+    ];
+
+    fn descriptor() -> LiveCapabilityDescriptor {
+        LiveCapabilityDescriptor {
+            protocol_version: 2,
+            provider: "test",
+            model: "model",
+            timestamps: LiveTimestampCapability::Segment,
+            timestamp_provenance: TimestampProvenance::GatewaySynthesizedFromAcceptedAudio,
+            finalized_events: LiveFinalizedCapability::SegmentAndUtterance,
+            language_hints: LiveLanguageHints::AsciiCode {
+                maximum_bytes: 10,
+                hyphen_at_edges: true,
+            },
+            diarization: false,
+            key_terms: true,
+            input_formats: INPUTS,
+            provider_limits: LiveProviderLimits {
+                maximum_public_input_frame_bytes: 64,
+                maximum_input_frame_bytes: 128,
+                maximum_key_terms: 2,
+                maximum_key_term_bytes: None,
+                maximum_public_key_term_utf16_units: 256,
+                maximum_key_term_characters: Some(5),
+                key_term_character_unit: Some(TextLengthUnit::UnicodeScalars),
+                maximum_public_key_term_total_utf16_units: 10,
+                normalize_key_term_whitespace: true,
+            },
+        }
+    }
 
     fn supported<'a>(key_terms: &'a [&'a str]) -> LiveCapabilityRequest<'a> {
         LiveCapabilityRequest {
@@ -282,27 +241,15 @@ mod tests {
     }
 
     #[test]
-    fn every_live_profile_has_exact_supported_capabilities() {
-        let deepgram = LiveIdentity::DeepgramNova3.capability_descriptor();
-        let elevenlabs = LiveIdentity::ElevenlabsScribeV2Realtime.capability_descriptor();
-        for descriptor in [deepgram, elevenlabs] {
-            assert_eq!(
-                descriptor.finalized_events,
-                LiveFinalizedCapability::SegmentAndUtterance
-            );
-            assert_eq!(descriptor.input_formats, INPUTS);
-            assert!(!descriptor.diarization);
-            assert!(descriptor.validate(&supported(&["VoiceText"])).is_ok());
-            assert_eq!(descriptor.lifecycle_order, ORDER);
-        }
-        assert_eq!(deepgram.timestamps, LiveTimestampCapability::Segment);
-        assert_eq!(elevenlabs.timestamps, LiveTimestampCapability::None);
+    fn checked_descriptor_accepts_its_supported_surface() {
+        assert!(descriptor().validate(&supported(&["Voice"])).is_ok());
     }
 
     #[test]
     fn unsupported_live_features_fail_closed() {
-        let descriptor = LiveIdentity::ElevenlabsScribeV2Realtime.capability_descriptor();
+        let mut descriptor = descriptor();
         let mut request = supported(&[]);
+        descriptor.timestamps = LiveTimestampCapability::None;
         request.timestamps = true;
         assert_eq!(
             descriptor.validate(&request),
@@ -324,22 +271,24 @@ mod tests {
 
     #[test]
     fn live_descriptors_match_provider_language_and_key_term_limits() {
-        let deepgram = LiveIdentity::DeepgramNova3.capability_descriptor();
+        let descriptor = descriptor();
         let mut request = supported(&["x"]);
-        request.language_hint = Some("-en");
+        request.language_hint = Some("not$valid");
         assert_eq!(
-            deepgram.validate(&request),
+            descriptor.validate(&request),
             Err(LiveCapabilityError::UnsupportedLanguageHint)
         );
-
-        let elevenlabs = LiveIdentity::ElevenlabsScribeV2Realtime.capability_descriptor();
         let long = "x".repeat(21);
         let long_terms = [&*long];
         request.language_hint = Some("multi");
         request.key_terms = &long_terms;
         assert_eq!(
-            elevenlabs.validate(&request),
+            descriptor.validate(&request),
             Err(LiveCapabilityError::InvalidKeyTerm)
         );
+        let astral = "😀😀😀😀😀";
+        let astral_terms = [astral];
+        request.key_terms = &astral_terms;
+        assert!(descriptor.validate(&request).is_ok());
     }
 }

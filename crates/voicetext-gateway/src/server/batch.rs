@@ -27,6 +27,7 @@ use crate::contracts::batch_outbound::{
 use crate::identity::{
     IdempotencyKey, canonicalize_keyterms, deterministic_job_id, request_fingerprint,
 };
+use voicetext_speech::application::batch_capabilities::{BatchCapabilityRequest, BatchInputFormat};
 
 const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
 const MAX_TEXT_FIELD_BYTES: usize = 24 * 1024;
@@ -61,6 +62,19 @@ pub(crate) async fn post(
         .batch(identity)
         .cloned()
         .ok_or_else(GatewayHttpError::unsupported_profile)?;
+    let keyterms = form.keyterms.iter().map(String::as_str).collect::<Vec<_>>();
+    recognizer
+        .capabilities()
+        .validate(&BatchCapabilityRequest {
+            timestamps: true,
+            finalized_events: true,
+            language_hint: Some(identity.language()),
+            diarization: false,
+            key_terms: &keyterms,
+            input_format: BatchInputFormat::OggOpus,
+            input_bytes: form.audio.len(),
+        })
+        .map_err(|_| GatewayHttpError::bad_request("UNSUPPORTED_BATCH_CAPABILITY"))?;
 
     let audio_bytes = u64::try_from(form.audio.len())
         .map_err(|_| GatewayHttpError::bad_request("MULTIPART_FIELD_TOO_LARGE"))?;

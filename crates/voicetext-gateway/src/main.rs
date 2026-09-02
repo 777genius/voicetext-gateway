@@ -13,8 +13,6 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use url::Url;
 use voicetext_gateway::config::GatewayConfig;
-use voicetext_gateway::contracts::batch::BatchIdentity;
-use voicetext_gateway::contracts::live::LiveIdentity;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::{MachineSecret, SecretText};
 use voicetext_gateway::server::{
@@ -179,8 +177,8 @@ async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, Boots
             DeepgramLiveRecognizer::new(key.expose_secret(), parse_url(&endpoints.deepgram_live)?)
                 .map_err(|_| BootstrapFailure::ProviderConfiguration)?;
         profiles = profiles
-            .with_batch(BatchIdentity::DeepgramNova3MultiV2, Arc::new(batch))
-            .with_live(LiveIdentity::DeepgramNova3, Arc::new(live));
+            .with_batch(Arc::new(batch))
+            .with_live(Arc::new(live));
     }
     if let Some(path) = &config.elevenlabs_api_key_file {
         let key = provider_secret(path).await?;
@@ -196,8 +194,8 @@ async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, Boots
         )
         .map_err(|_| BootstrapFailure::ProviderConfiguration)?;
         profiles = profiles
-            .with_batch(BatchIdentity::ElevenlabsScribeV2MultiV3, Arc::new(batch))
-            .with_live(LiveIdentity::ElevenlabsScribeV2Realtime, Arc::new(live));
+            .with_batch(Arc::new(batch))
+            .with_live(Arc::new(live));
     }
     Ok(profiles)
 }

@@ -19,6 +19,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use uuid::Uuid;
 use voicetext_audio::discord_opus::DiscordOpusDecoder;
 use voicetext_speech::application::live::{LiveCoordinator, LiveCoordinatorEvent};
+use voicetext_speech::application::live_capabilities::{LiveCapabilityRequest, LiveInputFormat};
 use voicetext_speech::application::ports::{
     LiveRecognitionEvent, LiveRecognitionRequest, LiveTranscript, LiveTranscriptStability,
     RecognitionFailure,
@@ -97,6 +98,27 @@ async fn prepare_session(
         }
         AudioFormat::PcmS16le16Khz => None,
     };
+    let keyterms = config
+        .keyterms
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let input_format = match config.audio_format {
+        AudioFormat::Opus48Khz => LiveInputFormat::Opus48KhzMono,
+        AudioFormat::PcmS16le16Khz => LiveInputFormat::PcmS16Le16KhzMono,
+    };
+    factory
+        .capabilities()
+        .validate(&LiveCapabilityRequest {
+            timestamps: true,
+            finalized_events: true,
+            language_hint: Some(&config.language),
+            diarization: false,
+            key_terms: &keyterms,
+            input_format,
+            input_frame_bytes: 2,
+        })
+        .map_err(|_| SafeLiveError::InvalidConfig)?;
     let request = recognition_request(&config);
     let coordinator = timeout(
         PROVIDER_CONNECT_TIMEOUT,
@@ -123,7 +145,6 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
             let provider_read = opened.coordinator.receive_provider_event();
             tokio::pin!(provider_read);
             tokio::select! {
-                biased;
                 client = socket.recv() => Raced::Client(client),
                 provider = &mut provider_read => Raced::Provider(provider),
                 () = sleep_until(idle_deadline) => Raced::IdleTimeout,
@@ -305,7 +326,6 @@ async fn write_audio_or_cancel(
     let deadline = Instant::now() + PROVIDER_WRITE_TIMEOUT;
     loop {
         tokio::select! {
-            biased;
             client = socket.recv() => match client {
                 None | Some(Err(_) | Ok(Message::Close(_))) => {
                     return Err(SafeLiveError::TransportClosed);
@@ -386,7 +406,6 @@ async fn finalize(
             let provider_read = coordinator.receive_provider_event();
             tokio::pin!(provider_read);
             tokio::select! {
-                biased;
                 client = socket.recv() => match client {
                     None | Some(Err(_) | Ok(Message::Close(_))) => {
                         return Err(SafeLiveError::TransportClosed);
@@ -447,7 +466,6 @@ async fn begin_finalize_or_cancel(
     tokio::pin!(finalize);
     let deadline = Instant::now() + PROVIDER_WRITE_TIMEOUT.min(maximum_wait);
     tokio::select! {
-        biased;
         client = socket.recv() => match client {
             None | Some(Err(_) | Ok(Message::Close(_))) => {
                 Err(SafeLiveError::TransportClosed)
@@ -559,5 +577,4 @@ enum LoopControl {
 }
 
 #[cfg(test)]
-#[path = "live_tests.rs"]
 mod tests;

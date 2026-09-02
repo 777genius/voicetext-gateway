@@ -8,8 +8,6 @@ use voicetext_speech::application::ports::{
 
 pub(super) const MAX_PROVIDER_TEXT_BYTES: usize = 256 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
-const MAX_KEYTERMS: usize = 100;
-const MAX_KEYTERM_BYTES: usize = 256;
 const MALFORMED_RESPONSE: &str = "DEEPGRAM_LIVE_MALFORMED_RESPONSE";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,12 +86,7 @@ pub(super) fn build_url(
     ] {
         query.append_pair(name, value);
     }
-    for keyterm in keyterms
-        .iter()
-        .map(|term| term.trim())
-        .filter(|term| !term.is_empty() && term.len() <= MAX_KEYTERM_BYTES)
-        .take(MAX_KEYTERMS)
-    {
+    for keyterm in keyterms {
         query.append_pair("keyterm", keyterm);
     }
     drop(query);

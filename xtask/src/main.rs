@@ -58,9 +58,14 @@ fn verify(repository_root: &Path) -> Result<(), Vec<String>> {
     let manifest_path = repository_root.join("Cargo.toml");
     let manifest = fs::read_to_string(&manifest_path)
         .map_err(|error| vec![format!("cannot read {}: {error}", manifest_path.display())])?;
+    if manifest.lines().any(|line| line.contains("package =")) {
+        errors.push("workspace dependencies cannot rename first-party crates".to_owned());
+    }
     let members = parse_workspace_members(&manifest)?;
     let source_roots = workspace_source_roots(repository_root, &members, &mut errors);
     let source_files = enumerate_rust_files(repository_root, &source_roots, &mut errors);
+    let test_roots = workspace_test_roots(repository_root, &members);
+    let test_files = enumerate_rust_files(repository_root, &test_roots, &mut errors);
 
     source_dependencies::enforce(
         &boundaries,
@@ -70,7 +75,7 @@ fn verify(repository_root: &Path) -> Result<(), Vec<String>> {
         &mut errors,
     );
 
-    for relative_file in source_files {
+    for relative_file in source_files.into_iter().chain(test_files) {
         verify_source_file(repository_root, &relative_file, &boundaries, &mut errors);
     }
 
@@ -250,6 +255,7 @@ fn workspace_source_roots(
 ) -> Vec<PathBuf> {
     let mut roots = BTreeSet::new();
     for member in members {
+        validate_member_manifest(repository_root, member, errors);
         let source_root = member.join("src");
         let absolute = repository_root.join(&source_root);
         if absolute.is_dir() {
@@ -263,6 +269,81 @@ fn workspace_source_roots(
     }
     roots.insert(PathBuf::from("xtask/src"));
     roots.into_iter().collect()
+}
+
+fn workspace_test_roots(repository_root: &Path, members: &[PathBuf]) -> Vec<PathBuf> {
+    members
+        .iter()
+        .map(|member| member.join("tests"))
+        .filter(|root| repository_root.join(root).is_dir())
+        .collect()
+}
+
+fn validate_member_manifest(repository_root: &Path, member: &Path, errors: &mut Vec<String>) {
+    let manifest_path = member.join("Cargo.toml");
+    let absolute = repository_root.join(&manifest_path);
+    let manifest = match fs::read_to_string(&absolute) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            errors.push(format!("cannot read {}: {error}", manifest_path.display()));
+            return;
+        }
+    };
+    let expected = member
+        .file_name()
+        .map(|name| name.to_string_lossy().replace('-', "_"));
+    validate_manifest_text(&manifest_path, &manifest, expected.as_deref(), errors);
+    let build_script = member.join("build.rs");
+    if repository_root.join(&build_script).exists() {
+        errors.push(format!(
+            "unsupported first-party build script {}",
+            build_script.display()
+        ));
+    }
+    for unsupported in ["examples", "benches", "src/bin"] {
+        let target = member.join(unsupported);
+        if repository_root.join(&target).exists() {
+            errors.push(format!(
+                "unsupported implicit Cargo target directory {}",
+                target.display()
+            ));
+        }
+    }
+}
+
+fn validate_manifest_text(
+    manifest_path: &Path,
+    manifest: &str,
+    expected: Option<&str>,
+    errors: &mut Vec<String>,
+) {
+    let actual = manifest
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("name = \"")?.strip_suffix('"'))
+        .map(|name| name.replace('-', "_"));
+    if actual.as_deref() != expected {
+        errors.push(format!(
+            "{} package name must match its workspace directory",
+            manifest_path.display()
+        ));
+    }
+    for unsupported in ["[lib]", "[[bin]]", "[[example]]", "[[test]]", "[[bench]]"] {
+        if manifest.lines().any(|line| line.trim() == unsupported) {
+            errors.push(format!(
+                "{} uses unsupported custom Cargo target `{unsupported}`",
+                manifest_path.display()
+            ));
+        }
+    }
+    if manifest.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("build =") || line.contains("package =")
+    }) {
+        errors.push(format!(
+            "{} uses an unsupported build script or dependency alias",
+            manifest_path.display()
+        ));
+    }
 }
 
 fn enumerate_rust_files(
@@ -376,6 +457,7 @@ fn enforce_directional_rules(
     source: &str,
     errors: &mut Vec<String>,
 ) {
+    source_dependencies::reject_unsupported_constructs(relative_file, source, errors);
     let is_domain = boundary.name.ends_with(".domain");
     let is_application = boundary.name.ends_with(".application");
     if !is_domain && !is_application {
@@ -486,76 +568,4 @@ fn without_comments(source: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_current_boundary_format() {
-        let boundaries = parse_boundaries(
-            "# comment\nspeech.domain|crates/speech/src/domain|\n\
-             speech.application|crates/speech/src/application|speech.domain\n",
-        )
-        .expect("valid boundaries");
-
-        assert_eq!(boundaries.len(), 2);
-        assert_eq!(boundaries[1].allowed, ["speech.domain"]);
-    }
-
-    #[test]
-    fn rejects_unknown_allowed_boundary() {
-        let errors = parse_boundaries("speech.domain|src/domain|missing\n")
-            .expect_err("unknown boundary must fail");
-
-        assert!(errors.iter().any(|error| error.contains("invalid allowed")));
-    }
-
-    #[test]
-    fn parses_workspace_members() {
-        let members = parse_workspace_members(
-            "[workspace]\nmembers = [\n  \"crates/speech\",\n  \"xtask\",\n]\nresolver = \"3\"\n\n[workspace.package]\n",
-        )
-        .expect("valid workspace");
-
-        assert_eq!(
-            members,
-            [PathBuf::from("crates/speech"), PathBuf::from("xtask")]
-        );
-    }
-
-    #[test]
-    fn directional_rules_ignore_comments_but_reject_code() {
-        let boundary = Boundary {
-            name: "speech.domain".to_owned(),
-            root: PathBuf::from("src/domain"),
-            allowed: Vec::new(),
-        };
-        let mut errors = Vec::new();
-        enforce_directional_rules(
-            Path::new("src/domain/example.rs"),
-            &boundary,
-            "// use tokio;\n/* Deepgram */\nuse crate::application::Port;\n",
-            &mut errors,
-        );
-
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("domain cannot import application"));
-    }
-
-    #[test]
-    fn directional_rules_reject_runtime_and_provider_names() {
-        let boundary = Boundary {
-            name: "speech.application".to_owned(),
-            root: PathBuf::from("src/application"),
-            allowed: vec!["speech.domain".to_owned()],
-        };
-        let mut errors = Vec::new();
-        enforce_directional_rules(
-            Path::new("src/application/example.rs"),
-            &boundary,
-            "use std::env; use tokio::time; struct DeepgramAdapter; type Clock = SystemTime;",
-            &mut errors,
-        );
-
-        assert_eq!(errors.len(), 4);
-    }
-}
+mod tests;

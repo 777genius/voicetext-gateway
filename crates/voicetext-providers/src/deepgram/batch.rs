@@ -3,18 +3,20 @@ use std::fmt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, Response, StatusCode, Url};
 use thiserror::Error;
+use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
 use voicetext_speech::application::ports::{
     BatchReadableSegment, BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer,
     BatchSegment, BoxFuture, ProviderReference, RecognitionFailure,
 };
 
+use super::batch_capabilities::{self, CAPABILITIES};
 use super::dto::{self, ParsedBatchResult};
 use super::timeline;
 
-const CONTRACT_VERSION: u16 = 2;
-const PROVIDER: &str = "deepgram";
-const MODEL: &str = "nova-3";
-const LANGUAGE: &str = "multi";
+pub(super) const CONTRACT_VERSION: u16 = 2;
+pub(super) const PROVIDER: &str = "deepgram";
+pub(super) const MODEL: &str = "nova-3";
+pub(super) const LANGUAGE: &str = "multi";
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_RETRY_AFTER_MILLIS: u64 = 30_000;
@@ -63,7 +65,7 @@ impl DeepgramBatchRecognizer {
         &self,
         request: BatchRecognitionRequest,
     ) -> Result<BatchRecognitionResult, RecognitionFailure> {
-        if !profile_matches(&request) {
+        if !profile_matches(&request) || !batch_capabilities::matches(&request) {
             return Err(known_not_accepted(
                 false,
                 "BATCH_PROFILE_MISMATCH",
@@ -135,6 +137,12 @@ impl fmt::Debug for DeepgramBatchRecognizer {
 }
 
 impl BatchRecognizer for DeepgramBatchRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+        &CAPABILITIES
+    }
+
     fn recognize(
         &self,
         request: BatchRecognitionRequest,

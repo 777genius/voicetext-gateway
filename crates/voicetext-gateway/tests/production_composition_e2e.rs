@@ -1,7 +1,6 @@
-#[path = "support/fixture.rs"]
-mod fixture;
-#[path = "support/provider_wire.rs"]
 mod provider_wire;
+#[allow(dead_code, unused_imports)]
+mod support;
 
 use std::env;
 use std::fs;
@@ -14,8 +13,8 @@ use std::time::Duration;
 use sqlx::postgres::PgConnectOptions;
 use tokio::time::sleep;
 
-use fixture::synthetic_ogg_opus;
 use provider_wire::{DEEPGRAM_KEY, ELEVENLABS_KEY, RunningProviderWire};
+use support::synthetic_ogg_opus;
 
 const TOKEN: &str = "conformance-service-token-00000001";
 

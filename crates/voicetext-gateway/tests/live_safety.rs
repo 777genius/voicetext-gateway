@@ -73,6 +73,12 @@ struct StallingFactory {
 }
 
 impl LiveRecognizerFactory for StallingFactory {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+        support::live_capabilities(voicetext_gateway::contracts::live::LiveIdentity::DeepgramNova3)
+    }
+
     fn open(
         &self,
         _request: LiveRecognitionRequest,

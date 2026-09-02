@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::Boundary;
+mod unsupported;
+pub(super) use unsupported::reject_unsupported_constructs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
@@ -12,6 +14,10 @@ enum Token {
     ColonColon,
     LeftBrace,
     RightBrace,
+    LeftBracket,
+    RightBracket,
+    Pound,
+    Bang,
     Comma,
     Star,
     Semicolon,
@@ -31,7 +37,7 @@ pub(super) fn enforce(
     repository_root: &Path,
     errors: &mut Vec<String>,
 ) {
-    let index = ModuleIndex::new(source_roots, source_files);
+    let index = ModuleIndex::new(source_roots, source_files, errors);
     for relative_file in source_files {
         let Ok(source) = fs::read_to_string(repository_root.join(relative_file)) else {
             continue;
@@ -41,21 +47,40 @@ pub(super) fn enforce(
 }
 
 impl ModuleIndex {
-    fn new(source_roots: &[PathBuf], source_files: &[PathBuf]) -> Self {
+    fn new(source_roots: &[PathBuf], source_files: &[PathBuf], errors: &mut Vec<String>) -> Self {
         let mut modules = BTreeMap::new();
         let mut crates = BTreeMap::new();
         for root in source_roots {
             let Some(package) = root.parent().and_then(Path::file_name) else {
                 continue;
             };
-            crates.insert(package.to_string_lossy().replace('-', "_"), root.clone());
+            let crate_name = package.to_string_lossy().replace('-', "_");
+            if let Some(existing) = crates.insert(crate_name.clone(), root.clone())
+                && existing != *root
+            {
+                errors.push(format!(
+                    "ambiguous first-party crate name `{crate_name}` for {} and {}",
+                    existing.display(),
+                    root.display()
+                ));
+            }
         }
         for file in source_files {
             let Some(root) = source_roots.iter().find(|root| file.starts_with(root)) else {
                 continue;
             };
             if let Some(module) = module_path(root, file) {
-                modules.insert((root.clone(), module), file.clone());
+                if let Some(existing) = modules.insert((root.clone(), module.clone()), file.clone())
+                    && existing != *file
+                    && (!module.is_empty() || !standard_root_pair(&existing, file))
+                {
+                    errors.push(format!(
+                        "ambiguous first-party module `{}` for {} and {}",
+                        module.join("::"),
+                        existing.display(),
+                        file.display()
+                    ));
+                }
             }
         }
         Self { modules, crates }
@@ -79,21 +104,20 @@ impl ModuleIndex {
             Some("super") => {
                 let current = module_path(current_root, file).unwrap_or_default();
                 let count = path.iter().take_while(|part| *part == "super").count();
-                let mut best = None;
-                for pops in 0..=count.min(current.len()) {
-                    let mut candidate = current[..current.len() - pops].to_vec();
-                    candidate.extend(path[count..].iter().cloned());
-                    if let Some((target, score)) = self.resolve_module(current_root, &candidate)
-                        && best.as_ref().is_none_or(|(_, best_score, best_pops)| {
-                            (score, pops) > (*best_score, *best_pops)
-                        })
-                    {
-                        best = Some((target, score, pops));
-                    }
+                if count > current.len() {
+                    return Err(format!(
+                        "first-party path `{}` escapes its crate root",
+                        path.join("::")
+                    ));
                 }
-                return best.map(|(target, _, _)| Some(target)).ok_or_else(|| {
-                    format!("cannot resolve first-party path `{}`", path.join("::"))
-                });
+                let mut candidate = current[..current.len() - count].to_vec();
+                candidate.extend(path[count..].iter().cloned());
+                return self
+                    .resolve_module(current_root, &candidate)
+                    .map(|(target, _)| Some(target))
+                    .ok_or_else(|| {
+                        format!("cannot resolve first-party path `{}`", path.join("::"))
+                    });
             }
             Some(first) => {
                 let Some(root) = self.crates.get(first) else {
@@ -128,6 +152,12 @@ impl ModuleIndex {
         }
         None
     }
+}
+
+fn standard_root_pair(left: &Path, right: &Path) -> bool {
+    let names = [left.file_name(), right.file_name()];
+    names.contains(&Some(std::ffi::OsStr::new("lib.rs")))
+        && names.contains(&Some(std::ffi::OsStr::new("main.rs")))
 }
 
 fn module_path(root: &Path, file: &Path) -> Option<Vec<String>> {
@@ -195,7 +225,8 @@ fn classify<'a>(boundaries: &'a [Boundary], file: &Path) -> Option<&'a Boundary>
 }
 
 fn first_party_paths(source: &str, index: &ModuleIndex, file: &Path) -> Vec<Vec<String>> {
-    let tokens = tokenize(source);
+    let source = without_cfg_test_modules(source);
+    let tokens = tokenize(&source);
     let mut paths = use_paths(&tokens);
     let mut index_token = 0;
     while index_token < tokens.len() {
@@ -247,6 +278,58 @@ fn first_party_paths(source: &str, index: &ModuleIndex, file: &Path) -> Vec<Vec<
         }
     }
     paths
+}
+
+fn without_cfg_test_modules(source: &str) -> String {
+    let mut output = source.as_bytes().to_vec();
+    let mut search = 0;
+    while let Some(offset) = source[search..].find("#[cfg(test)]") {
+        let start = search + offset;
+        let remainder = &source[start..];
+        let semicolon = remainder.find(';');
+        let opening = remainder.find('{');
+        if let Some(semicolon) = semicolon
+            && opening.is_none_or(|opening| semicolon < opening)
+        {
+            let end = start + semicolon + 1;
+            for byte in &mut output[start..end] {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            search = end;
+            continue;
+        }
+        let Some(open_offset) = opening else {
+            break;
+        };
+        let open = start + open_offset;
+        let mut depth = 0_u32;
+        let mut end = open;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end == open {
+            break;
+        }
+        for byte in &mut output[start..end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        search = end;
+    }
+    String::from_utf8(output).expect("source began as UTF-8")
 }
 
 fn use_paths(tokens: &[Token]) -> Vec<Vec<String>> {
@@ -360,6 +443,18 @@ fn tokenize(source: &str) -> Vec<Token> {
         } else if bytes[cursor] == b'}' {
             tokens.push(Token::RightBrace);
             cursor += 1;
+        } else if bytes[cursor] == b'[' {
+            tokens.push(Token::LeftBracket);
+            cursor += 1;
+        } else if bytes[cursor] == b']' {
+            tokens.push(Token::RightBracket);
+            cursor += 1;
+        } else if bytes[cursor] == b'#' {
+            tokens.push(Token::Pound);
+            cursor += 1;
+        } else if bytes[cursor] == b'!' {
+            tokens.push(Token::Bang);
+            cursor += 1;
         } else if bytes[cursor] == b',' {
             tokens.push(Token::Comma);
             cursor += 1;
@@ -446,92 +541,4 @@ fn skip_raw_string(bytes: &[u8], cursor: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fixture() -> (Vec<Boundary>, Vec<PathBuf>, Vec<PathBuf>, ModuleIndex) {
-        let boundaries = vec![
-            Boundary {
-                name: "app".to_owned(),
-                root: PathBuf::from("crates/demo/src/app"),
-                allowed: vec!["domain".to_owned()],
-            },
-            Boundary {
-                name: "domain".to_owned(),
-                root: PathBuf::from("crates/demo/src/domain"),
-                allowed: Vec::new(),
-            },
-            Boundary {
-                name: "adapter".to_owned(),
-                root: PathBuf::from("crates/demo/src/adapter"),
-                allowed: vec!["app".to_owned()],
-            },
-        ];
-        let roots = vec![PathBuf::from("crates/demo/src")];
-        let files = vec![
-            PathBuf::from("crates/demo/src/app/mod.rs"),
-            PathBuf::from("crates/demo/src/domain/deep/model.rs"),
-            PathBuf::from("crates/demo/src/adapter/deep/client.rs"),
-        ];
-        let index = ModuleIndex::new(&roots, &files);
-        (boundaries, roots, files, index)
-    }
-
-    #[test]
-    fn positive_fixture_resolves_deep_and_renamed_import() {
-        let (boundaries, _, _, index) = fixture();
-        let source = include_str!("../fixtures/source-dependencies/positive/deep_renamed.rs");
-        let mut errors = Vec::new();
-        enforce_file(
-            &boundaries,
-            &index,
-            Path::new("crates/demo/src/app/mod.rs"),
-            source,
-            &mut errors,
-        );
-        assert!(errors.is_empty(), "{errors:?}");
-    }
-
-    #[test]
-    fn negative_fixture_rejects_deep_and_renamed_undeclared_edge() {
-        let (boundaries, _, _, index) = fixture();
-        let source = include_str!("../fixtures/source-dependencies/negative/deep_renamed.rs");
-        let mut errors = Vec::new();
-        enforce_file(
-            &boundaries,
-            &index,
-            Path::new("crates/demo/src/domain/deep/model.rs"),
-            source,
-            &mut errors,
-        );
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("domain -> adapter"));
-        assert!(errors[0].contains("crate::adapter::deep::client::Client"));
-    }
-
-    #[test]
-    fn tokenizer_ignores_comments_and_all_string_forms() {
-        let (_, _, _, index) = fixture();
-        let paths = first_party_paths(
-            "// crate::adapter::Bad\n\"crate::adapter::Bad\"; r#\"crate::adapter::Bad\"#; crate::domain::Good;",
-            &index,
-            Path::new("crates/demo/src/app/mod.rs"),
-        );
-        assert_eq!(paths, [vec!["crate", "domain", "Good"]]);
-    }
-
-    #[test]
-    fn grouped_use_trees_resolve_each_deep_edge_before_aliasing() {
-        let (boundaries, _, _, index) = fixture();
-        let mut errors = Vec::new();
-        enforce_file(
-            &boundaries,
-            &index,
-            Path::new("crates/demo/src/domain/deep/model.rs"),
-            "use crate::{domain::deep::model::Model, adapter::{deep::client::Client as C}};",
-            &mut errors,
-        );
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].contains("domain -> adapter"));
-    }
-}
+mod tests;

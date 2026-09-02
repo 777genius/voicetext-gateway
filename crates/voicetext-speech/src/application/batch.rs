@@ -33,7 +33,6 @@ impl fmt::Debug for BatchCoordinator<'_> {
 }
 
 impl<'a> BatchCoordinator<'a> {
-    /// Binds the narrow capabilities required by the batch use case.
     pub const fn new(
         recognizer: &'a dyn BatchRecognizer,
         jobs: &'a dyn BatchJobStore,
@@ -46,7 +45,6 @@ impl<'a> BatchCoordinator<'a> {
         }
     }
 
-    /// Durably admits a request or returns its exact prior snapshot.
     pub fn admit(
         &self,
         mut request: BatchAdmissionRequest,
@@ -313,6 +311,12 @@ mod tests {
     }
 
     impl BatchRecognizer for Fake {
+        fn capabilities(
+            &self,
+        ) -> &'static crate::application::batch_capabilities::BatchCapabilityDescriptor {
+            panic!("application fake has no composition capabilities")
+        }
+
         fn recognize(
             &self,
             _request: BatchRecognitionRequest,

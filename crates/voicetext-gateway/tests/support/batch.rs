@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use voicetext_gateway::contracts::batch::BatchIdentity;
 
 use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
@@ -131,9 +132,15 @@ impl BatchAudioSpool for FakeBatchInfrastructure {
 }
 
 #[derive(Debug)]
-pub struct FakeBatchRecognizer;
+pub struct FakeBatchRecognizer(pub BatchIdentity);
 
 impl BatchRecognizer for FakeBatchRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+        super::batch_capabilities(self.0)
+    }
+
     fn recognize(
         &self,
         request: BatchRecognitionRequest,

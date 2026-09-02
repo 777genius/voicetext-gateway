@@ -6,9 +6,9 @@ use std::sync::Arc;
 use voicetext_speech::application::ports::{BatchRecognizer, LiveRecognizerFactory};
 
 use crate::contracts::batch::BatchIdentity;
-use crate::contracts::batch_capabilities::BatchCapabilityDescriptor;
 use crate::contracts::live::LiveIdentity;
-use crate::contracts::live_capabilities::LiveCapabilityDescriptor;
+use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
+use voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor;
 
 /// Configured recognizers for the four `VoiceText` compatibility profiles.
 ///
@@ -36,12 +36,10 @@ impl ProfileRegistry {
 
     /// Binds exactly one batch profile.
     #[must_use]
-    pub fn with_batch(
-        mut self,
-        identity: BatchIdentity,
-        recognizer: Arc<dyn BatchRecognizer>,
-    ) -> Self {
-        match identity {
+    pub fn with_batch(mut self, recognizer: Arc<dyn BatchRecognizer>) -> Self {
+        match batch_identity(recognizer.capabilities())
+            .expect("batch adapter advertises an unsupported capability identity")
+        {
             BatchIdentity::DeepgramNova3MultiV2 => self.deepgram_batch = Some(recognizer),
             BatchIdentity::ElevenlabsScribeV2MultiV3 => self.elevenlabs_batch = Some(recognizer),
         }
@@ -50,12 +48,10 @@ impl ProfileRegistry {
 
     /// Binds exactly one live profile.
     #[must_use]
-    pub fn with_live(
-        mut self,
-        identity: LiveIdentity,
-        recognizer: Arc<dyn LiveRecognizerFactory>,
-    ) -> Self {
-        match identity {
+    pub fn with_live(mut self, recognizer: Arc<dyn LiveRecognizerFactory>) -> Self {
+        match live_identity(recognizer.capabilities())
+            .expect("live adapter advertises an unsupported capability identity")
+        {
             LiveIdentity::DeepgramNova3 => self.deepgram_live = Some(recognizer),
             LiveIdentity::ElevenlabsScribeV2Realtime => self.elevenlabs_live = Some(recognizer),
         }
@@ -78,7 +74,7 @@ impl ProfileRegistry {
         identity: BatchIdentity,
     ) -> Option<&'static BatchCapabilityDescriptor> {
         self.batch(identity)
-            .map(|_| identity.capability_descriptor())
+            .map(|recognizer| recognizer.capabilities())
     }
 
     /// Returns the exact configured live profile, without fallback.
@@ -97,7 +93,7 @@ impl ProfileRegistry {
         identity: LiveIdentity,
     ) -> Option<&'static LiveCapabilityDescriptor> {
         self.live(identity)
-            .map(|_| identity.capability_descriptor())
+            .map(|recognizer| recognizer.capabilities())
     }
 
     /// True when at least one batch and one live profile are available.
@@ -105,6 +101,32 @@ impl ProfileRegistry {
     pub fn is_operational(&self) -> bool {
         (self.deepgram_batch.is_some() || self.elevenlabs_batch.is_some())
             && (self.deepgram_live.is_some() || self.elevenlabs_live.is_some())
+    }
+}
+
+fn batch_identity(descriptor: &BatchCapabilityDescriptor) -> Option<BatchIdentity> {
+    [
+        BatchIdentity::DeepgramNova3MultiV2,
+        BatchIdentity::ElevenlabsScribeV2MultiV3,
+    ]
+    .into_iter()
+    .find(|identity| {
+        descriptor.contract_version == u16::from(identity.contract_version())
+            && descriptor.provider == identity.provider()
+            && descriptor.model == identity.model()
+            && descriptor.language == identity.language()
+    })
+}
+
+fn live_identity(descriptor: &LiveCapabilityDescriptor) -> Option<LiveIdentity> {
+    match (
+        descriptor.protocol_version,
+        descriptor.provider,
+        descriptor.model,
+    ) {
+        (2, "deepgram", "nova-3") => Some(LiveIdentity::DeepgramNova3),
+        (2, "elevenlabs", "scribe_v2_realtime") => Some(LiveIdentity::ElevenlabsScribeV2Realtime),
+        _ => None,
     }
 }
 
@@ -122,6 +144,14 @@ impl fmt::Debug for ProfileRegistry {
 
 #[cfg(test)]
 mod tests {
+    use voicetext_speech::application::batch_capabilities::{
+        BatchFinalizedCapability, BatchInputFormat, BatchLanguageHints, BatchProviderLimits,
+        BatchTimestampCapability, TimestampProvenance,
+    };
+    use voicetext_speech::application::live_capabilities::{
+        LiveFinalizedCapability, LiveInputFormat, LiveLanguageHints, LiveProviderLimits,
+        LiveTimestampCapability,
+    };
     use voicetext_speech::application::ports::{
         BatchRecognitionRequest, BatchRecognitionResult, BoxFuture, LiveRecognitionRequest,
         LiveRecognizerSession, RecognitionFailure,
@@ -129,10 +159,67 @@ mod tests {
 
     use super::*;
 
+    const BATCH_INPUTS: &[BatchInputFormat] = &[BatchInputFormat::OggOpus];
+    const BATCH: BatchCapabilityDescriptor = BatchCapabilityDescriptor {
+        contract_version: 2,
+        provider: "deepgram",
+        model: "nova-3",
+        language: "multi",
+        timestamps: BatchTimestampCapability::Segment,
+        timestamp_provenance: TimestampProvenance::ProviderNative,
+        finalized_events: BatchFinalizedCapability::TerminalTranscript,
+        language_hints: BatchLanguageHints::Fixed("multi"),
+        diarization: false,
+        key_terms: true,
+        input_formats: BATCH_INPUTS,
+        provider_limits: BatchProviderLimits {
+            maximum_public_input_bytes: 1,
+            maximum_input_bytes: 1,
+            maximum_key_terms: 0,
+            maximum_key_term_bytes: 0,
+            maximum_key_term_characters: None,
+            key_term_character_unit: None,
+            maximum_key_term_words: None,
+            normalize_key_term_whitespace: false,
+            restricted_key_term_punctuation: false,
+        },
+    };
+    const LIVE_INPUTS: &[LiveInputFormat] = &[LiveInputFormat::Opus48KhzMono];
+    const LIVE: LiveCapabilityDescriptor = LiveCapabilityDescriptor {
+        protocol_version: 2,
+        provider: "elevenlabs",
+        model: "scribe_v2_realtime",
+        timestamps: LiveTimestampCapability::Segment,
+        timestamp_provenance: TimestampProvenance::GatewaySynthesizedFromAcceptedAudio,
+        finalized_events: LiveFinalizedCapability::SegmentAndUtterance,
+        language_hints: LiveLanguageHints::AsciiCode {
+            maximum_bytes: 10,
+            hyphen_at_edges: true,
+        },
+        diarization: false,
+        key_terms: true,
+        input_formats: LIVE_INPUTS,
+        provider_limits: LiveProviderLimits {
+            maximum_public_input_frame_bytes: 1,
+            maximum_input_frame_bytes: 1,
+            maximum_key_terms: 0,
+            maximum_key_term_bytes: None,
+            maximum_public_key_term_utf16_units: 1,
+            maximum_key_term_characters: None,
+            key_term_character_unit: None,
+            maximum_public_key_term_total_utf16_units: 0,
+            normalize_key_term_whitespace: false,
+        },
+    };
+
     #[derive(Debug)]
     struct Never;
 
     impl BatchRecognizer for Never {
+        fn capabilities(&self) -> &'static BatchCapabilityDescriptor {
+            &BATCH
+        }
+
         fn recognize(
             &self,
             _request: BatchRecognitionRequest,
@@ -142,6 +229,10 @@ mod tests {
     }
 
     impl LiveRecognizerFactory for Never {
+        fn capabilities(&self) -> &'static LiveCapabilityDescriptor {
+            &LIVE
+        }
+
         fn open(
             &self,
             _request: LiveRecognitionRequest,
@@ -153,8 +244,8 @@ mod tests {
     #[test]
     fn exact_slots_never_fall_back() {
         let registry = ProfileRegistry::new()
-            .with_batch(BatchIdentity::DeepgramNova3MultiV2, Arc::new(Never))
-            .with_live(LiveIdentity::ElevenlabsScribeV2Realtime, Arc::new(Never));
+            .with_batch(Arc::new(Never))
+            .with_live(Arc::new(Never));
 
         assert!(
             registry
@@ -177,7 +268,7 @@ mod tests {
             registry
                 .batch_descriptor(BatchIdentity::DeepgramNova3MultiV2)
                 .unwrap(),
-            BatchIdentity::DeepgramNova3MultiV2.capability_descriptor()
+            &BATCH
         );
         assert!(
             registry
@@ -188,7 +279,7 @@ mod tests {
             registry
                 .live_descriptor(LiveIdentity::ElevenlabsScribeV2Realtime)
                 .unwrap(),
-            LiveIdentity::ElevenlabsScribeV2Realtime.capability_descriptor()
+            &LIVE
         );
     }
 }

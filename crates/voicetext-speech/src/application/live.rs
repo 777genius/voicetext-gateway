@@ -363,6 +363,12 @@ mod tests {
     }
 
     impl LiveRecognizerFactory for FakeFactory {
+        fn capabilities(
+            &self,
+        ) -> &'static crate::application::live_capabilities::LiveCapabilityDescriptor {
+            panic!("application fake has no composition capabilities")
+        }
+
         fn open(
             &self,
             _request: LiveRecognitionRequest,

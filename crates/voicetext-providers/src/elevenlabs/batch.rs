@@ -1,23 +1,25 @@
-use std::collections::HashSet;
 use std::fmt;
 
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Response, StatusCode, Url};
 use thiserror::Error;
+use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
 use voicetext_speech::application::ports::{
     BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer, BatchSegment, BoxFuture,
     ProviderReference, RecognitionFailure,
 };
 
+use super::batch_capabilities::{self, CAPABILITIES};
+use super::batch_keyterms::canonicalize_keyterms;
 use super::dto::{self, ParsedBatchResult};
 
-const CONTRACT_VERSION: u16 = 3;
-const PROVIDER: &str = "elevenlabs";
-const MODEL: &str = "scribe_v2";
-const LANGUAGE: &str = "multi";
-const MAX_AUDIO_BYTES: usize = 500 * 1_024 * 1_024;
-const MAX_KEYTERMS: usize = 100;
+pub(super) const CONTRACT_VERSION: u16 = 3;
+pub(super) const PROVIDER: &str = "elevenlabs";
+pub(super) const MODEL: &str = "scribe_v2";
+pub(super) const LANGUAGE: &str = "multi";
+pub(super) const MAX_AUDIO_BYTES: usize = 500 * 1_024 * 1_024;
+pub(super) const MAX_KEYTERMS: usize = 100;
 const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1_024 * 1_024;
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1_024;
 const MAX_RETRY_AFTER_MILLIS: u64 = 30_000;
@@ -31,7 +33,6 @@ pub enum ElevenLabsConfigurationError {
     InvalidApiKeyHeader,
 }
 
-/// `ElevenLabs` Scribe v2 implementation of the provider-neutral paid batch port.
 pub struct ElevenLabsBatchRecognizer {
     client: Client,
     api_key: HeaderValue,
@@ -39,7 +40,6 @@ pub struct ElevenLabsBatchRecognizer {
 }
 
 impl ElevenLabsBatchRecognizer {
-    /// Creates an adapter from explicitly injected transport configuration.
     ///
     /// # Errors
     ///
@@ -73,7 +73,7 @@ impl ElevenLabsBatchRecognizer {
             authoritative_duration_millis,
             keyterms,
         } = request;
-        let keyterms = canonicalize_keyterms(keyterms)?;
+        let keyterms = canonicalize_keyterms(keyterms);
         let audio = Part::bytes(audio)
             .file_name("audio.ogg")
             .mime_str("audio/ogg")
@@ -132,6 +132,12 @@ impl fmt::Debug for ElevenLabsBatchRecognizer {
 }
 
 impl BatchRecognizer for ElevenLabsBatchRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+        &CAPABILITIES
+    }
+
     fn recognize(
         &self,
         request: BatchRecognitionRequest,
@@ -169,36 +175,15 @@ fn validate_request(request: &BatchRecognitionRequest) -> Result<(), Recognition
             None,
         ));
     }
+    if !batch_capabilities::matches(request) {
+        return Err(known_not_accepted(
+            false,
+            "ELEVENLABS_REQUEST_CAPABILITY_MISMATCH",
+            None,
+            None,
+        ));
+    }
     Ok(())
-}
-
-fn canonicalize_keyterms(input: Vec<String>) -> Result<Vec<String>, RecognitionFailure> {
-    if input.len() > MAX_KEYTERMS {
-        return Err(invalid_keyterms());
-    }
-    let mut seen = HashSet::new();
-    let mut output = Vec::new();
-    for term in input {
-        let normalized = term.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.is_empty()
-            || normalized.chars().count() >= 50
-            || normalized.split_whitespace().count() > 5
-            || normalized
-                .chars()
-                .any(|character| matches!(character, '<' | '>' | '{' | '}' | '[' | ']' | '\\'))
-        {
-            return Err(invalid_keyterms());
-        }
-        if seen.insert(normalized.clone()) {
-            output.push(normalized);
-        }
-    }
-    output.sort();
-    Ok(output)
-}
-
-fn invalid_keyterms() -> RecognitionFailure {
-    known_not_accepted(false, "ELEVENLABS_KEYTERMS_INVALID", None, None)
 }
 
 fn project_result(
@@ -586,8 +571,24 @@ mod tests {
                 if code == "BATCH_PROFILE_MISMATCH"
         ));
         assert!(!format!("{recognizer:?}").contains("never-print-this"));
-        assert!(canonicalize_keyterms(vec!["x".into(); MAX_KEYTERMS + 1]).is_err());
-        assert!(canonicalize_keyterms(vec!["bad<tag".into()]).is_err());
+        let mut excessive = request();
+        excessive.keyterms = vec!["x".into(); MAX_KEYTERMS + 1];
+        assert!(matches!(
+            recognizer.recognize(excessive).await,
+            Err(RecognitionFailure::KnownNotAccepted {
+                retryable: false,
+                ..
+            })
+        ));
+        let mut punctuation = request();
+        punctuation.keyterms = vec!["bad<tag".into()];
+        assert!(matches!(
+            recognizer.recognize(punctuation).await,
+            Err(RecognitionFailure::KnownNotAccepted {
+                retryable: false,
+                ..
+            })
+        ));
 
         let failure = recognizer.recognize(request()).await.unwrap_err();
         assert!(matches!(

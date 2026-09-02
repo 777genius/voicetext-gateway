@@ -6,7 +6,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::{Uuid, Variant};
 
 use super::ContractViolation;
-use super::live_capabilities::{LiveInputFormat, validate_client_profile};
 
 const MAX_ERROR_CODE_CHARS: usize = 128;
 const MAX_ERROR_MESSAGE_CHARS: usize = 2_048;
@@ -23,6 +22,13 @@ const MAX_COMMAND_BYTES: usize = 1_024;
 pub enum ClientCommand {
     Finalize,
     Close,
+}
+
+/// The only supported live provider/model identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LiveIdentity {
+    DeepgramNova3,
+    ElevenlabsScribeV2Realtime,
 }
 
 /// Parses a bounded control frame without accepting audio encoded as JSON.
@@ -48,26 +54,10 @@ pub fn parse_client_command(json: &str) -> Result<ClientCommand, ContractViolati
     }
 }
 
-/// The only supported live provider/model identities.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LiveIdentity {
-    DeepgramNova3,
-    ElevenlabsScribeV2Realtime,
-}
-
-impl LiveIdentity {
-    pub const fn provider(self) -> Provider {
-        match self {
-            Self::DeepgramNova3 => Provider::Deepgram,
-            Self::ElevenlabsScribeV2Realtime => Provider::Elevenlabs,
-        }
-    }
-
-    pub const fn model(self) -> Model {
-        match self {
-            Self::DeepgramNova3 => Model::Nova3,
-            Self::ElevenlabsScribeV2Realtime => Model::ScribeV2Realtime,
-        }
+const fn identity_wire(identity: LiveIdentity) -> (Provider, Model) {
+    match identity {
+        LiveIdentity::DeepgramNova3 => (Provider::Deepgram, Model::Nova3),
+        LiveIdentity::ElevenlabsScribeV2Realtime => (Provider::Elevenlabs, Model::ScribeV2Realtime),
     }
 }
 
@@ -168,12 +158,6 @@ pub fn parse_client_config(json: &str) -> Result<ClientConfig, ContractViolation
     };
     validate_language(&wire.language)?;
     validate_keyterms(&wire.keyterms)?;
-    let input_format = match audio_format {
-        AudioFormat::Opus48Khz => LiveInputFormat::Opus48KhzMono,
-        AudioFormat::PcmS16le16Khz => LiveInputFormat::PcmS16Le16KhzMono,
-    };
-    validate_client_profile(identity, &wire.language, &wire.keyterms, input_format)
-        .map_err(|_| ContractViolation("unsupported live profile features"))?;
     Ok(ClientConfig {
         identity,
         language: wire.language,
@@ -198,8 +182,8 @@ pub fn serialize_client_config(config: &ClientConfig) -> Result<String, Contract
     };
     let wire = ConfigWire {
         message_type: ConfigType::Config,
-        provider: config.identity.provider(),
-        model: config.identity.model(),
+        provider: identity_wire(config.identity).0,
+        model: identity_wire(config.identity).1,
         language: config.language.clone(),
         capabilities: vec![Capability::FinalizeAck],
         channels: 1,
@@ -314,7 +298,7 @@ fn parse_ready(
     let wire: ReadyWire =
         serde_json::from_value(value).map_err(|_| ContractViolation("invalid ready message"))?;
     require(
-        wire.provider == expected.provider() && wire.model == expected.model(),
+        (wire.provider, wire.model) == identity_wire(expected),
         "ready identity mismatch",
     )?;
     Ok(ServerMessage::Ready {

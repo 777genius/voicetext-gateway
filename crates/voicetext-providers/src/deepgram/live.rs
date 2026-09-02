@@ -16,6 +16,11 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::Url;
+use voicetext_speech::application::batch_capabilities::TimestampProvenance;
+use voicetext_speech::application::live_capabilities::{
+    LiveCapabilityDescriptor, LiveCapabilityRequest, LiveFinalizedCapability, LiveInputFormat,
+    LiveLanguageHints, LiveProviderLimits, LiveTimestampCapability,
+};
 use voicetext_speech::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
     LiveRecognizerSession, ProviderReference, RecognitionFailure,
@@ -30,6 +35,37 @@ const MAX_RETRY_AFTER_MILLIS: u64 = 30_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_FORMATS: &[LiveInputFormat] = &[
+    LiveInputFormat::Opus48KhzMono,
+    LiveInputFormat::PcmS16Le16KhzMono,
+    LiveInputFormat::PcmS16Le48KhzMono,
+];
+const CAPABILITIES: LiveCapabilityDescriptor = LiveCapabilityDescriptor {
+    protocol_version: PROTOCOL_VERSION,
+    provider: PROVIDER,
+    model: MODEL,
+    timestamps: LiveTimestampCapability::Segment,
+    timestamp_provenance: TimestampProvenance::ProviderNative,
+    finalized_events: LiveFinalizedCapability::SegmentAndUtterance,
+    language_hints: LiveLanguageHints::AsciiCode {
+        maximum_bytes: 10,
+        hyphen_at_edges: false,
+    },
+    diarization: false,
+    key_terms: true,
+    input_formats: INPUT_FORMATS,
+    provider_limits: LiveProviderLimits {
+        maximum_public_input_frame_bytes: 64 * 1_024,
+        maximum_input_frame_bytes: 64 * 1_024,
+        maximum_key_terms: 100,
+        maximum_key_term_bytes: Some(256),
+        maximum_public_key_term_utf16_units: 256,
+        maximum_key_term_characters: None,
+        key_term_character_unit: None,
+        maximum_public_key_term_total_utf16_units: 8_192,
+        normalize_key_term_whitespace: false,
+    },
+};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ClientWriter = SplitSink<ClientSocket, Message>;
@@ -77,7 +113,7 @@ impl DeepgramLiveRecognizer {
         &self,
         request: LiveRecognitionRequest,
     ) -> Result<Box<dyn LiveRecognizerSession>, RecognitionFailure> {
-        if !profile_matches(&request) {
+        if !profile_matches(&request) || !capabilities_match(&request) {
             return Err(known_not_accepted(
                 false,
                 "DEEPGRAM_LIVE_PROFILE_MISMATCH",
@@ -155,12 +191,42 @@ impl fmt::Debug for DeepgramLiveRecognizer {
 }
 
 impl LiveRecognizerFactory for DeepgramLiveRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+        &CAPABILITIES
+    }
+
     fn open(
         &self,
         request: LiveRecognitionRequest,
     ) -> BoxFuture<'_, Result<Box<dyn LiveRecognizerSession>, RecognitionFailure>> {
         Box::pin(self.open_inner(request))
     }
+}
+
+fn capabilities_match(request: &LiveRecognitionRequest) -> bool {
+    let terms = request
+        .keyterms
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let input_format = match request.sample_rate_hz {
+        16_000 => LiveInputFormat::PcmS16Le16KhzMono,
+        48_000 => LiveInputFormat::PcmS16Le48KhzMono,
+        _ => return false,
+    };
+    CAPABILITIES
+        .validate(&LiveCapabilityRequest {
+            timestamps: true,
+            finalized_events: true,
+            language_hint: Some(&request.profile.language),
+            diarization: false,
+            key_terms: &terms,
+            input_format,
+            input_frame_bytes: 2,
+        })
+        .is_ok()
 }
 
 /// One connected Deepgram live session with independent read and write locks.
@@ -395,5 +461,4 @@ fn unknown(code: &str, provider_reference: Option<ProviderReference>) -> Recogni
 }
 
 #[cfg(test)]
-#[path = "live_tests.rs"]
 mod tests;

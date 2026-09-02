@@ -1,10 +1,8 @@
 //! Versioned `VoiceText` boundary data and wire validation.
 
 pub mod batch;
-pub mod batch_capabilities;
 pub mod batch_outbound;
 pub mod live;
-pub mod live_capabilities;
 pub mod live_outbound;
 
 use std::fmt;
@@ -182,16 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn live_config_rejects_profile_specific_features_before_session_open() {
+    fn transport_parsing_preserves_profile_features_for_application_validation() {
         let too_long = "x".repeat(21);
         let elevenlabs = format!(
             r#"{{"type":"config","provider":"elevenlabs","model":"scribe_v2_realtime","language":"multi","capabilities":["finalize_ack"],"channels":1,"protocol_v":2,"client_session_id":"{ID}","encoding":"opus","sample_rate":48000,"keyterms":["{too_long}"]}}"#
         );
-        assert!(live::parse_client_config(&elevenlabs).is_err());
+        assert!(live::parse_client_config(&elevenlabs).is_ok());
         let deepgram = format!(
             r#"{{"type":"config","provider":"deepgram","model":"nova-3","language":"-en","capabilities":["finalize_ack"],"channels":1,"protocol_v":2,"client_session_id":"{ID}","encoding":"opus","sample_rate":48000}}"#
         );
-        assert!(live::parse_client_config(&deepgram).is_err());
+        assert!(live::parse_client_config(&deepgram).is_ok());
     }
 }
 

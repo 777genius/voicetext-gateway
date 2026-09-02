@@ -1,6 +1,7 @@
 //! Deepgram Nova-3 speech-to-text adapters.
 
 mod batch;
+mod batch_capabilities;
 mod dto;
 mod live;
 mod live_dto;

@@ -96,24 +96,12 @@ fn decode_audio(message: Message) -> (Vec<u8>, bool) {
 }
 
 #[test]
-fn adapts_optional_keyterms_to_realtime_provider_limits() {
-    let mut input = vec![
-        " Craig ".into(),
-        "live Pipecat assistant".into(),
-        "   ".into(),
-        "Craig".into(),
-        "release   train".into(),
-    ];
-    input.extend((0..60).map(|index| format!("term-{index:02}")));
-
+fn canonicalizes_keyterms_after_checked_validation() {
+    let input = vec!["Craig".into(), "Craig".into(), "release   train".into()];
     let keyterms = canonicalize_keyterms(&input);
-
-    assert_eq!(keyterms.len(), MAX_KEYTERMS);
+    assert_eq!(keyterms.len(), 2);
     assert_eq!(keyterms[0], "Craig");
     assert_eq!(keyterms[1], "release train");
-    assert_eq!(keyterms[2], "term-00");
-    assert_eq!(keyterms[MAX_KEYTERMS - 1], "term-47");
-    assert!(!keyterms.iter().any(|term| term == "live Pipecat assistant"));
 }
 
 #[tokio::test]

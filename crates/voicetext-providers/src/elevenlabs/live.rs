@@ -16,6 +16,11 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use url::Url;
+use voicetext_speech::application::batch_capabilities::{TextLengthUnit, TimestampProvenance};
+use voicetext_speech::application::live_capabilities::{
+    LiveCapabilityDescriptor, LiveCapabilityRequest, LiveFinalizedCapability, LiveInputFormat,
+    LiveLanguageHints, LiveProviderLimits, LiveTimestampCapability,
+};
 use voicetext_speech::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
     LiveRecognizerSession, ProviderReference, RecognitionFailure,
@@ -36,6 +41,37 @@ const MAX_RETRY_AFTER_MILLIS: u64 = 30_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_FORMATS: &[LiveInputFormat] = &[
+    LiveInputFormat::Opus48KhzMono,
+    LiveInputFormat::PcmS16Le16KhzMono,
+    LiveInputFormat::PcmS16Le48KhzMono,
+];
+const CAPABILITIES: LiveCapabilityDescriptor = LiveCapabilityDescriptor {
+    protocol_version: PROTOCOL_VERSION,
+    provider: PROVIDER,
+    model: MODEL,
+    timestamps: LiveTimestampCapability::Segment,
+    timestamp_provenance: TimestampProvenance::GatewaySynthesizedFromAcceptedAudio,
+    finalized_events: LiveFinalizedCapability::SegmentAndUtterance,
+    language_hints: LiveLanguageHints::AsciiCode {
+        maximum_bytes: 10,
+        hyphen_at_edges: true,
+    },
+    diarization: false,
+    key_terms: true,
+    input_formats: INPUT_FORMATS,
+    provider_limits: LiveProviderLimits {
+        maximum_public_input_frame_bytes: 64 * 1_024,
+        maximum_input_frame_bytes: MAX_AUDIO_FRAME_BYTES,
+        maximum_key_terms: MAX_KEYTERMS,
+        maximum_key_term_bytes: None,
+        maximum_public_key_term_utf16_units: 256,
+        maximum_key_term_characters: Some(MAX_KEYTERM_CHARS),
+        key_term_character_unit: Some(TextLengthUnit::UnicodeScalars),
+        maximum_public_key_term_total_utf16_units: 8_192,
+        normalize_key_term_whitespace: true,
+    },
+};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ClientWriter = SplitSink<ClientSocket, Message>;
@@ -148,6 +184,12 @@ impl fmt::Debug for ElevenLabsLiveRecognizer {
 }
 
 impl LiveRecognizerFactory for ElevenLabsLiveRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+        &CAPABILITIES
+    }
+
     fn open(
         &self,
         request: LiveRecognitionRequest,
@@ -337,12 +379,34 @@ async fn bounded_io<T>(
 
 fn validate_profile(request: &LiveRecognitionRequest) -> Result<(), RecognitionFailure> {
     let valid_rate = matches!(request.sample_rate_hz, 16_000 | 48_000);
+    let input_format = match request.sample_rate_hz {
+        16_000 => LiveInputFormat::PcmS16Le16KhzMono,
+        48_000 => LiveInputFormat::PcmS16Le48KhzMono,
+        _ => LiveInputFormat::Opus48KhzMono,
+    };
+    let terms = request
+        .keyterms
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let capability_match = CAPABILITIES
+        .validate(&LiveCapabilityRequest {
+            timestamps: true,
+            finalized_events: true,
+            language_hint: Some(&request.profile.language),
+            diarization: false,
+            key_terms: &terms,
+            input_format,
+            input_frame_bytes: 2,
+        })
+        .is_ok();
     if request.profile.protocol_version != PROTOCOL_VERSION
         || request.profile.provider != PROVIDER
         || request.profile.model != MODEL
         || !live_dto::valid_language_code(&request.profile.language)
         || request.channels != CHANNELS
         || !valid_rate
+        || !capability_match
     {
         return Err(known_not_accepted(
             false,
@@ -354,23 +418,13 @@ fn validate_profile(request: &LiveRecognitionRequest) -> Result<(), RecognitionF
     Ok(())
 }
 
-/// Adapts optional generic keyterm hints to the stricter `ElevenLabs` realtime limits.
-///
-/// Unsupported hints are omitted instead of rejecting recognition: keyterms improve quality but
-/// are not part of the transcript's correctness contract.
 fn canonicalize_keyterms(input: &[String]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut output = Vec::new();
     for term in input {
         let normalized = term.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.is_empty() || normalized.chars().count() > MAX_KEYTERM_CHARS {
-            continue;
-        }
         if seen.insert(normalized.clone()) {
             output.push(normalized);
-            if output.len() == MAX_KEYTERMS {
-                break;
-            }
         }
     }
     output
@@ -439,5 +493,4 @@ fn unknown(code: &str, provider_reference: Option<ProviderReference>) -> Recogni
 }
 
 #[cfg(test)]
-#[path = "live_tests.rs"]
 mod tests;

@@ -9,7 +9,7 @@ fail() {
   exit 1
 }
 
-frontend='# syntax=docker/dockerfile:1.18@sha256:38387523653efa0039f8e1c89bb74a30504e76ee9f565e25c9a09841f9427b05'
+frontend='# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf'
 [ "$(sed -n '1p' Dockerfile)" = "$frontend" ] || fail "Dockerfile frontend is not the reviewed 1.18 digest"
 
 if awk '/^FROM / && $2 != "builder" && $0 !~ /@sha256:[0-9a-f]{64}/ { bad = 1 } END { exit bad }' Dockerfile; then

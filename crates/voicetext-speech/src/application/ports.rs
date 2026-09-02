@@ -4,6 +4,8 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 
+use super::batch_capabilities::BatchCapabilityDescriptor;
+use super::live_capabilities::LiveCapabilityDescriptor;
 use crate::domain::batch::{BatchJob, BatchProfile};
 use crate::domain::live::RawAudioSequence;
 
@@ -154,6 +156,9 @@ pub struct BatchRecognitionResult {
 
 /// Paid pre-recorded recognition capability.
 pub trait BatchRecognizer: Send + Sync {
+    /// Returns the immutable identity and limitations implemented by this adapter.
+    fn capabilities(&self) -> &'static BatchCapabilityDescriptor;
+
     /// Submits exactly one bound request. The caller owns retry decisions from the returned class.
     fn recognize(
         &self,
@@ -339,6 +344,9 @@ pub enum LiveRecognitionEvent {
 
 /// Creates provider-bound live sessions without coupling callers to an adapter.
 pub trait LiveRecognizerFactory: Send + Sync {
+    /// Returns the immutable identity and limitations implemented by this adapter.
+    fn capabilities(&self) -> &'static LiveCapabilityDescriptor;
+
     /// Opens exactly the requested configured profile; implementations never fall back.
     fn open(
         &self,
