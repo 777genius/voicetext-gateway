@@ -1,3 +1,4 @@
+#[path = "production_composition_e2e/provider_wire.rs"]
 mod provider_wire;
 #[allow(dead_code, unused_imports)]
 mod support;
