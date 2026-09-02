@@ -38,7 +38,7 @@ jobs:
       - name: Install pinned security and policy tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
-          go install github.com/gitleaks/gitleaks/v8@v8.28.0
+          go install github.com/zricethezav/gitleaks/v8@v8.28.0
           go install github.com/anchore/syft/cmd/syft@v1.33.0
 
       - name: Scan the tracked tree and complete history for secrets
