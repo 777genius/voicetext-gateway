@@ -6,6 +6,9 @@
   runtime.
 - Application tests use in-memory ports and prove idempotency, cancellation, provider binding,
   retry classification, and unknown-outcome fencing.
+- Live application tests prove exact PCM S16LE frame alignment, checked accepted-audio horizon
+  arithmetic, the inclusive 250 ms provider-lead boundary, future-event rejection, non-overlapping
+  final ordering, and unrestricted partial revision for both timestamp provenance modes.
 - Provider adapter tests use local HTTP/WebSocket fakes and bounded synthetic fixtures. They verify
   provider request construction and response projection without paid traffic.
 - Gateway contract tests run the real HTTP/WebSocket server and the independent Discord Meeting
