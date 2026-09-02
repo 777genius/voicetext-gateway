@@ -30,6 +30,11 @@ RUN --mount=type=cache,id=voicetext-cargo-registry,target=/usr/local/cargo/regis
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
 
+ARG SOURCE_SHA
+LABEL org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.revision="${SOURCE_SHA}" \
+      org.opencontainers.image.source="https://github.com/777genius/voicetext-gateway"
+
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
@@ -38,6 +43,7 @@ RUN apt-get update \
     && install -d --owner voicetext --group voicetext --mode 0700 /var/lib/voicetext/spool
 
 COPY --from=builder /workspace/voicetext-gateway /usr/local/bin/voicetext-gateway
+COPY --chmod=0444 LICENSE NOTICE /usr/share/licenses/voicetext-gateway/
 
 USER 10001:10001
 WORKDIR /var/lib/voicetext

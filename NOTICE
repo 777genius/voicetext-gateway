@@ -1,0 +1,11 @@
+VoiceText Gateway
+Copyright 2026 VoiceText Gateway contributors
+
+This product includes software developed by the VoiceText Gateway contributors.
+
+The names Deepgram, ElevenLabs, PostgreSQL, Axum, Discord, and Pipecat are trademarks or names of
+their respective owners. Their mention describes interoperability and does not imply endorsement.
+
+Third-party Rust components and their license conclusions are recorded from the exact locked graph
+by the release `cargo deny check` and CycloneDX evidence. The corresponding source and license
+information is available through each component's Package URL in that release SBOM.

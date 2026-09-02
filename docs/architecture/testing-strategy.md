@@ -29,8 +29,9 @@ key and synthetic audio and performs exactly one planned provider effect:
 5. Deepgram batch with ElevenLabs live;
 6. ElevenLabs batch with Deepgram live.
 
-The checked-in TypeScript consumer gate is opt-in because it spans two repositories. With both
-workspaces available and the Discord workspace dependencies installed, run:
+The checked-in TypeScript consumer fixture is dependency-free and digest-pinned. The required
+production-composition release job runs it without resolving a mutable consumer repository or npm
+dependency. The older in-memory cross-repository test remains available for integration work:
 
 ```sh
 DISCORD_MEETING_ASSISTANT_ROOT=/absolute/path/to/discord-voice-bot \
@@ -41,21 +42,23 @@ DISCORD_MEETING_ASSISTANT_ROOT=/absolute/path/to/discord-voice-bot \
 This gate uses only in-memory fake providers and synthetic Ogg/Opus. It performs no paid provider or
 Discord request.
 
-Production composition has a stronger opt-in gate. It starts the shipped gateway binary, reads
+Production composition is a required CI and release gate. It starts the release-mode shipped
+gateway binary, reads
 permission-restricted secret files, migrates a disposable PostgreSQL database, connects the real
 Deepgram and ElevenLabs HTTP/WebSocket adapters to deterministic wire fakes, and drives all four
 profiles plus both mixed batch/live selections through the checked-in TypeScript consumer:
 
 ```sh
 VOICETEXT_TEST_DATABASE_URL=postgresql://.../voicetext_test_<unique> \
-DISCORD_MEETING_ASSISTANT_ROOT=/absolute/path/to/discord-voice-bot \
-  cargo test -p voicetext-gateway --test production_composition_e2e \
-  production_binary_matches_the_typescript_consumer_through_real_provider_adapters \
-  -- --ignored --exact
+VOICETEXT_GATEWAY_PRODUCTION_BINARY="$PWD/target/release/voicetext-gateway" \
+  scripts/run-production-composition-gate.sh
 ```
 
-The test asserts one provider effect per original batch/live request and zero provider effects for
-idempotent batch replay. It still performs no paid provider or Discord request.
+The gate verifies the fixture SHA-256 before use and asserts one provider effect per original
+batch/live request and zero provider effects for idempotent batch replay. Its PostgreSQL database is
+disposable, provider endpoints are loopback-only fakes, credentials and audio are synthetic, and it
+performs no paid provider or Discord request. Node.js 24 or newer is required to execute the exact
+TypeScript source directly.
 
 Durable startup recovery has a separate disposable-PostgreSQL gate:
 

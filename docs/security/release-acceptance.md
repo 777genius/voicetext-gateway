@@ -21,6 +21,9 @@ private repository content in that bundle.
 - [ ] The exact digest-pinned image is built from a Git `ref` plus matching `checksum`; its SBOM is
   generated, parsed, retained, and linked to the image digest. Vulnerability results are reviewed
   under the release policy.
+- [ ] Required `exact-head` and `production-composition` jobs pass for the tagged SHA. The latter
+  runs the release-mode binary, disposable PostgreSQL, loopback provider fakes, and the
+  SHA-256-pinned independent TypeScript fixture without provider keys or mutable consumer input.
 - [ ] The non-root/read-only/no-new-privileges runtime assertions and mounted-file secret-custody
   checks pass. A rollback image digest and compatible database/spool backup are recorded.
 - [ ] Each real-provider and private-guild gate uses only test identities and synthetic fixtures and
@@ -74,3 +77,24 @@ an uncertain paid request, or deleting authoritative spool evidence.
 Pipecat remains future-only documentation. It is not part of release qualification, private
 adoption, runtime composition, or rollback until a separately approved conformance-tested adapter
 exists.
+
+## Immutable release evidence and retention
+
+For a `v*` tag, `release-evidence` runs only after both required jobs succeed. It rebuilds the image
+from the exact remote Git ref plus checksum, publishes it to GHCR, and takes the registry digest as
+the sole subject identity. GitHub artifact attestations cryptographically bind that digest to SLSA
+build provenance, the digest-bearing CycloneDX SBOM, and the deterministic release predicate. The
+predicate records hashes of the exact source SHA, SBOM, Grype result and fail-closed policy,
+Apache-2.0 license, NOTICE, and TypeScript composition fixture. CI verifies the attestations against
+the repository identity before publication.
+
+GitHub Actions artifacts are a convenience copy retained for 90 days, the maximum generally
+available to public repositories; repository policy can further reduce that period. They are not
+the release-lifetime record. The digest-named archive, predicate, SBOM, vulnerability result,
+applied policy, exact image LICENSE/NOTICE, and pinned composition fixture are uploaded without
+overwrite to the GitHub Release for the exact tag. GitHub Release assets and GHCR
+attestations follow the release/package lifetime and remain until an authorized maintainer deletes
+them. The workflow creates a draft release when none exists, so human acceptance remains required
+before publication. Configure branch protection/rulesets to require the workflow jobs named
+`exact-head` and `production-composition`; only `release-evidence` is authorized to publish images
+or release evidence.

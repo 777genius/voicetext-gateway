@@ -27,19 +27,18 @@ use support::synthetic_ogg_opus;
 const TOKEN: &str = "conformance-service-token-00000001";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires VOICETEXT_TEST_DATABASE_URL and DISCORD_MEETING_ASSISTANT_ROOT"]
+#[ignore = "requires VOICETEXT_TEST_DATABASE_URL, Node.js, and a built production binary"]
 async fn production_binary_matches_the_typescript_consumer_through_real_provider_adapters() {
     let database_url = env::var("VOICETEXT_TEST_DATABASE_URL")
         .expect("VOICETEXT_TEST_DATABASE_URL must identify a disposable database");
     assert_disposable_database(&database_url);
-    let consumer_root = env::var_os("DISCORD_MEETING_ASSISTANT_ROOT")
-        .map(PathBuf::from)
-        .expect("DISCORD_MEETING_ASSISTANT_ROOT is required");
+    let consumer_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contract-fixtures/typescript-consumer");
     assert!(
         consumer_root
-            .join("packages/voicetext-adapter/package.json")
+            .join("voicetext-gateway-contract.ts")
             .is_file(),
-        "Discord Meeting Assistant VoiceText adapter is missing"
+        "pinned TypeScript contract fixture is missing"
     );
 
     let wire = RunningProviderWire::start().await;
@@ -65,16 +64,9 @@ async fn production_binary_matches_the_typescript_consumer_through_real_provider
     });
     wait_until_ready(address, &mut gateway).await;
 
-    let result = Command::new("pnpm")
+    let result = Command::new("node")
         .current_dir(&consumer_root)
-        .args([
-            "--filter",
-            "@discord-meeting/voicetext-adapter",
-            "exec",
-            "vitest",
-            "run",
-            "test/voicetext-gateway-black-box.e2e.test.ts",
-        ])
+        .arg("voicetext-gateway-contract.ts")
         .env(
             "VOICETEXT_GATEWAY_E2E_HTTP_ORIGIN",
             format!("http://{address}"),
@@ -211,7 +203,11 @@ struct GatewayProcess(Child);
 
 impl GatewayProcess {
     fn start(config: &GatewayProcessConfig<'_>) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_voicetext-gateway"))
+        let binary = env::var_os("VOICETEXT_GATEWAY_PRODUCTION_BINARY").map_or_else(
+            || PathBuf::from(env!("CARGO_BIN_EXE_voicetext-gateway")),
+            PathBuf::from,
+        );
+        let child = Command::new(binary)
             .env_clear()
             .env("RUST_LOG", "error")
             .env("VOICETEXT_ALLOW_INSECURE_PROVIDER_ENDPOINTS", "true")
@@ -242,7 +238,7 @@ impl GatewayProcess {
             .env("VOICETEXT_SPOOL_DIR", config.spool_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("could not start the production gateway binary");
         Self(child)

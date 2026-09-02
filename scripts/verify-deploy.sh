@@ -11,6 +11,9 @@ fail() {
 
 frontend='# syntax=docker/dockerfile:1.18@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf'
 [ "$(sed -n '1p' Dockerfile)" = "$frontend" ] || fail "Dockerfile frontend is not the reviewed 1.18 digest"
+[ "$(sha256sum LICENSE | cut -d' ' -f1)" = \
+  c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 ] ||
+  fail "LICENSE is not the reviewed Apache License 2.0 text"
 
 if awk '/^FROM / && $2 != "builder" && $0 !~ /@sha256:[0-9a-f]{64}/ { bad = 1 } END { exit bad }' Dockerfile; then
   :
@@ -24,6 +27,10 @@ grep -Fq '${VOICETEXT_HEALTHCHECK_URL}' Dockerfile ||
   fail "image healthcheck does not honor its configured URL"
 grep -Eq 'remote_context=.*\.git\?ref=.*&checksum=' .github/workflows/ci.yml ||
   fail "CI does not exercise a remote Git ref+checksum build context"
+grep -Fq 'COPY --chmod=0444 LICENSE NOTICE /usr/share/licenses/voicetext-gateway/' Dockerfile ||
+  fail "runtime image does not package Apache-2.0 license and notice"
+grep -Fq 'org.opencontainers.image.revision="${SOURCE_SHA}"' Dockerfile ||
+  fail "runtime image does not carry the exact source revision label"
 
 for route in \
   /api/v1/transcribe/batch \
