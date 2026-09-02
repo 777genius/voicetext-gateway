@@ -191,9 +191,7 @@ impl fmt::Debug for DeepgramLiveRecognizer {
 }
 
 impl LiveRecognizerFactory for DeepgramLiveRecognizer {
-    fn capabilities(
-        &self,
-    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+    fn capabilities(&self) -> &'static LiveCapabilityDescriptor {
         &CAPABILITIES
     }
 

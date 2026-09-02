@@ -137,9 +137,7 @@ impl fmt::Debug for DeepgramBatchRecognizer {
 }
 
 impl BatchRecognizer for DeepgramBatchRecognizer {
-    fn capabilities(
-        &self,
-    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+    fn capabilities(&self) -> &'static BatchCapabilityDescriptor {
         &CAPABILITIES
     }
 

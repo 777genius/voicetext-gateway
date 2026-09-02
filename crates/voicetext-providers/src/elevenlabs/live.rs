@@ -184,9 +184,7 @@ impl fmt::Debug for ElevenLabsLiveRecognizer {
 }
 
 impl LiveRecognizerFactory for ElevenLabsLiveRecognizer {
-    fn capabilities(
-        &self,
-    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+    fn capabilities(&self) -> &'static LiveCapabilityDescriptor {
         &CAPABILITIES
     }
 

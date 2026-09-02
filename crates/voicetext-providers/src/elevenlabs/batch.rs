@@ -132,9 +132,7 @@ impl fmt::Debug for ElevenLabsBatchRecognizer {
 }
 
 impl BatchRecognizer for ElevenLabsBatchRecognizer {
-    fn capabilities(
-        &self,
-    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+    fn capabilities(&self) -> &'static BatchCapabilityDescriptor {
         &CAPABILITIES
     }
 
