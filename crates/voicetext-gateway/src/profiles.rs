@@ -35,6 +35,11 @@ impl ProfileRegistry {
     }
 
     /// Binds exactly one batch profile.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an injected adapter advertises an identity outside the closed compatibility
+    /// matrix. Composition treats that as a programmer error and fails before serving traffic.
     #[must_use]
     pub fn with_batch(mut self, recognizer: Arc<dyn BatchRecognizer>) -> Self {
         match batch_identity(recognizer.capabilities())
@@ -47,6 +52,11 @@ impl ProfileRegistry {
     }
 
     /// Binds exactly one live profile.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an injected adapter advertises an identity outside the closed compatibility
+    /// matrix. Composition treats that as a programmer error and fails before serving traffic.
     #[must_use]
     pub fn with_live(mut self, recognizer: Arc<dyn LiveRecognizerFactory>) -> Self {
         match live_identity(recognizer.capabilities())
