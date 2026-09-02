@@ -230,6 +230,18 @@ mod tests {
     use crate::application::ports::{BatchAudioHandle, BatchResultProjectionFailure, BatchSegment};
     use crate::domain::batch::{BatchJob, BatchJobStatus};
 
+    struct AcceptProjection;
+
+    impl BatchResultProjection for AcceptProjection {
+        fn validate(
+            &self,
+            _id: &BatchJobId,
+            _result: &BatchRecognitionResult,
+        ) -> Result<(), BatchResultProjectionFailure> {
+            Ok(())
+        }
+    }
+
     fn profile() -> BatchProfile {
         BatchProfile::new(2, "provider", "model", "multi").unwrap()
     }
@@ -267,16 +279,6 @@ mod tests {
             revision: 1,
         };
         snapshot.job.begin_submission().unwrap();
-        struct AcceptProjection;
-        impl BatchResultProjection for AcceptProjection {
-            fn validate(
-                &self,
-                _id: &BatchJobId,
-                _result: &BatchRecognitionResult,
-            ) -> Result<(), BatchResultProjectionFailure> {
-                Ok(())
-            }
-        }
         let outcome = apply_recognition_outcome(snapshot, recognition, &AcceptProjection).unwrap();
         (outcome.job.state().status(), outcome.retry_after_millis)
     }
