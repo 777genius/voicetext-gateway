@@ -102,7 +102,7 @@ pub async fn reconcile_startup(
         let Some(next_cursor) = page.next_cursor else {
             break;
         };
-        advance_cursor(&cursor, &next_cursor)?;
+        advance_cursor(cursor.as_ref(), &next_cursor)?;
         cursor = Some(next_cursor);
     }
     state.mark_startup_reconciled();
@@ -158,7 +158,7 @@ async fn drain_backlog(
         }
         let next_cursor =
             next_cursor.ok_or_else(|| StartupRecoveryFailure::new("RECOVERY_CURSOR_MISSING"))?;
-        advance_cursor(&cursor, &next_cursor)?;
+        advance_cursor(cursor.as_ref(), &next_cursor)?;
         cursor = Some(next_cursor);
     }
 }
@@ -203,10 +203,10 @@ async fn execute_actionable(state: &GatewayState, snapshot: &BatchJobSnapshot) {
 }
 
 fn advance_cursor(
-    current: &Option<BatchJobId>,
+    current: Option<&BatchJobId>,
     next: &BatchJobId,
 ) -> Result<(), StartupRecoveryFailure> {
-    if current.as_ref() == Some(next) {
+    if current == Some(next) {
         return Err(StartupRecoveryFailure::new(
             "RECOVERY_CURSOR_DID_NOT_ADVANCE",
         ));

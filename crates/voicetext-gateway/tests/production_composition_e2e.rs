@@ -150,7 +150,7 @@ impl BatchRecognizer for AdmissionOnlyRecognizer {
     }
 }
 
-async fn seed_recovery_backlog(database_url: &str, spool_path: &Path, count: u128) {
+async fn seed_recovery_backlog(database_url: &str, spool_path: &Path, count: u8) {
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(database_url)
@@ -162,13 +162,13 @@ async fn seed_recovery_backlog(database_url: &str, spool_path: &Path, count: u12
     let recognizer = AdmissionOnlyRecognizer;
     let coordinator = BatchCoordinator::new(&recognizer, &jobs, &spool);
     for index in 1..=count {
-        let id = Uuid::from_u128(index).hyphenated().to_string();
+        let id = Uuid::from_u128(u128::from(index)).hyphenated().to_string();
         coordinator
             .admit(BatchAdmissionRequest {
                 id: voicetext_speech::application::ports::BatchJobId::new(id),
                 profile: BatchProfile::new(2, "deepgram", "nova-3", "multi").unwrap(),
-                fingerprint: BatchRequestFingerprint::from_bytes([index as u8; 32]),
-                audio: vec![index as u8; 32],
+                fingerprint: BatchRequestFingerprint::from_bytes([index; 32]),
+                audio: vec![index; 32],
                 authoritative_duration_millis: 20,
                 keyterms: Vec::new(),
             })

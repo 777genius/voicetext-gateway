@@ -141,6 +141,13 @@ impl GatewayMetrics {
 
     fn render(&self) -> String {
         let mut output = String::with_capacity(512);
+        self.render_batch(&mut output);
+        self.render_spool(&mut output);
+        self.render_live(&mut output);
+        output
+    }
+
+    fn render_batch(&self, output: &mut String) {
         for (name, help, value) in [
             (
                 "voicetext_batch_requests_total",
@@ -209,6 +216,13 @@ impl GatewayMetrics {
                 "Interrupted submissions made terminally unknown during recovery.",
                 self.batch_recovery_unknown.load(Ordering::Relaxed),
             ),
+        ] {
+            write_metric(output, name, help, value);
+        }
+    }
+
+    fn render_spool(&self, output: &mut String) {
+        for (name, help, value) in [
             (
                 "voicetext_spool_terminal_removed_total",
                 "Terminal batch audio artifacts removed.",
@@ -229,6 +243,13 @@ impl GatewayMetrics {
                 "Configured durable batch audio spool capacity.",
                 self.spool_capacity_bytes.load(Ordering::Relaxed),
             ),
+        ] {
+            write_metric(output, name, help, value);
+        }
+    }
+
+    fn render_live(&self, output: &mut String) {
+        for (name, help, value) in [
             (
                 "voicetext_live_sessions_total",
                 "Accepted live WebSocket sessions.",
@@ -245,17 +266,20 @@ impl GatewayMetrics {
                 self.live_failures.load(Ordering::Relaxed),
             ),
         ] {
-            let _write = writeln!(output, "# HELP {name} {help}");
-            let metric_type = if name.ends_with("_bytes") || name.ends_with("_inflight") {
-                "gauge"
-            } else {
-                "counter"
-            };
-            let _write = writeln!(output, "# TYPE {name} {metric_type}");
-            let _write = writeln!(output, "{name} {value}");
+            write_metric(output, name, help, value);
         }
-        output
     }
+}
+
+fn write_metric(output: &mut String, name: &str, help: &str, value: u64) {
+    let _write = writeln!(output, "# HELP {name} {help}");
+    let metric_type = if name.ends_with("_bytes") || name.ends_with("_inflight") {
+        "gauge"
+    } else {
+        "counter"
+    };
+    let _write = writeln!(output, "# TYPE {name} {metric_type}");
+    let _write = writeln!(output, "{name} {value}");
 }
 
 pub(crate) async fn metrics(State(state): State<GatewayState>) -> (StatusCode, HeaderMap, String) {

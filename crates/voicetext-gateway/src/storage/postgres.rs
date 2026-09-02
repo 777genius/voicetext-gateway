@@ -239,11 +239,13 @@ impl BatchJobStore for PostgresBatchJobStore {
 
     fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
         Box::pin(async move {
-            sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-                "SELECT MAX(job_id) FROM voicetext_batch_jobs
-                 WHERE state IN ('accepted', 'retryable', 'submitting')",
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT job_id FROM voicetext_batch_jobs
+                 WHERE state IN ('accepted', 'retryable', 'submitting')
+                 ORDER BY job_id DESC
+                 LIMIT 1",
             )
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             .map_err(database_failure)
             .map(|head| head.map(|id| BatchJobId::new(id.hyphenated().to_string())))

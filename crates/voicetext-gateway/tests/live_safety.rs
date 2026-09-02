@@ -32,6 +32,7 @@ struct Calls {
     opened: AtomicUsize,
     writes: AtomicUsize,
     finalizes: AtomicUsize,
+    finalize_drain_started: Notify,
     closes: AtomicUsize,
 }
 
@@ -164,7 +165,12 @@ impl LiveRecognizerSession for StallingSession {
     fn next_event(
         &self,
     ) -> BoxFuture<'_, Result<Option<LiveRecognitionEvent>, RecognitionFailure>> {
-        Box::pin(std::future::pending())
+        Box::pin(async move {
+            if self.calls.finalizes.load(Ordering::SeqCst) == 1 {
+                self.calls.finalize_drain_started.notify_one();
+            }
+            std::future::pending().await
+        })
     }
 
     fn finalize(&self) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
@@ -251,7 +257,7 @@ async fn provider_open_stall_is_cancelled_at_the_gateway_bound() {
 }
 
 #[tokio::test]
-async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
+async fn idle_deadline_terminates_without_sleeping() {
     let (gateway, mut socket, _signals, _calls) = connect(Stall::None).await;
     let _ready = futures_util::StreamExt::next(&mut socket)
         .await
@@ -272,9 +278,12 @@ async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
         None | Some(Err(_) | Ok(Message::Close(_)))
     ));
     drop(socket);
-    gateway.stop().await;
     tokio::time::resume();
+    gateway.stop().await;
+}
 
+#[tokio::test]
+async fn finalize_drain_deadline_terminates_without_sleeping() {
     let (gateway, mut socket, _signals, calls) = connect(Stall::None).await;
     let _ready = futures_util::StreamExt::next(&mut socket)
         .await
@@ -284,7 +293,6 @@ async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
         .send(Message::Binary(vec![0, 0].into()))
         .await
         .unwrap();
-    tokio::time::pause();
     let _ack = futures_util::StreamExt::next(&mut socket)
         .await
         .unwrap()
@@ -293,14 +301,19 @@ async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
         .send(Message::Text(r#"{"type":"finalize"}"#.into()))
         .await
         .unwrap();
+    calls.finalize_drain_started.notified().await;
+    tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     let finalized = futures_util::StreamExt::next(&mut socket)
         .await
         .unwrap()
         .unwrap();
-    assert!(finalized.is_text());
+    let finalized_json: serde_json::Value =
+        serde_json::from_str(finalized.into_text().unwrap().as_str()).unwrap();
+    assert_eq!(finalized_json["type"], "finalize_complete");
     assert_eq!(calls.finalizes.load(Ordering::SeqCst), 1);
     drop(socket);
+    tokio::time::resume();
     gateway.stop().await;
 }
 
