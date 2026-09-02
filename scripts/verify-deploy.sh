@@ -100,7 +100,7 @@ if command -v caddy >/dev/null 2>&1; then
   VOICETEXT_PUBLIC_HOST=voice.example.invalid caddy adapt \
     --config deploy/Caddyfile --adapter caddyfile >"$adapted_json"
 elif command -v docker >/dev/null 2>&1 && docker image inspect "$caddy_image" >/dev/null 2>&1; then
-  docker run --rm --network none \
+  docker run --rm --network none --entrypoint caddy \
     -e VOICETEXT_PUBLIC_HOST=voice.example.invalid \
     -v "$root/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
     "$caddy_image" adapt --config /etc/caddy/Caddyfile --adapter caddyfile >"$adapted_json"
