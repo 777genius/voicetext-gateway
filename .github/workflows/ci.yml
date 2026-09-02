@@ -45,10 +45,16 @@ jobs:
           cargo test --workspace --all-features --locked
           cargo doc --workspace --no-deps --locked
 
+      - name: Install exact Go runtime for security tools
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.3
+          check-latest: false
+
       - name: Install pinned security and policy tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
-          go install github.com/zricethezav/gitleaks/v8@v8.28.0
+          go install github.com/zricethezav/gitleaks/v8@v8.30.1
           go_bin="$(go env GOPATH)/bin"
           echo "$go_bin" >> "$GITHUB_PATH"
           "$go_bin/gitleaks" version
@@ -190,9 +196,15 @@ jobs:
           test "$(git cat-file -t "$SOURCE_REF")" = tag
           test -z "$(git status --porcelain --untracked-files=no)"
 
+      - name: Install exact Go runtime for evidence tools
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.3
+          check-latest: false
+
       - name: Install pinned evidence tools
         run: |
-          go install github.com/anchore/syft/cmd/syft@v1.33.0
+          go install github.com/anchore/syft/cmd/syft@v1.51.1
           go install github.com/anchore/grype/cmd/grype@v0.118.0
           go_bin="$(go env GOPATH)/bin"
           echo "$go_bin" >> "$GITHUB_PATH"
@@ -242,7 +254,7 @@ jobs:
           rm evidence/sbom.raw.json
 
       - name: Cryptographically attest the digest-bearing SBOM
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ${{ steps.publish.outputs.image }}
           subject-digest: ${{ steps.publish.outputs.digest }}
