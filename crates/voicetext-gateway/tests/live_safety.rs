@@ -104,6 +104,52 @@ struct StallingSession {
     calls: Arc<Calls>,
 }
 
+#[derive(Debug)]
+struct ProviderErrorFactory;
+
+impl LiveRecognizerFactory for ProviderErrorFactory {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::live_capabilities::LiveCapabilityDescriptor {
+        support::live_capabilities(voicetext_gateway::contracts::live::LiveIdentity::DeepgramNova3)
+    }
+
+    fn open(
+        &self,
+        _request: LiveRecognitionRequest,
+    ) -> BoxFuture<'_, Result<Box<dyn LiveRecognizerSession>, RecognitionFailure>> {
+        Box::pin(async { Ok(Box::new(ProviderErrorSession) as Box<dyn LiveRecognizerSession>) })
+    }
+}
+
+#[derive(Debug)]
+struct ProviderErrorSession;
+
+impl LiveRecognizerSession for ProviderErrorSession {
+    fn write_audio(&self, _frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(
+        &self,
+    ) -> BoxFuture<'_, Result<Option<LiveRecognitionEvent>, RecognitionFailure>> {
+        Box::pin(async {
+            Err(RecognitionFailure::KnownAcceptedTerminal {
+                code: "SYNTHETIC_PROVIDER_TERMINAL".into(),
+                provider_reference: None,
+            })
+        })
+    }
+
+    fn finalize(&self) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn close(&self) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl LiveRecognizerSession for StallingSession {
     fn write_audio(&self, _frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
@@ -151,12 +197,11 @@ async fn connect(stall_kind: Stall) -> (TestGateway, Socket, Arc<StallSignals>, 
         calls: Arc::clone(&calls),
     });
     let gateway = TestGateway::start_with_live(factory).await;
-    let mut request = gateway.websocket_url().into_client_request().unwrap();
-    request.headers_mut().insert(
-        "authorization",
-        HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
-    );
-    let (mut socket, _) = connect_async(request).await.unwrap();
+    let socket = connect_to(&gateway).await;
+    (gateway, socket, signals, calls)
+}
+
+async fn configure(socket: &mut Socket) {
     socket
         .send(Message::Text(
             json!({
@@ -177,7 +222,17 @@ async fn connect(stall_kind: Stall) -> (TestGateway, Socket, Arc<StallSignals>, 
         ))
         .await
         .unwrap();
-    (gateway, socket, signals, calls)
+}
+
+async fn connect_to(gateway: &TestGateway) -> Socket {
+    let mut request = gateway.websocket_url().into_client_request().unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {TOKEN}")).unwrap(),
+    );
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    configure(&mut socket).await;
+    socket
 }
 
 type Socket =
@@ -208,7 +263,14 @@ async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
         .await
         .unwrap()
         .unwrap();
-    assert!(timeout_frame.is_text());
+    let timeout_json: serde_json::Value =
+        serde_json::from_str(timeout_frame.into_text().unwrap().as_str()).unwrap();
+    assert_eq!(timeout_json["type"], "error");
+    let closed = futures_util::StreamExt::next(&mut socket).await;
+    assert!(matches!(
+        closed,
+        None | Some(Err(_) | Ok(Message::Close(_)))
+    ));
     drop(socket);
     gateway.stop().await;
     tokio::time::resume();
@@ -239,6 +301,49 @@ async fn idle_and_finalize_drain_deadlines_terminate_without_sleeping() {
     assert!(finalized.is_text());
     assert_eq!(calls.finalizes.load(Ordering::SeqCst), 1);
     drop(socket);
+    gateway.stop().await;
+}
+
+#[tokio::test]
+async fn provider_error_and_queued_client_frames_emit_one_protocol_terminal() {
+    let gateway = TestGateway::start_with_live(Arc::new(ProviderErrorFactory)).await;
+    let mut socket = connect_to(&gateway).await;
+    let ready = futures_util::StreamExt::next(&mut socket)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ready.is_text());
+
+    let _ = socket.send(Message::Binary(vec![0, 0].into())).await;
+    let _ = socket
+        .send(Message::Text(r#"{"type":"finalize"}"#.into()))
+        .await;
+    let _ = socket
+        .send(Message::Text(r#"{"type":"close"}"#.into()))
+        .await;
+
+    let mut terminals = 0;
+    loop {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            futures_util::StreamExt::next(&mut socket),
+        )
+        .await
+        .expect("gateway did not terminate provider-error race");
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                terminals += usize::from(matches!(
+                    value["type"].as_str(),
+                    Some("error" | "finalize_complete")
+                ));
+            }
+            None | Some(Err(_) | Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
+            Some(Ok(Message::Frame(_))) => unreachable!("raw frame is not exposed by tungstenite"),
+        }
+    }
+    assert_eq!(terminals, 1);
     gateway.stop().await;
 }
 

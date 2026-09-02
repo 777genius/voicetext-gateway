@@ -236,12 +236,8 @@ impl ElevenLabsLiveSession {
                         return Err(self.terminal_with_reference(code).await);
                     }
                     let mut state = self.state.lock().await;
-                    match state.apply(parsed) {
-                        Ok(Some(event)) => return Ok(Some(event)),
-                        Ok(None) => {}
-                        Err(code) => {
-                            return Err(unknown(code, state.provider_reference()));
-                        }
+                    if let Some(event) = state.apply(parsed) {
+                        return Ok(Some(event));
                     }
                 }
                 Message::Ping(payload) => {

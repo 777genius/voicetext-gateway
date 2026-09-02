@@ -493,6 +493,25 @@ async fn assert_live_profile(gateway: &TestGateway, provider: &str, model: &str)
     );
 
     socket
+        .send(Message::Binary(vec![0xf8, 0xff, 0xfe].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_json(&mut socket).await,
+        json!({"type": "ack", "seq": 2})
+    );
+    assert_eq!(
+        next_json(&mut socket).await,
+        json!({
+            "type": "final",
+            "text": "synthetic live speech",
+            "start_ms": 60,
+            "duration_ms": 40,
+            "confidence": 0.899_999_976_158_142_1
+        })
+    );
+
+    socket
         .send(Message::Text(r#"{"type":"finalize"}"#.into()))
         .await
         .unwrap();
@@ -504,7 +523,30 @@ async fn assert_live_profile(gateway: &TestGateway, provider: &str, model: &str)
             "saw_result": true
         })
     );
-    socket.close(None).await.unwrap();
+
+    assert_clean_close_after_terminal(&mut socket).await;
+}
+
+async fn assert_clean_close_after_terminal<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // These can already be queued when the success terminal is written. They must not produce a
+    // second protocol terminal before the gateway closes cleanly.
+    let _ = socket
+        .send(Message::Text(r#"{"type":"finalize"}"#.into()))
+        .await;
+    let _ = socket.send(Message::Binary(vec![0, 0].into())).await;
+    let _ = socket
+        .send(Message::Text(r#"{"type":"close"}"#.into()))
+        .await;
+    let next = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("gateway did not close after finalize success");
+    assert!(
+        matches!(next, None | Some(Err(_) | Ok(Message::Close(_)))),
+        "gateway emitted a second message after finalize success: {next:?}"
+    );
 }
 
 async fn next_json<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> Value

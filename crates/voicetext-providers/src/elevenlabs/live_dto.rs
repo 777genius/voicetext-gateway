@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use base64::Engine;
 use serde_json::Value;
 use url::Url;
@@ -23,7 +21,6 @@ pub(super) enum ParsedLiveMessage {
     Transcript {
         kind: TranscriptKind,
         text: String,
-        end_millis: Option<u64>,
         confidence: Option<f32>,
     },
     TerminalError {
@@ -125,7 +122,6 @@ fn parse_transcript(
         .filter(|text| text.len() <= MAX_TRANSCRIPT_BYTES)
         .ok_or_else(malformed)?
         .to_owned();
-    let end_millis = parse_end_millis(object.get("words"))?;
     let confidence = parse_confidence(object.get("confidence"))?;
     if text.trim().is_empty() && kind != TranscriptKind::UtteranceFinal {
         return Ok(ParsedLiveMessage::Ignore);
@@ -133,42 +129,8 @@ fn parse_transcript(
     Ok(ParsedLiveMessage::Transcript {
         kind,
         text,
-        end_millis,
         confidence,
     })
-}
-
-fn parse_end_millis(words: Option<&Value>) -> Result<Option<u64>, ParseFailure> {
-    let words = match words {
-        None | Some(Value::Null) => return Ok(None),
-        Some(words) => words,
-    };
-    let words = words.as_array().ok_or_else(malformed)?;
-    let mut previous = 0_u64;
-    let mut end = None;
-    for word in words {
-        let object = word.as_object().ok_or_else(malformed)?;
-        for field in ["start", "end"] {
-            if let Some(value) = object.get(field) {
-                if value.is_null() {
-                    continue;
-                }
-                let seconds = value
-                    .as_f64()
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-                    .ok_or_else(malformed)?;
-                let millis = seconds_to_millis(seconds).ok_or_else(malformed)?;
-                if field == "end" {
-                    if millis < previous {
-                        return Err(malformed());
-                    }
-                    previous = millis;
-                    end = Some(millis);
-                }
-            }
-        }
-    }
-    Ok(end)
 }
 
 fn parse_confidence(value: Option<&Value>) -> Result<Option<f32>, ParseFailure> {
@@ -180,13 +142,6 @@ fn parse_confidence(value: Option<&Value>) -> Result<Option<f32>, ParseFailure> 
             .map(Some)
             .ok_or_else(malformed),
     }
-}
-
-fn seconds_to_millis(seconds: f64) -> Option<u64> {
-    let rounded = Duration::try_from_secs_f64(seconds)
-        .ok()?
-        .checked_add(Duration::from_micros(500))?;
-    u64::try_from(rounded.as_millis()).ok()
 }
 
 fn terminal_error_code(kind: &str) -> Option<&'static str> {
@@ -229,11 +184,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_transcripts_timestamps_and_confidence() {
+    fn parses_transcripts_without_treating_provider_timing_as_authoritative() {
         let ParsedLiveMessage::Transcript {
             kind,
             text,
-            end_millis,
             confidence,
         } = parse_text(
             r#"{"message_type":"final_transcript_with_timestamps","text":"hello","confidence":0.8,"words":[{"start":0.0,"end":1.25}]}"#,
@@ -244,21 +198,25 @@ mod tests {
         };
         assert_eq!(kind, TranscriptKind::SegmentFinal);
         assert_eq!(text, "hello");
-        assert_eq!(end_millis, Some(1_250));
         assert_eq!(confidence, Some(0.8));
     }
 
     #[test]
-    fn accepts_nullable_optional_timestamp_evidence_from_the_provider_schema() {
+    fn ignores_missing_nullable_leading_and_decreasing_provider_timing() {
         for payload in [
+            r#"{"message_type":"committed_transcript","text":"hello"}"#,
             r#"{"message_type":"committed_transcript_with_timestamps","text":"hello","words":null}"#,
             r#"{"message_type":"committed_transcript_with_timestamps","text":"hello","words":[{"start":null,"end":null}]}"#,
+            r#"{"message_type":"committed_transcript_with_timestamps","text":"hello","words":[{"start":8.0,"end":9.0}]}"#,
+            r#"{"message_type":"committed_transcript_with_timestamps","text":"hello","words":[{"end":2.0},{"end":1.0}]}"#,
         ] {
-            let ParsedLiveMessage::Transcript { end_millis, .. } = parse_text(payload).unwrap()
-            else {
-                panic!("expected committed transcript");
-            };
-            assert_eq!(end_millis, None);
+            assert!(matches!(
+                parse_text(payload).unwrap(),
+                ParsedLiveMessage::Transcript {
+                    kind: TranscriptKind::UtteranceFinal,
+                    ..
+                }
+            ));
         }
     }
 
@@ -287,7 +245,6 @@ mod tests {
         }
         for payload in [
             r#"{"message_type":"partial_transcript","text":"x","confidence":2}"#.to_owned(),
-            r#"{"message_type":"committed_transcript","text":"x","words":[{"end":-1}]}"#.to_owned(),
             format!(
                 r#"{{"message_type":"future","padding":"{}"}}"#,
                 "x".repeat(MAX_PROVIDER_MESSAGE_BYTES)

@@ -57,6 +57,7 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
         Ok(opened) => opened,
         Err(error) => {
             fail_socket(&mut socket, error, state.metrics()).await;
+            close_socket(&mut socket).await;
             return;
         }
     };
@@ -72,12 +73,13 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
     {
         state.metrics().live_failure();
         close_coordinator(&mut opened.coordinator).await;
+        close_socket(&mut socket).await;
         return;
     }
 
     stream(&mut socket, &state, &mut opened).await;
     close_coordinator(&mut opened.coordinator).await;
-    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
+    close_socket(&mut socket).await;
 }
 
 async fn prepare_session(
@@ -183,17 +185,9 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
                 )
                 .await;
                 match finalized {
-                    Ok(()) => {
-                        if let Err(error) = await_client_close(
-                            socket,
-                            limits.live_frame_bytes,
-                            limits.finalize_timeout,
-                        )
-                        .await
-                        {
-                            fail_socket(socket, error, state.metrics()).await;
-                        }
-                    }
+                    // `finalize_complete` is the protocol terminal. Close immediately so queued
+                    // client frames cannot be classified as a second terminal `error`.
+                    Ok(()) => {}
                     Err(error) => fail_socket(socket, error, state.metrics()).await,
                 }
                 break;
@@ -202,43 +196,6 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
                 fail_socket(socket, error, state.metrics()).await;
                 break;
             }
-        }
-    }
-}
-
-async fn await_client_close(
-    socket: &mut WebSocket,
-    maximum: usize,
-    maximum_wait: Duration,
-) -> Result<(), SafeLiveError> {
-    let deadline = Instant::now() + maximum_wait;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(());
-        }
-        let received = match timeout(remaining, socket.recv()).await {
-            Err(_) | Ok(None | Some(Ok(Message::Close(_)))) => return Ok(()),
-            Ok(Some(Err(_))) => return Err(SafeLiveError::TransportClosed),
-            Ok(Some(Ok(message))) => message,
-        };
-        match received {
-            Message::Text(text) if text.len() <= maximum => {
-                if parse_client_command(&text) == Ok(ClientCommand::Close) {
-                    return Ok(());
-                }
-                return Err(SafeLiveError::InvalidCommand);
-            }
-            Message::Ping(payload) => {
-                timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Pong(payload)))
-                    .await
-                    .map_err(|_| SafeLiveError::TransportClosed)?
-                    .map_err(|_| SafeLiveError::TransportClosed)?;
-            }
-            Message::Pong(_) => {}
-            Message::Text(_) => return Err(SafeLiveError::FrameTooLarge),
-            Message::Binary(_) => return Err(SafeLiveError::InvalidCommand),
-            Message::Close(_) => return Ok(()),
         }
     }
 }
@@ -523,6 +480,10 @@ async fn close_coordinator(coordinator: &mut LiveCoordinator) {
     let _ = timeout(PROVIDER_CLOSE_TIMEOUT, coordinator.close()).await;
 }
 
+async fn close_socket(socket: &mut WebSocket) {
+    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
+}
+
 async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &GatewayMetrics) {
     metrics.live_failure();
     let _ = send_message(
@@ -533,7 +494,6 @@ async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &Gat
         },
     )
     .await;
-    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 fn recognition_request(config: &ClientConfig) -> LiveRecognitionRequest {

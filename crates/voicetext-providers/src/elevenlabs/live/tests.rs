@@ -21,7 +21,7 @@ fn recognition_request(sample_rate_hz: u32, language: &str) -> LiveRecognitionRe
         },
         sample_rate_hz,
         channels: CHANNELS,
-        keyterms: vec![" Craig ".into(), "Craig".into(), "release train".into()],
+        keyterms: vec!["Craig".into(), "Craig".into(), "release train".into()],
     }
 }
 

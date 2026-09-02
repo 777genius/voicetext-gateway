@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use voicetext_gateway::contracts::live::LiveIdentity;
 
 use tokio::sync::{Mutex, mpsc};
@@ -25,7 +25,7 @@ impl LiveRecognizerFactory for FakeLiveFactory {
         let session = FakeLiveSession {
             sender,
             receiver: Mutex::new(receiver),
-            emitted_transcript: AtomicBool::new(false),
+            accepted_audio: AtomicUsize::new(0),
         };
         Box::pin(async move { Ok(Box::new(session) as Box<dyn LiveRecognizerSession>) })
     }
@@ -35,26 +35,29 @@ impl LiveRecognizerFactory for FakeLiveFactory {
 struct FakeLiveSession {
     sender: mpsc::Sender<LiveRecognitionEvent>,
     receiver: Mutex<mpsc::Receiver<LiveRecognitionEvent>>,
-    emitted_transcript: AtomicBool,
+    accepted_audio: AtomicUsize,
 }
 
 impl LiveRecognizerSession for FakeLiveSession {
     fn write_audio(&self, _frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
-            if !self.emitted_transcript.swap(true, Ordering::SeqCst) {
+            let accepted_audio = self.accepted_audio.fetch_add(1, Ordering::SeqCst);
+            if accepted_audio == 0 {
                 self.sender
                     .send(LiveRecognitionEvent::Transcript(transcript(
                         LiveTranscriptStability::Partial,
-                    )))
-                    .await
-                    .unwrap();
-                self.sender
-                    .send(LiveRecognitionEvent::Transcript(transcript(
-                        LiveTranscriptStability::UtteranceFinal,
+                        accepted_audio,
                     )))
                     .await
                     .unwrap();
             }
+            self.sender
+                .send(LiveRecognitionEvent::Transcript(transcript(
+                    LiveTranscriptStability::UtteranceFinal,
+                    accepted_audio,
+                )))
+                .await
+                .unwrap();
             Ok(())
         })
     }
@@ -80,10 +83,13 @@ impl LiveRecognizerSession for FakeLiveSession {
     }
 }
 
-fn transcript(stability: LiveTranscriptStability) -> LiveTranscript {
+fn transcript(stability: LiveTranscriptStability, accepted_audio: usize) -> LiveTranscript {
     LiveTranscript {
         text: "synthetic live speech".into(),
-        start_millis: 20,
+        start_millis: 20
+            + u64::try_from(accepted_audio)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(40),
         duration_millis: 40,
         confidence: Some(0.9),
         stability,
