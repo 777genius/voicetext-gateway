@@ -35,6 +35,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends build-essential cmake
 
+      - name: Format, lint, test, and document
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-features --locked
+          cargo doc --workspace --no-deps --locked
+
       - name: Install pinned security and policy tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
@@ -57,15 +66,6 @@ jobs:
         run: |
           cargo xtask verify
           cargo deny check
-
-      - name: Format, lint, test, and document
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: |
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo test --workspace --all-features --locked
-          cargo doc --workspace --no-deps --locked
 
       - name: Validate Compose, Caddy semantics, secrets, and runtime hardening
         run: |
