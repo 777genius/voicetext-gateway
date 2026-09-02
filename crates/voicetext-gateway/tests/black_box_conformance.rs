@@ -17,6 +17,8 @@ use uuid::Uuid;
 use support::{TOKEN, TestGateway, synthetic_ogg_opus};
 
 const IDEMPOTENCY_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const ELEVENLABS_IDEMPOTENCY_KEY: &str =
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
 #[tokio::test]
 async fn current_voicetext_health_contract_is_preserved() {
@@ -86,7 +88,7 @@ async fn exact_batch_v2_and_v3_wire_contracts() {
             version: "3",
             provider: "elevenlabs",
             model: "scribe_v2",
-            idempotency_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            idempotency_key: ELEVENLABS_IDEMPOTENCY_KEY,
         },
     )
     .await;
