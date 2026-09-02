@@ -147,7 +147,7 @@ impl GatewayState {
     ) -> Self {
         let live_slots = Arc::new(Semaphore::new(limits.live_connections.get()));
         let batch_capacity = limits.live_connections.get();
-        let batch_capacity_u32 = u32::try_from(batch_capacity).expect("validated batch capacity");
+        let batch_capacity_u32 = u32::try_from(batch_capacity).unwrap_or(u32::MAX);
         let provider_capacity = batch_capacity.div_ceil(2).max(1);
         Self(Arc::new(GatewayStateInner {
             auth,

@@ -445,7 +445,7 @@ mod tests {
         let config = load(&values).unwrap();
         assert_eq!(config.bind_address, "127.0.0.1:9080".parse().unwrap());
         assert_eq!(config.finalize_timeout, Duration::from_millis(750));
-        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(120));
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_mins(2));
         assert_eq!(config.max_connections, 32);
         assert_eq!(config.max_upload_bytes, 2 * 1024 * 1024);
         assert_eq!(

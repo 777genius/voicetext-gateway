@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
+use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
@@ -155,6 +156,15 @@ async fn run() -> Result<(), BootstrapFailure> {
         .map_err(|_| BootstrapFailure::Bind)?;
     log_listening(config.bind_address);
     start_startup_recovery(&state, recovery);
+    serve_until_shutdown(listener, state, pool, config.shutdown_drain_timeout).await
+}
+
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    state: GatewayState,
+    pool: PgPool,
+    shutdown_drain_timeout: Duration,
+) -> Result<(), BootstrapFailure> {
     let (stop_server, server_shutdown) = oneshot::channel();
     let server_state = state.clone();
     let mut server = tokio::spawn(async move {
@@ -174,7 +184,7 @@ async fn run() -> Result<(), BootstrapFailure> {
         () = after_shutdown_signal(wait_for_process_signal(), move || shutdown_state.begin_shutdown()) => {}
     }
     let _notified = stop_server.send(());
-    let shutdown_deadline = tokio::time::Instant::now() + config.shutdown_drain_timeout;
+    let shutdown_deadline = tokio::time::Instant::now() + shutdown_drain_timeout;
     let aborted = state.shutdown_batch_tasks(shutdown_deadline).await;
     if aborted != 0 {
         tracing::warn!(aborted, "batch shutdown drain deadline reached");
