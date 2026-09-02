@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::{Uuid, Variant};
 
 use super::ContractViolation;
+use super::live_capabilities::{LiveInputFormat, validate_client_profile};
 
 const MAX_ERROR_CODE_CHARS: usize = 128;
 const MAX_ERROR_MESSAGE_CHARS: usize = 2_048;
@@ -167,6 +168,12 @@ pub fn parse_client_config(json: &str) -> Result<ClientConfig, ContractViolation
     };
     validate_language(&wire.language)?;
     validate_keyterms(&wire.keyterms)?;
+    let input_format = match audio_format {
+        AudioFormat::Opus48Khz => LiveInputFormat::Opus48KhzMono,
+        AudioFormat::PcmS16le16Khz => LiveInputFormat::PcmS16Le16KhzMono,
+    };
+    validate_client_profile(identity, &wire.language, &wire.keyterms, input_format)
+        .map_err(|_| ContractViolation("unsupported live profile features"))?;
     Ok(ClientConfig {
         identity,
         language: wire.language,

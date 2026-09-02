@@ -6,7 +6,9 @@ use std::sync::Arc;
 use voicetext_speech::application::ports::{BatchRecognizer, LiveRecognizerFactory};
 
 use crate::contracts::batch::BatchIdentity;
+use crate::contracts::batch_capabilities::BatchCapabilityDescriptor;
 use crate::contracts::live::LiveIdentity;
+use crate::contracts::live_capabilities::LiveCapabilityDescriptor;
 
 /// Configured recognizers for the four `VoiceText` compatibility profiles.
 ///
@@ -69,6 +71,16 @@ impl ProfileRegistry {
         }
     }
 
+    /// Returns the descriptor bound to an enabled batch profile.
+    #[must_use]
+    pub fn batch_descriptor(
+        &self,
+        identity: BatchIdentity,
+    ) -> Option<&'static BatchCapabilityDescriptor> {
+        self.batch(identity)
+            .map(|_| identity.capability_descriptor())
+    }
+
     /// Returns the exact configured live profile, without fallback.
     #[must_use]
     pub fn live(&self, identity: LiveIdentity) -> Option<&Arc<dyn LiveRecognizerFactory>> {
@@ -76,6 +88,16 @@ impl ProfileRegistry {
             LiveIdentity::DeepgramNova3 => self.deepgram_live.as_ref(),
             LiveIdentity::ElevenlabsScribeV2Realtime => self.elevenlabs_live.as_ref(),
         }
+    }
+
+    /// Returns the descriptor bound to an enabled live profile.
+    #[must_use]
+    pub fn live_descriptor(
+        &self,
+        identity: LiveIdentity,
+    ) -> Option<&'static LiveCapabilityDescriptor> {
+        self.live(identity)
+            .map(|_| identity.capability_descriptor())
     }
 
     /// True when at least one batch and one live profile are available.
@@ -151,5 +173,22 @@ mod tests {
                 .is_some()
         );
         assert!(registry.is_operational());
+        assert_eq!(
+            registry
+                .batch_descriptor(BatchIdentity::DeepgramNova3MultiV2)
+                .unwrap(),
+            BatchIdentity::DeepgramNova3MultiV2.capability_descriptor()
+        );
+        assert!(
+            registry
+                .batch_descriptor(BatchIdentity::ElevenlabsScribeV2MultiV3)
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .live_descriptor(LiveIdentity::ElevenlabsScribeV2Realtime)
+                .unwrap(),
+            LiveIdentity::ElevenlabsScribeV2Realtime.capability_descriptor()
+        );
     }
 }

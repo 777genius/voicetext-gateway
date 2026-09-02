@@ -4,10 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod source_dependencies;
+
 const MAX_SOURCE_LINES: usize = 600;
 
 #[derive(Debug, Eq, PartialEq)]
-struct Boundary {
+pub(crate) struct Boundary {
     name: String,
     root: PathBuf,
     allowed: Vec<String>,
@@ -59,6 +61,14 @@ fn verify(repository_root: &Path) -> Result<(), Vec<String>> {
     let members = parse_workspace_members(&manifest)?;
     let source_roots = workspace_source_roots(repository_root, &members, &mut errors);
     let source_files = enumerate_rust_files(repository_root, &source_roots, &mut errors);
+
+    source_dependencies::enforce(
+        &boundaries,
+        &source_roots,
+        &source_files,
+        repository_root,
+        &mut errors,
+    );
 
     for relative_file in source_files {
         verify_source_file(repository_root, &relative_file, &boundaries, &mut errors);
