@@ -16,13 +16,15 @@ use voicetext_gateway::secret::MachineSecret;
 use voicetext_gateway::server::{
     GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, recover_startup, router,
 };
-use voicetext_speech::application::ports::{BatchAudioSpool, BatchJobStore, BoxFuture};
+use voicetext_speech::application::ports::{
+    BatchAudioSpool, BatchJobStore, BoxFuture, LiveRecognizerFactory,
+};
 
 use batch::{FakeBatchInfrastructure, FakeBatchRecognizer};
 pub use fixture::synthetic_ogg_opus;
 use live::FakeLiveFactory;
 
-pub const TOKEN: &str = "conformance-token";
+pub const TOKEN: &str = "conformance-service-token-00000001";
 
 #[derive(Debug)]
 struct AlwaysReady;
@@ -42,11 +44,14 @@ pub struct TestGateway {
 
 impl TestGateway {
     pub async fn start() -> Self {
+        Self::start_with_live(Arc::new(FakeLiveFactory)).await
+    }
+
+    pub async fn start_with_live(live_factory: Arc<dyn LiveRecognizerFactory>) -> Self {
         let batch = Arc::new(FakeBatchInfrastructure::default());
         let jobs: Arc<dyn BatchJobStore> = batch.clone();
         let spool: Arc<dyn BatchAudioSpool> = batch;
         let batch_recognizer = Arc::new(FakeBatchRecognizer);
-        let live_factory = Arc::new(FakeLiveFactory);
         let profiles = ProfileRegistry::new()
             .with_batch(
                 BatchIdentity::DeepgramNova3MultiV2,

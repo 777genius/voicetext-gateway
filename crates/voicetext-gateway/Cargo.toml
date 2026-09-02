@@ -33,6 +33,7 @@ voicetext-speech.workspace = true
 futures-util.workspace = true
 ogg.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite.workspace = true
 
 [lints]

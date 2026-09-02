@@ -3,9 +3,12 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, RETRY_AFTER};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, StatusCode};
@@ -24,6 +27,9 @@ const MODEL: &str = "nova-3";
 const CHANNELS: u8 = 1;
 const MAX_IGNORED_MESSAGES_BEFORE_YIELD: usize = 32;
 const MAX_RETRY_AFTER_MILLIS: u64 = 30_000;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type ClientWriter = SplitSink<ClientSocket, Message>;
@@ -95,24 +101,29 @@ impl DeepgramLiveRecognizer {
         let config = WebSocketConfig::default()
             .max_message_size(Some(live_dto::MAX_PROVIDER_TEXT_BYTES))
             .max_frame_size(Some(live_dto::MAX_PROVIDER_TEXT_BYTES));
-        let (socket, response) =
-            match connect_async_with_config(handshake, Some(config), false).await {
-                Ok(connected) => connected,
-                Err(WebSocketError::Http(response)) => {
-                    return Err(handshake_status_failure(
-                        response.status(),
-                        response.headers(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(known_not_accepted(
-                        true,
-                        "DEEPGRAM_LIVE_CONNECT_FAILED",
-                        None,
-                        None,
-                    ));
-                }
-            };
+        let connected = timeout(
+            CONNECT_TIMEOUT,
+            connect_async_with_config(handshake, Some(config), false),
+        )
+        .await
+        .map_err(|_| known_not_accepted(true, "DEEPGRAM_LIVE_CONNECT_TIMEOUT", None, None))?;
+        let (socket, response) = match connected {
+            Ok(connected) => connected,
+            Err(WebSocketError::Http(response)) => {
+                return Err(handshake_status_failure(
+                    response.status(),
+                    response.headers(),
+                ));
+            }
+            Err(_) => {
+                return Err(known_not_accepted(
+                    true,
+                    "DEEPGRAM_LIVE_CONNECT_FAILED",
+                    None,
+                    None,
+                ));
+            }
+        };
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(handshake_status_failure(
                 response.status(),
@@ -165,13 +176,19 @@ struct ReadState {
 }
 
 impl DeepgramLiveSession {
-    async fn write_message(&self, message: Message, code: &str) -> Result<(), RecognitionFailure> {
-        self.writer
-            .lock()
-            .await
-            .send(message)
-            .await
-            .map_err(|_| unknown(code, None))
+    async fn write_message(
+        &self,
+        message: Message,
+        timeout_code: &str,
+        failure_code: &str,
+    ) -> Result<(), RecognitionFailure> {
+        bounded_io(
+            WRITE_TIMEOUT,
+            async { self.writer.lock().await.send(message).await },
+            timeout_code,
+            failure_code,
+        )
+        .await
     }
 
     async fn next_event_inner(&self) -> Result<Option<LiveRecognitionEvent>, RecognitionFailure> {
@@ -253,6 +270,7 @@ impl LiveRecognizerSession for DeepgramLiveSession {
         Box::pin(async move {
             self.write_message(
                 Message::Binary(frame.pcm_s16le.into()),
+                "DEEPGRAM_LIVE_AUDIO_WRITE_TIMEOUT",
                 "DEEPGRAM_LIVE_AUDIO_WRITE_FAILED",
             )
             .await
@@ -268,22 +286,41 @@ impl LiveRecognizerSession for DeepgramLiveSession {
     fn finalize(&self) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(self.write_message(
             Message::text(r#"{"type":"Finalize"}"#),
+            "DEEPGRAM_LIVE_FINALIZE_WRITE_TIMEOUT",
             "DEEPGRAM_LIVE_FINALIZE_WRITE_FAILED",
         ))
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
-            let mut writer = self.writer.lock().await;
-            let control = writer
-                .send(Message::text(r#"{"type":"CloseStream"}"#))
-                .await;
-            let closed = writer.close().await;
-            control
-                .and(closed)
-                .map_err(|_| unknown("DEEPGRAM_LIVE_CLOSE_FAILED", None))
+            bounded_io(
+                CLOSE_TIMEOUT,
+                async {
+                    let mut writer = self.writer.lock().await;
+                    let control = writer
+                        .send(Message::text(r#"{"type":"CloseStream"}"#))
+                        .await;
+                    let closed = writer.close().await;
+                    control.and(closed)
+                },
+                "DEEPGRAM_LIVE_CLOSE_TIMEOUT",
+                "DEEPGRAM_LIVE_CLOSE_FAILED",
+            )
+            .await
         })
     }
+}
+
+async fn bounded_io<T>(
+    maximum: Duration,
+    operation: impl Future<Output = Result<T, WebSocketError>>,
+    timeout_code: &str,
+    failure_code: &str,
+) -> Result<T, RecognitionFailure> {
+    timeout(maximum, operation)
+        .await
+        .map_err(|_| unknown(timeout_code, None))?
+        .map_err(|_| unknown(failure_code, None))
 }
 
 fn profile_matches(request: &LiveRecognitionRequest) -> bool {
@@ -356,244 +393,7 @@ fn unknown(code: &str, provider_reference: Option<ProviderReference>) -> Recogni
         provider_reference,
     }
 }
+
 #[cfg(test)]
-mod tests {
-    use futures_util::{SinkExt, StreamExt};
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
-    use tokio_tungstenite::accept_hdr_async;
-    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-    use voicetext_speech::application::ports::{
-        LiveProfile, LiveTranscriptStability, RecognitionFailureClass,
-    };
-    use voicetext_speech::domain::live::LiveSession;
-
-    use super::*;
-
-    #[derive(Debug)]
-    struct CapturedFlow {
-        target: String,
-        authorization: String,
-        audio: Vec<u8>,
-        finalize: String,
-        close_stream: String,
-        saw_close: bool,
-    }
-    fn recognition_request() -> LiveRecognitionRequest {
-        LiveRecognitionRequest {
-            profile: LiveProfile {
-                protocol_version: 2,
-                provider: PROVIDER.into(),
-                model: MODEL.into(),
-                language: "multi".into(),
-            },
-            sample_rate_hz: 48_000,
-            channels: CHANNELS,
-            keyterms: vec![" Craig ".into(), "release train".into()],
-        }
-    }
-    fn audio_frame() -> LiveAudioFrame {
-        let mut lifecycle = LiveSession::new();
-        lifecycle.mark_ready().unwrap();
-        LiveAudioFrame {
-            sequence: lifecycle.accept_audio().unwrap(),
-            pcm_s16le: vec![1, 2, 3, 4],
-        }
-    }
-    #[test]
-    fn accepts_only_supported_pcm_rates_and_projects_legacy_rate() {
-        let mut request = recognition_request();
-        request.sample_rate_hz = 16_000;
-        assert!(profile_matches(&request));
-        let endpoint = Url::parse("wss://api.deepgram.com/v1/listen").unwrap();
-        let url = live_dto::build_url(endpoint, request.sample_rate_hz, "multi", &[]);
-        assert!(
-            url.query_pairs()
-                .any(|pair| pair == ("sample_rate".into(), "16000".into()))
-        );
-        request.sample_rate_hz = 44_100;
-        assert!(!profile_matches(&request));
-        request.sample_rate_hz = 48_000;
-        request.profile.language = "ru&model=attacker".into();
-        assert!(!profile_matches(&request));
-    }
-    async fn spawn_success() -> (Url, tokio::task::JoinHandle<CapturedFlow>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let (handshake_sender, handshake_receiver) = oneshot::channel();
-            #[allow(clippy::result_large_err)]
-            let callback = move |request: &Request, mut response: Response| {
-                let captured = (
-                    request.uri().to_string(),
-                    request.headers()[AUTHORIZATION]
-                        .to_str()
-                        .unwrap()
-                        .to_owned(),
-                );
-                handshake_sender.send(captured).unwrap();
-                response
-                    .headers_mut()
-                    .insert("x-dg-request-id", HeaderValue::from_static("handshake-1"));
-                Ok(response)
-            };
-            let mut socket = accept_hdr_async(stream, callback).await.unwrap();
-            let (target, authorization) = handshake_receiver.await.unwrap();
-            let audio = socket.next().await.unwrap().unwrap().into_data().to_vec();
-            let finalize = socket
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_text()
-                .unwrap()
-                .to_string();
-            for payload in [
-                r#"{"type":"FutureEvent"}"#,
-                r#"{"type":"Metadata","request_id":"metadata-2"}"#,
-                r#"{"type":"Results","start":0.25,"duration":0.5,"channel":{"alternatives":[{"transcript":"hel","confidence":0.5}]}}"#,
-                r#"{"type":"Results","start":0.25,"duration":0.75,"is_final":true,"speech_final":true,"from_finalize":true,"channel":{"alternatives":[{"transcript":"hello","confidence":0.9}]}}"#,
-                r#"{"type":"UtteranceEnd","last_word_end":1.0}"#,
-                r#"{"type":"Error","err_code":"BAD_REQUEST"}"#,
-            ] {
-                socket.send(Message::text(payload)).await.unwrap();
-            }
-            let close_stream = socket
-                .next()
-                .await
-                .unwrap()
-                .unwrap()
-                .into_text()
-                .unwrap()
-                .to_string();
-            let saw_close = matches!(socket.next().await, Some(Ok(Message::Close(_))));
-            CapturedFlow {
-                target,
-                authorization,
-                audio,
-                finalize,
-                close_stream,
-                saw_close,
-            }
-        });
-        (
-            Url::parse(&format!("ws://{address}/v1/listen?discarded=true")).unwrap(),
-            handle,
-        )
-    }
-    #[tokio::test]
-    async fn sends_exact_handshake_audio_finalize_close_and_normalizes_events() {
-        let (endpoint, server) = spawn_success().await;
-        let factory = DeepgramLiveRecognizer::new("test-secret", endpoint).unwrap();
-        let session = factory.open(recognition_request()).await.unwrap();
-        session.write_audio(audio_frame()).await.unwrap();
-        session.finalize().await.unwrap();
-        let LiveRecognitionEvent::Transcript(partial) =
-            session.next_event().await.unwrap().unwrap()
-        else {
-            panic!("expected partial transcript");
-        };
-        assert_eq!(partial.text, "hel");
-        assert_eq!(partial.stability, LiveTranscriptStability::Partial);
-        let LiveRecognitionEvent::Transcript(finalized) =
-            session.next_event().await.unwrap().unwrap()
-        else {
-            panic!("expected final transcript");
-        };
-        assert_eq!(finalized.stability, LiveTranscriptStability::UtteranceFinal);
-        assert_eq!(
-            session.next_event().await.unwrap(),
-            Some(LiveRecognitionEvent::FinalizeResultObserved)
-        );
-        assert_eq!(
-            session.next_event().await.unwrap(),
-            Some(LiveRecognitionEvent::UtteranceEnd {
-                last_word_end_millis: 1_000,
-            })
-        );
-        let error = session.next_event().await.unwrap_err();
-        assert_eq!(
-            error.class(),
-            RecognitionFailureClass::KnownAcceptedTerminal
-        );
-        assert_eq!(error.provider_reference().unwrap().as_str(), "metadata-2");
-        session.close().await.unwrap();
-        let captured = server.await.unwrap();
-        assert_eq!(captured.authorization, "Token test-secret");
-        assert_eq!(captured.audio, vec![1, 2, 3, 4]);
-        assert_eq!(captured.finalize, r#"{"type":"Finalize"}"#);
-        assert_eq!(captured.close_stream, r#"{"type":"CloseStream"}"#);
-        assert!(captured.saw_close);
-        assert_eq!(
-            captured.target,
-            concat!(
-                "/v1/listen?encoding=linear16&sample_rate=48000&channels=1&language=multi&",
-                "model=nova-3&punctuate=true&interim_results=true&utterance_end_ms=1400&",
-                "vad_events=true&endpointing=300&smart_format=true&no_delay=true&",
-                "keyterm=Craig&keyterm=release+train"
-            )
-        );
-        assert!(!format!("{factory:?}").contains("test-secret"));
-    }
-    async fn rejected_handshake(status: StatusCode) -> RecognitionFailure {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            #[allow(clippy::result_large_err)]
-            let callback = move |_request: &Request, _response: Response| {
-                let mut response = ErrorResponse::new(Some("rejected".into()));
-                *response.status_mut() = status;
-                let headers = response.headers_mut();
-                headers.insert(RETRY_AFTER, HeaderValue::from_static("90"));
-                headers.insert("x-dg-request-id", HeaderValue::from_static("reject-1"));
-                Err(response)
-            };
-            let _expected_rejection = accept_hdr_async(stream, callback).await;
-        });
-        let endpoint = Url::parse(&format!("ws://{address}/v1/listen")).unwrap();
-        let error = DeepgramLiveRecognizer::new("key", endpoint)
-            .unwrap()
-            .open(recognition_request())
-            .await
-            .err()
-            .unwrap();
-        server.await.unwrap();
-        error
-    }
-    #[tokio::test]
-    async fn classifies_handshake_status_and_rejects_profile_before_connect() {
-        let limited = rejected_handshake(StatusCode::TOO_MANY_REQUESTS).await;
-        assert_eq!(
-            limited.class(),
-            RecognitionFailureClass::KnownNotAccepted { retryable: true }
-        );
-        assert_eq!(limited.provider_reference().unwrap().as_str(), "reject-1");
-        let RecognitionFailure::KnownNotAccepted {
-            retry_after_millis, ..
-        } = limited
-        else {
-            panic!("expected rejection");
-        };
-        assert_eq!(retry_after_millis, Some(MAX_RETRY_AFTER_MILLIS));
-        let unavailable = rejected_handshake(StatusCode::SERVICE_UNAVAILABLE).await;
-        assert_eq!(
-            unavailable.class(),
-            RecognitionFailureClass::KnownNotAccepted { retryable: true }
-        );
-        let auth = rejected_handshake(StatusCode::UNAUTHORIZED).await;
-        assert_eq!(
-            auth.class(),
-            RecognitionFailureClass::KnownNotAccepted { retryable: false }
-        );
-        let endpoint = Url::parse("ws://127.0.0.1:9/v1/listen").unwrap();
-        let factory = DeepgramLiveRecognizer::new("key", endpoint).unwrap();
-        let mut request = recognition_request();
-        request.sample_rate_hz = 44_100;
-        assert_eq!(
-            factory.open(request).await.err().unwrap().code(),
-            "DEEPGRAM_LIVE_PROFILE_MISMATCH"
-        );
-    }
-}
+#[path = "live_tests.rs"]
+mod tests;

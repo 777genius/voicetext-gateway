@@ -66,20 +66,22 @@ pub enum AuthenticationError {
 mod tests {
     use super::*;
 
+    const TOKEN: &str = "gateway-service-token-000000000001";
+
     #[test]
     fn accepts_the_exact_bearer_form() {
-        let expected = MachineSecret::from_token(b"gateway-token").unwrap();
+        let expected = MachineSecret::from_token(TOKEN.as_bytes()).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer gateway-token"),
+            HeaderValue::from_static("Bearer gateway-service-token-000000000001"),
         );
         assert_eq!(authenticate(&headers, &expected), Ok(()));
     }
 
     #[test]
     fn rejects_missing_duplicate_and_invalid_credentials() {
-        let expected = MachineSecret::from_token(b"gateway-token").unwrap();
+        let expected = MachineSecret::from_token(TOKEN.as_bytes()).unwrap();
         assert_eq!(
             authenticate(&HeaderMap::new(), &expected),
             Err(AuthenticationError::Missing)
@@ -88,11 +90,11 @@ mod tests {
         let mut duplicate = HeaderMap::new();
         duplicate.append(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer gateway-token"),
+            HeaderValue::from_static("Bearer gateway-service-token-000000000001"),
         );
         duplicate.append(
             AUTHORIZATION,
-            HeaderValue::from_static("Bearer gateway-token"),
+            HeaderValue::from_static("Bearer gateway-service-token-000000000001"),
         );
         assert_eq!(
             authenticate(&duplicate, &expected),

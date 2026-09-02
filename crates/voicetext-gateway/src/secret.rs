@@ -10,6 +10,8 @@ use tokio::io::AsyncReadExt;
 
 /// Maximum accepted size of a mounted secret file, including its final newline.
 pub const MAX_SECRET_FILE_BYTES: usize = 16 * 1024;
+/// Minimum entropy-bearing byte length required for a gateway service token.
+pub const MIN_MACHINE_TOKEN_BYTES: usize = 32;
 const MAX_SECRET_READ_BYTES: u64 = 16 * 1024 + 1;
 
 /// A one-way representation of a machine authentication token.
@@ -25,7 +27,7 @@ impl MachineSecret {
     ///
     /// # Errors
     ///
-    /// Returns [`SecretError::Empty`] for an empty token, or
+    /// Returns [`SecretError::TooShort`] for a token shorter than 32 bytes, or
     /// [`SecretError::InvalidCharacter`] for whitespace, control, or non-ASCII bytes.
     pub fn from_token(token: &[u8]) -> Result<Self, SecretError> {
         validate_token(token)?;
@@ -154,9 +156,12 @@ impl fmt::Display for MachineSecret {
 /// Validation failure for plaintext token input.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum SecretError {
-    /// The token has no bytes.
-    #[error("machine token must not be empty")]
-    Empty,
+    /// The token does not meet the service-token minimum length.
+    #[error("machine token must be at least {minimum} bytes")]
+    TooShort {
+        /// Required minimum, without disclosing the supplied length or value.
+        minimum: usize,
+    },
     /// The token is not one unambiguous visible-ASCII value.
     #[error("machine token contains whitespace, control, or non-ASCII bytes")]
     InvalidCharacter,
@@ -215,8 +220,10 @@ pub enum SecretFileError {
 }
 
 fn validate_token(token: &[u8]) -> Result<(), SecretError> {
-    if token.is_empty() {
-        return Err(SecretError::Empty);
+    if token.len() < MIN_MACHINE_TOKEN_BYTES {
+        return Err(SecretError::TooShort {
+            minimum: MIN_MACHINE_TOKEN_BYTES,
+        });
     }
     if token.iter().any(|byte| !(0x21..=0x7e).contains(byte)) {
         return Err(SecretError::InvalidCharacter);
@@ -318,7 +325,7 @@ mod tests {
 
     #[test]
     fn secret_is_always_redacted() {
-        let secret = MachineSecret::from_token(b"do-not-print-this").unwrap();
+        let secret = MachineSecret::from_token(b"do-not-print-this-service-token-0001").unwrap();
         assert_eq!(format!("{secret}"), "[REDACTED]");
         assert_eq!(format!("{secret:?}"), "MachineSecret(REDACTED)");
     }
@@ -382,21 +389,53 @@ mod tests {
 
     #[test]
     fn verification_handles_equal_and_different_lengths() {
-        let secret = MachineSecret::from_token(b"correct-token").unwrap();
-        assert!(secret.verifies(b"correct-token"));
+        let secret = MachineSecret::from_token(b"correct-service-token-000000000001").unwrap();
+        assert!(secret.verifies(b"correct-service-token-000000000001"));
         assert!(!secret.verifies(b"wrong"));
-        assert!(!secret.verifies(b"correct-token-with-suffix"));
+        assert!(!secret.verifies(b"correct-service-token-000000000001-with-suffix"));
+    }
+
+    #[test]
+    fn machine_token_enforces_secret_safe_thirty_two_byte_boundary() {
+        let error = MachineSecret::from_token(&[b'x'; MIN_MACHINE_TOKEN_BYTES - 1])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            SecretError::TooShort {
+                minimum: MIN_MACHINE_TOKEN_BYTES
+            }
+        );
+        assert!(!format!("{error:?}").contains("31"));
+        assert!(MachineSecret::from_token(&[b'x'; MIN_MACHINE_TOKEN_BYTES]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn mounted_machine_token_enforces_the_same_boundary() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("service-token");
+        fs::write(&path, [b'x'; MIN_MACHINE_TOKEN_BYTES - 1]).unwrap();
+        secure_permissions(&path);
+        assert!(matches!(
+            MachineSecret::read_from_file(&path).await,
+            Err(SecretFileError::InvalidToken(SecretError::TooShort {
+                minimum: MIN_MACHINE_TOKEN_BYTES
+            }))
+        ));
+        fs::write(&path, [b'x'; MIN_MACHINE_TOKEN_BYTES]).unwrap();
+        let secret = MachineSecret::read_from_file(&path).await.unwrap();
+        assert!(secret.verifies(&[b'x'; MIN_MACHINE_TOKEN_BYTES]));
     }
 
     #[tokio::test]
     async fn loader_trims_one_terminal_lf() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("token");
-        fs::write(&path, b"mounted-token\n").unwrap();
+        fs::write(&path, b"mounted-service-token-000000000001\n").unwrap();
         secure_permissions(&path);
 
         let secret = MachineSecret::read_from_file(&path).await.unwrap();
-        assert!(secret.verifies(b"mounted-token"));
+        assert!(secret.verifies(b"mounted-service-token-000000000001"));
     }
 
     #[tokio::test]

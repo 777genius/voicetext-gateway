@@ -1,38 +1,36 @@
 //! Bounded `VoiceText` protocol v2 WebSocket transport.
 
-use std::time::Duration;
-
-use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::HeaderMap;
-use axum::response::Response;
-use tokio::time::{Instant, timeout};
-use uuid::Uuid;
-use voicetext_audio::discord_opus::DiscordOpusDecoder;
-use voicetext_speech::application::live::{
-    LiveCoordinator, LiveCoordinatorError, LiveCoordinatorEvent,
-};
-use voicetext_speech::application::ports::{
-    LiveRecognitionEvent, LiveRecognitionRequest, LiveTranscript, LiveTranscriptStability,
-    RecognitionFailure,
-};
-use voicetext_speech::domain::live::FinalizeStatus as DomainFinalizeStatus;
-
+use super::error::GatewayHttpError;
+use super::live_error::SafeLiveError;
+use super::metrics::GatewayMetrics;
+use super::state::GatewayState;
 use crate::auth::authenticate;
 use crate::contracts::live::{
     AudioFormat, ClientCommand, ClientConfig, FinalizeStatus, LiveIdentity, TranscriptSegment,
     parse_client_command, parse_client_config,
 };
 use crate::contracts::live_outbound::{OutboundServerMessage, serialize_server_message};
-
-use super::error::GatewayHttpError;
-use super::live_diagnostics::{recognition_failure_class, safe_provider_failure_code};
-use super::metrics::GatewayMetrics;
-use super::state::GatewayState;
-
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderMap;
+use axum::response::Response;
+use std::time::Duration;
+use tokio::time::{Instant, sleep_until, timeout};
+use uuid::Uuid;
+use voicetext_audio::discord_opus::DiscordOpusDecoder;
+use voicetext_speech::application::live::{LiveCoordinator, LiveCoordinatorEvent};
+use voicetext_speech::application::ports::{
+    LiveRecognitionEvent, LiveRecognitionRequest, LiveTranscript, LiveTranscriptStability,
+    RecognitionFailure,
+};
+use voicetext_speech::domain::live::FinalizeStatus as DomainFinalizeStatus;
 const FINALIZE_QUIESCENCE: Duration = Duration::from_millis(100);
-
-/// Authenticates and upgrades one bounded live transcription connection.
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROVIDER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const LIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_SESSION_TIMEOUT: Duration = Duration::from_hours(4);
 pub(crate) async fn upgrade(
     State(state): State<GatewayState>,
     headers: HeaderMap,
@@ -72,13 +70,13 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
     .is_err()
     {
         state.metrics().live_failure();
-        let _ = opened.coordinator.close().await;
+        close_coordinator(&mut opened.coordinator).await;
         return;
     }
 
     stream(&mut socket, &state, &mut opened).await;
-    let _ = opened.coordinator.close().await;
-    let _ = socket.send(Message::Close(None)).await;
+    close_coordinator(&mut opened.coordinator).await;
+    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 async fn prepare_session(
@@ -100,9 +98,13 @@ async fn prepare_session(
         AudioFormat::PcmS16le16Khz => None,
     };
     let request = recognition_request(&config);
-    let coordinator = LiveCoordinator::open(factory.as_ref(), request)
-        .await
-        .map_err(|error| SafeLiveError::from_coordinator(&error, "open"))?;
+    let coordinator = timeout(
+        PROVIDER_CONNECT_TIMEOUT,
+        LiveCoordinator::open(factory.as_ref(), request),
+    )
+    .await
+    .map_err(|_| SafeLiveError::ProviderOperationTimeout)?
+    .map_err(|error| SafeLiveError::from_coordinator(&error, "open"))?;
     Ok(OpenedSession {
         identity: config.identity,
         decoder,
@@ -112,6 +114,8 @@ async fn prepare_session(
 
 async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut OpenedSession) {
     let limits = state.limits();
+    let session_deadline = Instant::now() + LIVE_SESSION_TIMEOUT;
+    let mut idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
 
     let mut accepted_audio = false;
     loop {
@@ -119,12 +123,16 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
             let provider_read = opened.coordinator.receive_provider_event();
             tokio::pin!(provider_read);
             tokio::select! {
+                biased;
                 client = socket.recv() => Raced::Client(client),
                 provider = &mut provider_read => Raced::Provider(provider),
+                () = sleep_until(idle_deadline) => Raced::IdleTimeout,
+                () = sleep_until(session_deadline) => Raced::SessionTimeout,
             }
         };
         let control = match raced {
             Raced::Client(client) => {
+                idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
                 handle_client_frame(
                     client,
                     socket,
@@ -137,8 +145,10 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
                 .await
             }
             Raced::Provider(provider) => {
+                idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
                 handle_provider_event(provider, socket, &mut opened.coordinator).await
             }
+            Raced::IdleTimeout | Raced::SessionTimeout => Err(SafeLiveError::SessionTimeout),
         };
         match control {
             Ok(LoopControl::Continue) => {}
@@ -198,10 +208,12 @@ async fn await_client_close(
                 }
                 return Err(SafeLiveError::InvalidCommand);
             }
-            Message::Ping(payload) => socket
-                .send(Message::Pong(payload))
-                .await
-                .map_err(|_| SafeLiveError::TransportClosed)?,
+            Message::Ping(payload) => {
+                timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Pong(payload)))
+                    .await
+                    .map_err(|_| SafeLiveError::TransportClosed)?
+                    .map_err(|_| SafeLiveError::TransportClosed)?;
+            }
             Message::Pong(_) => {}
             Message::Text(_) => return Err(SafeLiveError::FrameTooLarge),
             Message::Binary(_) => return Err(SafeLiveError::InvalidCommand),
@@ -251,10 +263,7 @@ async fn handle_client_frame(
                 });
             }
             let pcm = decode_audio(decoder, frame.to_vec())?;
-            let sequence = coordinator
-                .provider_write(pcm)
-                .await
-                .map_err(|error| SafeLiveError::from_coordinator(&error, "write"))?;
+            let sequence = write_audio_or_cancel(socket, coordinator, pcm).await?;
             metrics.live_frame();
             send_message(
                 socket,
@@ -275,14 +284,48 @@ async fn handle_client_frame(
             Err(_) => Err(SafeLiveError::InvalidCommand),
         },
         Message::Ping(payload) => {
-            socket
-                .send(Message::Pong(payload))
+            timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Pong(payload)))
                 .await
+                .map_err(|_| SafeLiveError::TransportClosed)?
                 .map_err(|_| SafeLiveError::TransportClosed)?;
             Ok(LoopControl::Continue)
         }
         Message::Pong(_) => Ok(LoopControl::Continue),
         Message::Close(_) => Ok(LoopControl::Close),
+    }
+}
+
+async fn write_audio_or_cancel(
+    socket: &mut WebSocket,
+    coordinator: &mut LiveCoordinator,
+    pcm: Vec<u8>,
+) -> Result<voicetext_speech::domain::live::RawAudioSequence, SafeLiveError> {
+    let write = coordinator.provider_write(pcm);
+    tokio::pin!(write);
+    let deadline = Instant::now() + PROVIDER_WRITE_TIMEOUT;
+    loop {
+        tokio::select! {
+            biased;
+            client = socket.recv() => match client {
+                None | Some(Err(_) | Ok(Message::Close(_))) => {
+                    return Err(SafeLiveError::TransportClosed);
+                }
+                Some(Ok(Message::Ping(payload))) => {
+                    timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Pong(payload)))
+                        .await
+                        .map_err(|_| SafeLiveError::TransportClosed)?
+                        .map_err(|_| SafeLiveError::TransportClosed)?;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                    return Err(SafeLiveError::InvalidCommand);
+                }
+            },
+            result = &mut write => {
+                return result.map_err(|error| SafeLiveError::from_coordinator(&error, "write"));
+            }
+            () = sleep_until(deadline) => return Err(SafeLiveError::ProviderOperationTimeout),
+        }
     }
 }
 
@@ -328,10 +371,7 @@ async fn finalize(
     if coordinator.pending_audio_count() != 0 {
         return Err(SafeLiveError::PendingAcknowledgements);
     }
-    coordinator
-        .begin_finalize()
-        .await
-        .map_err(|error| SafeLiveError::from_coordinator(&error, "finalize_begin"))?;
+    begin_finalize_or_cancel(socket, coordinator, maximum_wait).await?;
 
     let deadline = Instant::now() + maximum_wait;
     let mut saw_result = false;
@@ -342,8 +382,20 @@ async fn finalize(
         } else {
             remaining
         };
-        let Ok(received) = timeout(wait, coordinator.receive_provider_event()).await else {
-            break;
+        let received = {
+            let provider_read = coordinator.receive_provider_event();
+            tokio::pin!(provider_read);
+            tokio::select! {
+                biased;
+                client = socket.recv() => match client {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => {
+                        return Err(SafeLiveError::TransportClosed);
+                    }
+                    Some(Ok(_)) => return Err(SafeLiveError::InvalidCommand),
+                },
+                provider = &mut provider_read => provider,
+                () = tokio::time::sleep(wait) => break,
+            }
         };
         let ended = matches!(received, Ok(None));
         let observed = matches!(
@@ -386,6 +438,28 @@ async fn finalize(
     .await
 }
 
+async fn begin_finalize_or_cancel(
+    socket: &mut WebSocket,
+    coordinator: &mut LiveCoordinator,
+    maximum_wait: Duration,
+) -> Result<(), SafeLiveError> {
+    let finalize = coordinator.begin_finalize();
+    tokio::pin!(finalize);
+    let deadline = Instant::now() + PROVIDER_WRITE_TIMEOUT.min(maximum_wait);
+    tokio::select! {
+        biased;
+        client = socket.recv() => match client {
+            None | Some(Err(_) | Ok(Message::Close(_))) => {
+                Err(SafeLiveError::TransportClosed)
+            }
+            Some(Ok(_)) => Err(SafeLiveError::InvalidCommand),
+        },
+        result = &mut finalize => result
+            .map_err(|error| SafeLiveError::from_coordinator(&error, "finalize_begin")),
+        () = sleep_until(deadline) => Err(SafeLiveError::ProviderOperationTimeout),
+    }
+}
+
 async fn send_coordinator_event(
     socket: &mut WebSocket,
     event: LiveCoordinatorEvent,
@@ -418,10 +492,17 @@ async fn send_message(
 ) -> Result<(), SafeLiveError> {
     let json =
         serialize_server_message(&message).map_err(|_| SafeLiveError::InvalidProviderEvent)?;
-    socket
-        .send(Message::Text(json.into()))
-        .await
-        .map_err(|_| SafeLiveError::TransportClosed)
+    timeout(
+        CLIENT_WRITE_TIMEOUT,
+        socket.send(Message::Text(json.into())),
+    )
+    .await
+    .map_err(|_| SafeLiveError::TransportClosed)?
+    .map_err(|_| SafeLiveError::TransportClosed)
+}
+
+async fn close_coordinator(coordinator: &mut LiveCoordinator) {
+    let _ = timeout(PROVIDER_CLOSE_TIMEOUT, coordinator.close()).await;
 }
 
 async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &GatewayMetrics) {
@@ -434,7 +515,7 @@ async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &Gat
         },
     )
     .await;
-    let _ = socket.send(Message::Close(None)).await;
+    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
 }
 
 fn recognition_request(config: &ClientConfig) -> LiveRecognitionRequest {
@@ -461,6 +542,8 @@ fn recognition_request(config: &ClientConfig) -> LiveRecognitionRequest {
 enum Raced {
     Client(Option<Result<Message, axum::Error>>),
     Provider(Result<Option<LiveRecognitionEvent>, RecognitionFailure>),
+    IdleTimeout,
+    SessionTimeout,
 }
 
 struct OpenedSession {
@@ -475,122 +558,6 @@ enum LoopControl {
     Close,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum SafeLiveError {
-    ConfigTimeout,
-    InvalidConfig,
-    InvalidCommand,
-    InvalidAudio,
-    FrameTooLarge,
-    ProfileNotConfigured,
-    AudioRuntimeUnavailable,
-    PendingAcknowledgements,
-    ProviderUnavailable,
-    ProviderTerminal,
-    ProviderOutcomeUnknown,
-    ProviderClosed,
-    InvalidProviderEvent,
-    TransportClosed,
-}
-
-impl SafeLiveError {
-    fn from_coordinator(error: &LiveCoordinatorError, phase: &'static str) -> Self {
-        if let LiveCoordinatorError::Recognition(failure) = error {
-            tracing::warn!(
-                phase,
-                provider_code = safe_provider_failure_code(failure.code()),
-                failure_class = recognition_failure_class(failure),
-                "live provider operation failed"
-            );
-        }
-        match error {
-            LiveCoordinatorError::Recognition(RecognitionFailure::KnownNotAccepted { .. }) => {
-                Self::ProviderUnavailable
-            }
-            LiveCoordinatorError::Recognition(RecognitionFailure::KnownAcceptedTerminal {
-                ..
-            }) => Self::ProviderTerminal,
-            LiveCoordinatorError::Recognition(RecognitionFailure::UnknownAfterSend { .. }) => {
-                Self::ProviderOutcomeUnknown
-            }
-            LiveCoordinatorError::InvalidAudioFrame => Self::InvalidAudio,
-            LiveCoordinatorError::InvalidProviderEvent(_) => Self::InvalidProviderEvent,
-            LiveCoordinatorError::Domain(_) => Self::InvalidCommand,
-        }
-    }
-
-    const fn code(self) -> &'static str {
-        match self {
-            Self::ConfigTimeout => "CONFIG_TIMEOUT",
-            Self::InvalidConfig => "INVALID_CONFIG",
-            Self::InvalidCommand => "INVALID_COMMAND",
-            Self::InvalidAudio => "INVALID_AUDIO",
-            Self::FrameTooLarge => "FRAME_TOO_LARGE",
-            Self::ProfileNotConfigured => "PROFILE_NOT_CONFIGURED",
-            Self::AudioRuntimeUnavailable => "AUDIO_RUNTIME_UNAVAILABLE",
-            Self::PendingAcknowledgements => "PENDING_ACKNOWLEDGEMENTS",
-            Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
-            Self::ProviderTerminal => "PROVIDER_TERMINAL",
-            Self::ProviderOutcomeUnknown => "PROVIDER_OUTCOME_UNKNOWN",
-            Self::ProviderClosed => "PROVIDER_CLOSED",
-            Self::InvalidProviderEvent => "INVALID_PROVIDER_EVENT",
-            Self::TransportClosed => "TRANSPORT_CLOSED",
-        }
-    }
-
-    const fn message(self) -> &'static str {
-        match self {
-            Self::ConfigTimeout => "Live configuration timed out",
-            Self::InvalidConfig => "Live configuration is invalid",
-            Self::InvalidCommand => "Live command is invalid",
-            Self::InvalidAudio => "Live audio frame is invalid",
-            Self::FrameTooLarge => "Live frame exceeds the configured limit",
-            Self::ProfileNotConfigured => "Requested live profile is not configured",
-            Self::AudioRuntimeUnavailable => "Live audio decoder is unavailable",
-            Self::PendingAcknowledgements => "Audio acknowledgements are still pending",
-            Self::ProviderUnavailable => "Live provider is temporarily unavailable",
-            Self::ProviderTerminal => "Live provider rejected the session",
-            Self::ProviderOutcomeUnknown => "Live provider outcome is unknown",
-            Self::ProviderClosed => "Live provider closed unexpectedly",
-            Self::InvalidProviderEvent => "Live provider returned an invalid event",
-            Self::TransportClosed => "Live transport closed",
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pcm_requires_complete_sixteen_bit_samples() {
-        assert_eq!(decode_audio(&mut None, vec![1, 2]).unwrap(), vec![1, 2]);
-        assert!(decode_audio(&mut None, vec![1]).is_err());
-        assert!(decode_audio(&mut None, Vec::new()).is_err());
-    }
-
-    #[test]
-    fn maps_transcript_stability_without_identity_drift() {
-        let message = transcript_message(LiveTranscript {
-            text: "hello".into(),
-            start_millis: 4,
-            duration_millis: 5,
-            confidence: Some(0.75),
-            stability: LiveTranscriptStability::SegmentFinal,
-        });
-        assert!(matches!(message, OutboundServerMessage::SegmentFinal(_)));
-    }
-
-    #[test]
-    fn provider_failure_mapping_executes_safe_diagnostics() {
-        let failure =
-            LiveCoordinatorError::Recognition(RecognitionFailure::KnownAcceptedTerminal {
-                code: "ELEVENLABS_LIVE_PROVIDER_ERROR".into(),
-                provider_reference: None,
-            });
-        assert!(matches!(
-            SafeLiveError::from_coordinator(&failure, "stream"),
-            SafeLiveError::ProviderTerminal
-        ));
-    }
-}
+#[path = "live_tests.rs"]
+mod tests;

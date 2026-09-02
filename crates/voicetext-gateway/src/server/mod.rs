@@ -15,6 +15,7 @@ mod error;
 mod health;
 mod live;
 mod live_diagnostics;
+mod live_error;
 mod metrics;
 mod recovery;
 mod state;

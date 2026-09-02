@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use fixture::synthetic_ogg_opus;
 use provider_wire::{DEEPGRAM_KEY, ELEVENLABS_KEY, RunningProviderWire};
 
-const TOKEN: &str = "conformance-token";
+const TOKEN: &str = "conformance-service-token-00000001";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VOICETEXT_TEST_DATABASE_URL and DISCORD_MEETING_ASSISTANT_ROOT"]
