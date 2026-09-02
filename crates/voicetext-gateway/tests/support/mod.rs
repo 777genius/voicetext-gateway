@@ -14,7 +14,8 @@ use voicetext_gateway::contracts::live::LiveIdentity;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::MachineSecret;
 use voicetext_gateway::server::{
-    GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, recover_startup, router,
+    GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, reconcile_startup, router,
+    start_startup_recovery,
 };
 use voicetext_speech::application::batch_capabilities::{
     BatchCapabilityDescriptor, BatchFinalizedCapability, BatchInputFormat, BatchLanguageHints,
@@ -172,10 +173,11 @@ impl TestGateway {
             Arc::new(AlwaysReady),
             limits,
         );
-        recover_startup(&state).await.unwrap();
+        let recovery = reconcile_startup(&state).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, receiver) = oneshot::channel();
+        start_startup_recovery(&state, recovery);
         let task = tokio::spawn(async move {
             axum::serve(listener, router(state))
                 .with_graceful_shutdown(async move {

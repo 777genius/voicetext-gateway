@@ -1,7 +1,6 @@
 //! Runtime-independent orchestration for durable batch recognition.
 
 use std::fmt;
-use std::num::NonZeroUsize;
 
 use crate::application::batch_models::apply_recognition_outcome;
 pub use crate::application::batch_models::{
@@ -15,13 +14,14 @@ use crate::application::ports::{
 };
 use crate::domain::batch::{BatchJob, BatchJobState};
 
-const RECOVERY_BATCH_LIMIT: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+pub(super) const RECOVERY_BATCH_LIMIT: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(100).unwrap();
 
 /// Coordinates admission, a single fenced provider call, and startup recovery.
 pub struct BatchCoordinator<'a> {
     recognizer: &'a dyn BatchRecognizer,
-    jobs: &'a dyn BatchJobStore,
-    spool: &'a dyn BatchAudioSpool,
+    pub(super) jobs: &'a dyn BatchJobStore,
+    pub(super) spool: &'a dyn BatchAudioSpool,
 }
 
 impl fmt::Debug for BatchCoordinator<'_> {
@@ -195,60 +195,6 @@ impl<'a> BatchCoordinator<'a> {
             }
         })
     }
-
-    /// Makes interrupted submissions terminally unknown and returns safe pending work.
-    pub fn recover_startup(
-        &self,
-        after: Option<BatchJobId>,
-    ) -> BoxFuture<'_, Result<BatchStartupRecovery, BatchCoordinatorFailure>> {
-        Box::pin(async move {
-            let mut candidates = self
-                .jobs
-                .list_recovery_candidates(after, RECOVERY_BATCH_LIMIT)
-                .await
-                .map_err(store)?;
-            let mut report = BatchStartupRecovery::default();
-            if candidates.len() >= RECOVERY_BATCH_LIMIT.get() {
-                candidates.truncate(RECOVERY_BATCH_LIMIT.get());
-                report.next_cursor = candidates.last().map(|snapshot| snapshot.id.clone());
-            }
-            for snapshot in candidates {
-                match snapshot.job.state() {
-                    BatchJobState::Accepted | BatchJobState::Retryable { .. } => {
-                        report.actionable.push(snapshot);
-                    }
-                    BatchJobState::Submitting { .. } => {
-                        let id = snapshot.id.clone();
-                        let expected_revision = snapshot.revision;
-                        let mut recovered = snapshot;
-                        recovered.job.recover_interrupted_submission();
-                        match self
-                            .jobs
-                            .compare_and_swap(expected_revision, recovered)
-                            .await
-                            .map_err(store)?
-                        {
-                            BatchJobUpdateOutcome::Stored(snapshot) => {
-                                self.spool
-                                    .remove(&snapshot.audio)
-                                    .await
-                                    .map_err(BatchCoordinatorFailure::Spool)?;
-                                report.recovered_unknown.push(snapshot);
-                            }
-                            BatchJobUpdateOutcome::RevisionConflict(snapshot) => {
-                                report.conflicts.push(snapshot);
-                            }
-                            BatchJobUpdateOutcome::Missing => {
-                                report.missing.push(id);
-                            }
-                        }
-                    }
-                    _ => report.invalid_candidates.push(snapshot),
-                }
-            }
-            Ok(report)
-        })
-    }
 }
 
 fn classify_existing(
@@ -266,7 +212,7 @@ fn classify_existing(
     }
 }
 
-fn store(failure: BatchJobStoreFailure) -> BatchCoordinatorFailure {
+pub(super) fn store(failure: BatchJobStoreFailure) -> BatchCoordinatorFailure {
     BatchCoordinatorFailure::Store(failure)
 }
 
@@ -439,6 +385,17 @@ mod tests {
             Box::pin(async move { Ok(outcome) })
         }
 
+        fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
+            let head = self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .max_by_key(|row| row.id.as_str())
+                .map(|row| row.id.clone());
+            Box::pin(async move { Ok(head) })
+        }
+
         fn list_recovery_candidates(
             &self,
             after: Option<BatchJobId>,
@@ -549,7 +506,8 @@ mod tests {
         assert!(fake.audio.lock().unwrap().is_some());
         assert_eq!(fake.removes.load(Ordering::SeqCst), 0);
 
-        let report = run(coordinator.recover_startup(None)).unwrap();
+        let report =
+            run(coordinator.recover_startup_through(None, BatchJobId::new("job"))).unwrap();
         assert_eq!(report.recovered_unknown.len(), 1);
         assert!(fake.audio.lock().unwrap().is_none());
         assert_eq!(fake.removes.load(Ordering::SeqCst), 1);
@@ -564,9 +522,20 @@ mod tests {
                 .unwrap()
                 .push(accepted_snapshot(&format!("job-{index:03}")));
         }
-        let report = run(BatchCoordinator::new(&fake, &fake, &fake).recover_startup(None)).unwrap();
+        let head = BatchJobId::new(format!("job-{:03}", RECOVERY_BATCH_LIMIT.get()));
+        let report =
+            run(BatchCoordinator::new(&fake, &fake, &fake).recover_startup_through(None, head))
+                .unwrap();
         assert_eq!(report.actionable.len(), RECOVERY_BATCH_LIMIT.get());
         assert!(report.next_cursor.is_some());
+        let tail = run(BatchCoordinator::new(&fake, &fake, &fake)
+            .recover_startup_through(report.next_cursor, BatchJobId::new("job-100")))
+        .unwrap();
+        assert_eq!(tail.actionable.len(), 1);
+        let frozen = run(BatchCoordinator::new(&fake, &fake, &fake)
+            .recover_startup_through(None, BatchJobId::new("job-050")))
+        .unwrap();
+        assert_eq!(frozen.actionable.len(), 51);
     }
 
     #[test]

@@ -206,6 +206,27 @@ impl GatewayState {
         Arc::clone(slots).try_acquire_owned().ok()
     }
 
+    pub(crate) async fn acquire_recovery_batch_slots(
+        &self,
+        identity: BatchIdentity,
+    ) -> Option<(
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
+    )> {
+        let global = Arc::clone(&self.0.global_batch_slots)
+            .acquire_owned()
+            .await
+            .ok()?;
+        let batch = Arc::clone(&self.0.batch_slots).acquire_owned().await.ok()?;
+        let provider = match identity {
+            BatchIdentity::DeepgramNova3MultiV2 => &self.0.deepgram_batch_slots,
+            BatchIdentity::ElevenlabsScribeV2MultiV3 => &self.0.elevenlabs_batch_slots,
+        };
+        let provider = Arc::clone(provider).acquire_owned().await.ok()?;
+        Some((global, batch, provider))
+    }
+
     pub(crate) fn spawn_batch_task(&self, task: impl Future<Output = ()> + Send + 'static) {
         let handle = tokio::spawn(task);
         let mut tasks = self

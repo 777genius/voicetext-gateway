@@ -243,12 +243,35 @@ pub trait BatchJobStore: Send + Sync {
         replacement: BatchJobSnapshot,
     ) -> BoxFuture<'_, Result<BatchJobUpdateOutcome, BatchJobStoreFailure>>;
 
+    /// Returns the greatest currently recoverable identity, freezing one startup scan.
+    fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
+        Box::pin(async {
+            Err(BatchJobStoreFailure::Unavailable {
+                code: "RECOVERY_HEAD_UNSUPPORTED".into(),
+            })
+        })
+    }
+
     /// Lists an identity-ordered bounded page after the exclusive cursor.
     fn list_recovery_candidates(
         &self,
         after: Option<BatchJobId>,
         maximum: NonZeroUsize,
     ) -> BoxFuture<'_, Result<Vec<BatchJobSnapshot>, BatchJobStoreFailure>>;
+
+    /// Lists a bounded page through an inclusive frozen head.
+    fn list_recovery_candidates_through(
+        &self,
+        after: Option<BatchJobId>,
+        through: BatchJobId,
+        maximum: NonZeroUsize,
+    ) -> BoxFuture<'_, Result<Vec<BatchJobSnapshot>, BatchJobStoreFailure>> {
+        Box::pin(async move {
+            let mut candidates = self.list_recovery_candidates(after, maximum).await?;
+            candidates.retain(|snapshot| snapshot.id.as_str() <= through.as_str());
+            Ok(candidates)
+        })
+    }
 }
 
 /// Failure to access the durable bounded audio spool.

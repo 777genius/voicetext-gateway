@@ -16,6 +16,7 @@ use voicetext_speech::application::batch::{
 use voicetext_speech::application::ports::{BatchJobId, BatchJobSnapshot};
 use voicetext_speech::domain::batch::{BatchJobState, BatchProfile, BatchUnknownOutcome};
 
+use super::effects::execute_fenced;
 use super::error::GatewayHttpError;
 use super::state::GatewayState;
 use crate::auth::authenticate;
@@ -176,31 +177,16 @@ fn spawn_execution(
     let task_state = (*state).clone();
     state.spawn_batch_task(async move {
         let _permits = (global_permit, batch_permit, provider_permit);
-        let Some(recognizer) = task_state.profiles().batch(identity).cloned() else {
+        task_state.metrics().batch_execution_started();
+        let Some(outcome) = execute_fenced(&task_state, identity, &id).await else {
+            task_state.metrics().batch_execution_finished();
             return;
         };
-        let coordinator = BatchCoordinator::new(
-            recognizer.as_ref(),
-            task_state.jobs(),
-            task_state.spool(),
-        );
-        task_state.metrics().batch_execution_started();
-        let outcome = coordinator.execute(&id).await;
         task_state.metrics().batch_execution_finished();
         match outcome {
             Ok(BatchExecutionOutcome::Persisted(snapshot)) => {
-                task_state.metrics().batch_provider_effect();
                 if snapshot.job.state().is_terminal() {
                     task_state.metrics().spool_terminal_cleaned(audio_bytes);
-                }
-                match snapshot.job.state() {
-                    BatchJobState::OutcomeUnknown { .. } => {
-                        task_state.metrics().batch_outcome_unknown();
-                    }
-                    BatchJobState::Failed { .. } => {
-                        task_state.metrics().batch_known_terminal_failure();
-                    }
-                    _ => {}
                 }
             }
             Ok(BatchExecutionOutcome::NotClaimed(_) | BatchExecutionOutcome::NotActionable(_)) => {}

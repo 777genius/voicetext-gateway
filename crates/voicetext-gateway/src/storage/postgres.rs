@@ -173,6 +173,7 @@ impl PostgresBatchJobStore {
     async fn recovery_inner(
         &self,
         after: Option<BatchJobId>,
+        through: Option<BatchJobId>,
         maximum: NonZeroUsize,
     ) -> Result<Vec<BatchJobSnapshot>, BatchJobStoreFailure> {
         let limit =
@@ -181,14 +182,20 @@ impl PostgresBatchJobStore {
             .as_ref()
             .map(|id| canonical_uuid(id.as_str()))
             .transpose()?;
+        let through = through
+            .as_ref()
+            .map(|id| canonical_uuid(id.as_str()))
+            .transpose()?;
         let sql = format!(
             "SELECT {COLUMNS} FROM voicetext_batch_jobs
              WHERE state IN ('accepted', 'retryable', 'submitting')
                AND ($1::uuid IS NULL OR job_id > $1)
-             ORDER BY job_id LIMIT $2"
+               AND ($2::uuid IS NULL OR job_id <= $2)
+             ORDER BY job_id LIMIT $3"
         );
         sqlx::query_as::<_, JobRecord>(AssertSqlSafe(sql))
             .bind(after)
+            .bind(through)
             .bind(limit)
             .fetch_all(&self.pool)
             .await
@@ -230,12 +237,34 @@ impl BatchJobStore for PostgresBatchJobStore {
         Box::pin(self.compare_and_swap_inner(expected_revision, replacement))
     }
 
+    fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                "SELECT MAX(job_id) FROM voicetext_batch_jobs
+                 WHERE state IN ('accepted', 'retryable', 'submitting')",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(database_failure)
+            .map(|head| head.map(|id| BatchJobId::new(id.hyphenated().to_string())))
+        })
+    }
+
     fn list_recovery_candidates(
         &self,
         after: Option<BatchJobId>,
         maximum: NonZeroUsize,
     ) -> BoxFuture<'_, Result<Vec<BatchJobSnapshot>, BatchJobStoreFailure>> {
-        Box::pin(self.recovery_inner(after, maximum))
+        Box::pin(self.recovery_inner(after, None, maximum))
+    }
+
+    fn list_recovery_candidates_through(
+        &self,
+        after: Option<BatchJobId>,
+        through: BatchJobId,
+        maximum: NonZeroUsize,
+    ) -> BoxFuture<'_, Result<Vec<BatchJobSnapshot>, BatchJobStoreFailure>> {
+        Box::pin(self.recovery_inner(after, Some(through), maximum))
     }
 }
 

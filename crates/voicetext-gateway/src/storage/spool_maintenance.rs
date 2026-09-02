@@ -182,6 +182,10 @@ mod tests {
             Box::pin(async { panic!("maintenance does not update") })
         }
 
+        fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
+            Box::pin(async { panic!("maintenance does not inspect recovery head") })
+        }
+
         fn list_recovery_candidates(
             &self,
             _: Option<BatchJobId>,

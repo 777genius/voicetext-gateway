@@ -17,8 +17,11 @@ pub struct GatewayMetrics {
     batch_admission_rejections: AtomicU64,
     batch_inflight: AtomicU64,
     batch_provider_effects: AtomicU64,
+    batch_provider_effects_persisted: AtomicU64,
+    batch_provider_effects_persistence_unknown: AtomicU64,
     batch_outcome_unknown: AtomicU64,
     batch_known_terminal_failures: AtomicU64,
+    batch_retryable_outcomes: AtomicU64,
     batch_recovery_executed: AtomicU64,
     batch_recovery_unknown: AtomicU64,
     spool_terminal_removed: AtomicU64,
@@ -56,8 +59,18 @@ impl GatewayMetrics {
         self.batch_inflight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn batch_provider_effect(&self) {
+    pub(crate) fn batch_provider_effect_started(&self) {
         self.batch_provider_effects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_provider_effect_persisted(&self) {
+        self.batch_provider_effects_persisted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_provider_effect_persistence_unknown(&self) {
+        self.batch_provider_effects_persistence_unknown
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn batch_outcome_unknown(&self) {
@@ -67,6 +80,15 @@ impl GatewayMetrics {
     pub(crate) fn batch_known_terminal_failure(&self) {
         self.batch_known_terminal_failures
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_retryable_outcome(&self) {
+        self.batch_retryable_outcomes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_recovery_executed(&self) {
+        self.batch_recovery_executed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_recovery(&self, executed: u64, unknown: u64) {
@@ -151,6 +173,18 @@ impl GatewayMetrics {
                 self.batch_provider_effects.load(Ordering::Relaxed),
             ),
             (
+                "voicetext_batch_provider_effects_persisted_total",
+                "Batch provider outcomes durably persisted after execution.",
+                self.batch_provider_effects_persisted
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_provider_effects_persistence_unknown_total",
+                "Batch provider effects whose post-egress persistence outcome is unknown.",
+                self.batch_provider_effects_persistence_unknown
+                    .load(Ordering::Relaxed),
+            ),
+            (
                 "voicetext_batch_outcome_unknown_total",
                 "Batch executions durably classified with unknown provider outcome.",
                 self.batch_outcome_unknown.load(Ordering::Relaxed),
@@ -159,6 +193,11 @@ impl GatewayMetrics {
                 "voicetext_batch_known_terminal_failures_total",
                 "Batch executions with a known terminal failure class.",
                 self.batch_known_terminal_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_retryable_outcomes_total",
+                "Batch executions durably classified as safe to retry.",
+                self.batch_retryable_outcomes.load(Ordering::Relaxed),
             ),
             (
                 "voicetext_batch_recovery_executed_total",
@@ -237,9 +276,15 @@ mod tests {
     fn metrics_have_fixed_names_and_no_dynamic_labels() {
         let metrics = GatewayMetrics::default();
         metrics.batch_request();
+        metrics.batch_provider_effect_started();
+        metrics.batch_provider_effect_persisted();
+        metrics.batch_retryable_outcome();
         metrics.live_frame();
         let rendered = metrics.render();
         assert!(rendered.contains("voicetext_batch_requests_total 1\n"));
+        assert!(rendered.contains("voicetext_batch_provider_effects_total 1\n"));
+        assert!(rendered.contains("voicetext_batch_provider_effects_persisted_total 1\n"));
+        assert!(rendered.contains("voicetext_batch_retryable_outcomes_total 1\n"));
         assert!(rendered.contains("voicetext_live_frames_total 1\n"));
         assert!(!rendered.contains('{'));
     }

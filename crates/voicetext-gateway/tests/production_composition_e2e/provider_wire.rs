@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -12,7 +12,7 @@ use axum::routing::{any, post};
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 pub const DEEPGRAM_KEY: &str = "deepgram-e2e-secret";
 pub const ELEVENLABS_KEY: &str = "elevenlabs-e2e-secret";
@@ -23,6 +23,30 @@ pub struct ProviderWireCounters {
     deepgram_live: Arc<AtomicUsize>,
     elevenlabs_batch: Arc<AtomicUsize>,
     elevenlabs_live: Arc<AtomicUsize>,
+    batch_gate: Arc<BatchGate>,
+}
+
+#[derive(Debug, Default)]
+struct BatchGate {
+    blocked: AtomicBool,
+    released: Notify,
+}
+
+impl BatchGate {
+    async fn wait(&self) {
+        loop {
+            let released = self.released.notified();
+            if !self.blocked.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
+    }
+
+    fn release(&self) {
+        self.blocked.store(false, Ordering::Release);
+        self.released.notify_waiters();
+    }
 }
 
 impl ProviderWireCounters {
@@ -45,9 +69,17 @@ pub struct RunningProviderWire {
 
 impl RunningProviderWire {
     pub async fn start() -> Self {
+        Self::start_with_batch_blocked(false).await
+    }
+
+    pub async fn start_with_batch_blocked(blocked: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let counters = ProviderWireCounters::default();
+        counters
+            .batch_gate
+            .blocked
+            .store(blocked, Ordering::Release);
         let router = Router::new()
             .route("/deepgram/batch", post(deepgram_batch))
             .route("/deepgram/live", any(deepgram_live))
@@ -91,6 +123,10 @@ impl RunningProviderWire {
         self.counters.clone()
     }
 
+    pub fn release_batch(&self) {
+        self.counters.batch_gate.release();
+    }
+
     pub async fn stop(mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _sent = shutdown.send(());
@@ -110,6 +146,7 @@ async fn deepgram_batch(
     );
     assert!(!body.is_empty());
     counters.deepgram_batch.fetch_add(1, Ordering::SeqCst);
+    counters.batch_gate.wait().await;
     (
         [("x-dg-request-id", "deepgram-batch-e2e")],
         axum::Json(json!({
@@ -138,6 +175,7 @@ async fn elevenlabs_batch(
     assert_eq!(headers["xi-api-key"].to_str().unwrap(), ELEVENLABS_KEY);
     assert!(!body.is_empty());
     counters.elevenlabs_batch.fetch_add(1, Ordering::SeqCst);
+    counters.batch_gate.wait().await;
     axum::Json(json!({
         "language_code": "en",
         "language_probability": 0.99,

@@ -75,6 +75,17 @@ impl BatchJobStore for FakeBatchInfrastructure {
         Box::pin(async move { Ok(outcome) })
     }
 
+    fn recovery_head(&self) -> BoxFuture<'_, Result<Option<BatchJobId>, BatchJobStoreFailure>> {
+        let head = self
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .next_back()
+            .map(|snapshot| snapshot.id.clone());
+        Box::pin(async move { Ok(head) })
+    }
+
     fn list_recovery_candidates(
         &self,
         after: Option<BatchJobId>,

@@ -11,6 +11,7 @@ use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::trace::TraceLayer;
 
 mod batch;
+mod effects;
 mod error;
 mod health;
 mod live;
@@ -22,7 +23,10 @@ mod state;
 
 pub use health::PostgresSpoolReadiness;
 pub use metrics::GatewayMetrics;
-pub use recovery::{StartupRecoveryFailure, StartupRecoverySummary, recover_startup};
+pub use recovery::{
+    StartupRecoveryFailure, StartupRecoveryPlan, StartupRecoverySummary, reconcile_startup,
+    recover_startup, start_startup_recovery,
+};
 pub use state::{
     GatewayLimits, GatewayReadiness, GatewayState, InvalidGatewayLimits, ReadinessFailure,
 };

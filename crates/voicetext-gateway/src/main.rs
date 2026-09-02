@@ -16,7 +16,8 @@ use voicetext_gateway::config::GatewayConfig;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::{MachineSecret, SecretText};
 use voicetext_gateway::server::{
-    GatewayLimits, GatewayState, PostgresSpoolReadiness, recover_startup, router,
+    GatewayLimits, GatewayState, PostgresSpoolReadiness, reconcile_startup, router,
+    start_startup_recovery,
 };
 use voicetext_gateway::storage::{DurableFileSpool, PostgresBatchJobStore};
 
@@ -122,7 +123,7 @@ async fn run() -> Result<(), BootstrapFailure> {
         limits,
     );
 
-    let recovery = recover_startup(&state)
+    let recovery = reconcile_startup(&state)
         .await
         .map_err(|_| BootstrapFailure::Recovery)?;
     let maintenance = spool
@@ -130,28 +131,28 @@ async fn run() -> Result<(), BootstrapFailure> {
         .await
         .map_err(|_| BootstrapFailure::Spool)?;
     state.record_startup_metrics(
-        recovery.executed,
-        recovery.recovered_unknown,
+        0,
+        recovery.summary.recovered_unknown,
         maintenance.terminal_removed,
         maintenance.orphan_removed,
         maintenance.used_bytes,
         maintenance.capacity_bytes,
     );
     tracing::info!(
-        pages = recovery.pages,
-        recovered_unknown = recovery.recovered_unknown,
-        executed = recovery.executed,
+        pages = recovery.summary.pages,
+        recovered_unknown = recovery.summary.recovered_unknown,
         terminal_audio_removed = maintenance.terminal_removed,
         orphan_audio_removed = maintenance.orphan_removed,
         spool_used_bytes = maintenance.used_bytes,
         spool_capacity_bytes = maintenance.capacity_bytes,
-        "batch startup recovery completed"
+        "batch startup reconciliation completed"
     );
 
     let listener = tokio::net::TcpListener::bind(config.bind_address)
         .await
         .map_err(|_| BootstrapFailure::Bind)?;
     log_listening(config.bind_address);
+    start_startup_recovery(&state, recovery);
     let serve_result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await;

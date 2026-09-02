@@ -1,4 +1,3 @@
-#[path = "production_composition_e2e/provider_wire.rs"]
 mod provider_wire;
 #[allow(dead_code, unused_imports)]
 mod support;
@@ -11,8 +10,16 @@ use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::postgres::PgConnectOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::time::sleep;
+use uuid::Uuid;
+use voicetext_gateway::contracts::batch::BatchIdentity;
+use voicetext_gateway::storage::{DurableFileSpool, PostgresBatchJobStore};
+use voicetext_speech::application::batch::{BatchAdmissionRequest, BatchCoordinator};
+use voicetext_speech::application::ports::{
+    BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer, BoxFuture, RecognitionFailure,
+};
+use voicetext_speech::domain::batch::{BatchProfile, BatchRequestFingerprint};
 
 use provider_wire::{DEEPGRAM_KEY, ELEVENLABS_KEY, RunningProviderWire};
 use support::synthetic_ogg_opus;
@@ -88,6 +95,106 @@ async fn production_binary_matches_the_typescript_consumer_through_real_provider
         [2, 2, 2, 2],
         "each provider adapter must receive one original request and no replay"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires VOICETEXT_TEST_DATABASE_URL for a new disposable database"]
+async fn production_restart_binds_while_multi_page_recovery_provider_is_blocked() {
+    let database_url = env::var("VOICETEXT_TEST_DATABASE_URL")
+        .expect("VOICETEXT_TEST_DATABASE_URL must identify a disposable database");
+    assert_disposable_database(&database_url);
+    let sandbox = tempfile::tempdir().unwrap();
+    let spool_path = sandbox.path().join("spool");
+    fs::create_dir(&spool_path).unwrap();
+    seed_recovery_backlog(&database_url, &spool_path, 101).await;
+
+    let wire = RunningProviderWire::start_with_batch_blocked(true).await;
+    let token_path = write_secret(sandbox.path(), "gateway-token", TOKEN);
+    let database_path = write_secret(sandbox.path(), "postgres-url", &database_url);
+    let deepgram_path = write_secret(sandbox.path(), "deepgram-key", DEEPGRAM_KEY);
+    let elevenlabs_path = write_secret(sandbox.path(), "elevenlabs-key", ELEVENLABS_KEY);
+    let address = reserve_loopback_address();
+    let mut gateway = GatewayProcess::start(&GatewayProcessConfig {
+        address,
+        database_path: &database_path,
+        deepgram_path: &deepgram_path,
+        elevenlabs_path: &elevenlabs_path,
+        spool_path: &spool_path,
+        token_path: &token_path,
+        wire: &wire,
+    });
+
+    wait_until_ready(address, &mut gateway).await;
+    wait_for_batch_effect(&wire, &mut gateway).await;
+    let metrics = reqwest::get(format!("http://{address}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains("voicetext_batch_provider_effects_total 1"));
+    assert!(metrics.contains("voicetext_batch_provider_effects_persisted_total 0"));
+
+    drop(gateway);
+    wire.release_batch();
+    wire.stop().await;
+}
+
+#[derive(Debug)]
+struct AdmissionOnlyRecognizer;
+
+impl BatchRecognizer for AdmissionOnlyRecognizer {
+    fn capabilities(
+        &self,
+    ) -> &'static voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor {
+        support::batch_capabilities(BatchIdentity::DeepgramNova3MultiV2)
+    }
+
+    fn recognize(
+        &self,
+        _: BatchRecognitionRequest,
+    ) -> BoxFuture<'_, Result<BatchRecognitionResult, RecognitionFailure>> {
+        Box::pin(async { panic!("backlog seeding never executes providers") })
+    }
+}
+
+async fn seed_recovery_backlog(database_url: &str, spool_path: &Path, count: u128) {
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(database_url)
+        .await
+        .unwrap();
+    PostgresBatchJobStore::migrate(&pool).await.unwrap();
+    let jobs = PostgresBatchJobStore::new(pool.clone());
+    let spool = DurableFileSpool::new(spool_path, 1_048_576).unwrap();
+    let recognizer = AdmissionOnlyRecognizer;
+    let coordinator = BatchCoordinator::new(&recognizer, &jobs, &spool);
+    for index in 1..=count {
+        let id = Uuid::from_u128(index).hyphenated().to_string();
+        coordinator
+            .admit(BatchAdmissionRequest {
+                id: voicetext_speech::application::ports::BatchJobId::new(id),
+                profile: BatchProfile::new(2, "deepgram", "nova-3", "multi").unwrap(),
+                fingerprint: BatchRequestFingerprint::from_bytes([index as u8; 32]),
+                audio: vec![index as u8; 32],
+                authoritative_duration_millis: 20,
+                keyterms: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    pool.close().await;
+}
+
+async fn wait_for_batch_effect(wire: &RunningProviderWire, gateway: &mut GatewayProcess) {
+    for _ in 0..100 {
+        gateway.assert_running();
+        if wire.counters().snapshot()[0] == 1 {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("recovery worker did not reach the blocked local provider");
 }
 
 struct GatewayProcessConfig<'a> {

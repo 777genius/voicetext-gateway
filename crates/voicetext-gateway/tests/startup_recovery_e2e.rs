@@ -10,7 +10,8 @@ use voicetext_gateway::contracts::batch::BatchIdentity;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::MachineSecret;
 use voicetext_gateway::server::{
-    GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, recover_startup,
+    GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, reconcile_startup,
+    start_startup_recovery,
 };
 use voicetext_gateway::storage::{DurableFileSpool, PostgresBatchJobStore};
 use voicetext_speech::application::batch::{
@@ -130,10 +131,15 @@ async fn durable_startup_recovery_is_exactly_once() {
         )
         .unwrap(),
     );
-    let recovery = recover_startup(&state).await.unwrap();
+    let recovery = reconcile_startup(&state).await.unwrap();
 
-    assert_eq!(recovery.recovered_unknown, 1);
-    assert_eq!(recovery.executed, 1);
+    assert_eq!(recovery.summary.recovered_unknown, 1);
+    assert_eq!(recognizer.calls(), 1);
+    start_startup_recovery(&state, recovery);
+    wait_for_state(store.as_ref(), &accepted, |state| {
+        matches!(state, BatchJobState::Completed { .. })
+    })
+    .await;
     assert_eq!(recognizer.calls(), 2);
     assert!(matches!(
         store.load(&accepted).await.unwrap().unwrap().job.state(),
@@ -151,11 +157,28 @@ async fn durable_startup_recovery_is_exactly_once() {
         }
     ));
 
-    let replay = recover_startup(&state).await.unwrap();
-    assert_eq!(replay.recovered_unknown, 0);
-    assert_eq!(replay.executed, 0);
+    let replay = reconcile_startup(&state).await.unwrap();
+    assert_eq!(replay.summary.recovered_unknown, 0);
+    start_startup_recovery(&state, replay);
+    tokio::task::yield_now().await;
     assert_eq!(recognizer.calls(), 2);
+    state.shutdown_batch_tasks().await;
     pool.close().await;
+}
+
+async fn wait_for_state(
+    store: &PostgresBatchJobStore,
+    id: &BatchJobId,
+    expected: impl Fn(&BatchJobState) -> bool,
+) {
+    for _ in 0..100 {
+        let snapshot = store.load(id).await.unwrap().unwrap();
+        if expected(snapshot.job.state()) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("recovery worker did not persist the expected state");
 }
 
 async fn admit(coordinator: &BatchCoordinator<'_>, identity: u8) -> BatchJobId {
