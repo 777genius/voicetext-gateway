@@ -162,7 +162,9 @@ async fn durable_startup_recovery_is_exactly_once() {
     start_startup_recovery(&state, replay);
     tokio::task::yield_now().await;
     assert_eq!(recognizer.calls(), 2);
-    state.shutdown_batch_tasks().await;
+    state
+        .shutdown_batch_tasks(tokio::time::Instant::now() + Duration::from_secs(5))
+        .await;
     pool.close().await;
 }
 

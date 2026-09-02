@@ -100,3 +100,23 @@ fn directional_rules_reject_runtime_and_provider_names() {
     );
     assert_eq!(errors.len(), 4);
 }
+
+#[test]
+fn speech_application_rejects_persistence_serializers() {
+    let boundary = Boundary {
+        name: "speech.application".to_owned(),
+        root: PathBuf::from("src/application"),
+        allowed: vec!["speech.domain".to_owned()],
+    };
+    for source in ["use serde::Serialize;", "serde_json::to_vec(&result);"] {
+        let mut errors = Vec::new();
+        enforce_directional_rules(
+            Path::new("src/application/result.rs"),
+            &boundary,
+            source,
+            &mut errors,
+        );
+        assert_eq!(errors.len(), 1, "serializer unexpectedly passed: {source}");
+        assert!(errors[0].contains("persistence serializer"));
+    }
+}

@@ -126,6 +126,7 @@ Provider secrets are optional individually:
 - `VOICETEXT_ELEVENLABS_API_KEY_FILE`
 
 Operational settings include `VOICETEXT_BIND_ADDR`, `VOICETEXT_FINALIZE_TIMEOUT_MS`,
+`VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS`,
 `VOICETEXT_MAX_CONNECTIONS`, `VOICETEXT_MAX_UPLOAD_BYTES` and the four documented provider endpoint
 overrides. Provider endpoints require HTTPS/WSS. Plain HTTP/WS is accepted only with the explicit
 local-test flag `VOICETEXT_ALLOW_INSECURE_PROVIDER_ENDPOINTS=true`.

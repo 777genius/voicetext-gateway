@@ -91,6 +91,7 @@ services:
       VOICETEXT_ELEVENLABS_API_KEY_FILE: /run/secrets/elevenlabs_api_key
       VOICETEXT_HEALTHCHECK_URL: ${VOICETEXT_HEALTHCHECK_URL:-http://127.0.0.1:8080/health/ready}
       VOICETEXT_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS: ${VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS:-245000}
       VOICETEXT_SPOOL_DIR: /var/lib/voicetext/spool
     secrets:
       - postgres_url
@@ -109,7 +110,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 30s
+    # 60s request upload + 180s provider deadline + 5s cleanup margin.
+    stop_grace_period: 250s
     networks:
       - backend
       - egress

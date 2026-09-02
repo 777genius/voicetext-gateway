@@ -488,6 +488,17 @@ fn enforce_directional_rules(
             ));
         }
     }
+    if is_application {
+        for forbidden in ["serde", "serde_json"] {
+            if identifiers.contains(&forbidden) {
+                errors.push(format!(
+                    "{}: persistence serializer `{forbidden}` is forbidden in {}",
+                    relative_file.display(),
+                    boundary.name
+                ));
+            }
+        }
+    }
     if compact.contains("std::env") {
         errors.push(format!(
             "{}: `std::env` is forbidden in {}",

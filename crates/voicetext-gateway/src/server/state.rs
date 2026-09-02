@@ -19,6 +19,7 @@ use super::metrics::GatewayMetrics;
 
 const MAX_BATCH_UPLOAD_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_LIVE_FRAME_BYTES: usize = 64 * 1_024;
+const MAX_CONNECTIONS: usize = 10_000;
 
 /// Process-local transport bounds validated once during composition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +50,9 @@ impl GatewayLimits {
         if !(2..=MAX_LIVE_FRAME_BYTES).contains(&live_frame_bytes) {
             return Err(InvalidGatewayLimits::LiveFrameBytes);
         }
+        if live_connections.get() > MAX_CONNECTIONS {
+            return Err(InvalidGatewayLimits::LiveConnections);
+        }
         if !(Duration::from_millis(100)..=Duration::from_mins(2)).contains(&first_frame_timeout) {
             return Err(InvalidGatewayLimits::FirstFrameTimeout);
         }
@@ -72,6 +76,8 @@ pub enum InvalidGatewayLimits {
     BatchUploadBytes,
     #[error("live frame bound is invalid")]
     LiveFrameBytes,
+    #[error("connection bound is invalid")]
+    LiveConnections,
     #[error("first frame timeout is invalid")]
     FirstFrameTimeout,
     #[error("finalize timeout is invalid")]
@@ -117,12 +123,15 @@ struct GatewayStateInner {
     limits: GatewayLimits,
     live_slots: Arc<Semaphore>,
     global_batch_slots: Arc<Semaphore>,
+    batch_capacity: u32,
     batch_slots: Arc<Semaphore>,
     deepgram_batch_slots: Arc<Semaphore>,
     elevenlabs_batch_slots: Arc<Semaphore>,
     batch_tasks: Mutex<Vec<JoinHandle<()>>>,
+    batch_task_registration_closed: AtomicBool,
     metrics: GatewayMetrics,
     startup_reconciled: AtomicBool,
+    accepting_work: AtomicBool,
 }
 
 impl GatewayState {
@@ -138,6 +147,7 @@ impl GatewayState {
     ) -> Self {
         let live_slots = Arc::new(Semaphore::new(limits.live_connections.get()));
         let batch_capacity = limits.live_connections.get();
+        let batch_capacity_u32 = u32::try_from(batch_capacity).expect("validated batch capacity");
         let provider_capacity = batch_capacity.div_ceil(2).max(1);
         Self(Arc::new(GatewayStateInner {
             auth,
@@ -148,12 +158,15 @@ impl GatewayState {
             limits,
             live_slots,
             global_batch_slots: Arc::new(Semaphore::new(batch_capacity)),
+            batch_capacity: batch_capacity_u32,
             batch_slots: Arc::new(Semaphore::new(batch_capacity)),
             deepgram_batch_slots: Arc::new(Semaphore::new(provider_capacity)),
             elevenlabs_batch_slots: Arc::new(Semaphore::new(provider_capacity)),
             batch_tasks: Mutex::new(Vec::new()),
+            batch_task_registration_closed: AtomicBool::new(false),
             metrics: GatewayMetrics::default(),
             startup_reconciled: AtomicBool::new(false),
+            accepting_work: AtomicBool::new(true),
         }))
     }
 
@@ -182,13 +195,21 @@ impl GatewayState {
     }
 
     pub(crate) fn try_acquire_live_slot(&self) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.0.live_slots).try_acquire_owned().ok()
+        if !self.accepting_work() {
+            return None;
+        }
+        let permit = Arc::clone(&self.0.live_slots).try_acquire_owned().ok()?;
+        self.accepting_work().then_some(permit)
     }
 
     pub(crate) fn try_acquire_global_batch_slot(&self) -> Option<OwnedSemaphorePermit> {
-        Arc::clone(&self.0.global_batch_slots)
+        if !self.accepting_work() {
+            return None;
+        }
+        let permit = Arc::clone(&self.0.global_batch_slots)
             .try_acquire_owned()
-            .ok()
+            .ok()?;
+        self.accepting_work().then_some(permit)
     }
 
     pub(crate) fn try_acquire_batch_slot(&self) -> Option<OwnedSemaphorePermit> {
@@ -214,6 +235,9 @@ impl GatewayState {
         OwnedSemaphorePermit,
         OwnedSemaphorePermit,
     )> {
+        if !self.accepting_work() {
+            return None;
+        }
         let global = Arc::clone(&self.0.global_batch_slots)
             .acquire_owned()
             .await
@@ -224,22 +248,44 @@ impl GatewayState {
             BatchIdentity::ElevenlabsScribeV2MultiV3 => &self.0.elevenlabs_batch_slots,
         };
         let provider = Arc::clone(provider).acquire_owned().await.ok()?;
+        if !self.accepting_work() {
+            return None;
+        }
         Some((global, batch, provider))
     }
 
-    pub(crate) fn spawn_batch_task(&self, task: impl Future<Output = ()> + Send + 'static) {
-        let handle = tokio::spawn(task);
+    pub(crate) fn spawn_batch_task(&self, task: impl Future<Output = ()> + Send + 'static) -> bool {
         let mut tasks = self
             .0
             .batch_tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self
+            .0
+            .batch_task_registration_closed
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let handle = tokio::spawn(task);
         tasks.retain(|task| !task.is_finished());
         tasks.push(handle);
+        true
     }
 
-    /// Cancels and joins every tracked batch task during process shutdown.
-    pub async fn shutdown_batch_tasks(&self) {
+    /// Stops admission immediately, drains tracked batch tasks until one shared deadline, then
+    /// aborts only work that outlives that bound. Returns the number forced to abort.
+    pub async fn shutdown_batch_tasks(&self, deadline: tokio::time::Instant) -> usize {
+        self.begin_shutdown();
+        let all_slots =
+            Arc::clone(&self.0.global_batch_slots).acquire_many_owned(self.0.batch_capacity);
+        let quiescence_permit = match tokio::time::timeout_at(deadline, all_slots).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) | Err(_) => None,
+        };
+        self.0
+            .batch_task_registration_closed
+            .store(true, Ordering::Release);
         let tasks = {
             let mut tracked = self
                 .0
@@ -248,12 +294,9 @@ impl GatewayState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *tracked)
         };
-        for task in &tasks {
-            task.abort();
-        }
-        for task in tasks {
-            let _ = task.await;
-        }
+        let aborted = drain_tasks_until(tasks, deadline).await;
+        drop(quiescence_permit);
+        aborted
     }
 
     pub(crate) fn metrics(&self) -> &GatewayMetrics {
@@ -288,6 +331,41 @@ impl GatewayState {
     pub(crate) fn startup_reconciled(&self) -> bool {
         self.0.startup_reconciled.load(Ordering::Acquire)
     }
+
+    /// Stops new batch/live admission and makes readiness fail before draining begins.
+    pub fn begin_shutdown(&self) {
+        self.0.accepting_work.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn accepting_work(&self) -> bool {
+        self.0.accepting_work.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+async fn drain_tasks(tasks: Vec<JoinHandle<()>>, maximum: Duration) -> usize {
+    drain_tasks_until(tasks, tokio::time::Instant::now() + maximum).await
+}
+
+async fn drain_tasks_until(
+    mut tasks: Vec<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+) -> usize {
+    while let Some(task) = tasks.first_mut() {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            break;
+        }
+        drop(tasks.swap_remove(0));
+    }
+    tasks.retain(|task| !task.is_finished());
+    let aborted = tasks.len();
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _joined = task.await;
+    }
+    aborted
 }
 
 impl fmt::Debug for GatewayState {
@@ -303,6 +381,8 @@ impl fmt::Debug for GatewayState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     #[test]
@@ -322,11 +402,60 @@ mod tests {
             GatewayLimits::new(
                 MAX_BATCH_UPLOAD_BYTES,
                 1_275,
+                NonZeroUsize::new(MAX_CONNECTIONS + 1).unwrap(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .is_err()
+        );
+        assert!(
+            GatewayLimits::new(
+                MAX_BATCH_UPLOAD_BYTES,
+                1_275,
                 connections,
                 Duration::from_millis(99),
                 Duration::from_secs(1),
             )
             .is_err()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_drain_preserves_completed_work_until_the_shared_deadline() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let task_completed = Arc::clone(&completed);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _previous = task_completed.fetch_add(1, Ordering::SeqCst);
+        });
+        let drain = tokio::spawn(drain_tasks(vec![task], Duration::from_secs(3)));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(drain.await.unwrap(), 0);
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sigterm_drain_aborts_only_when_the_shared_deadline_expires() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            struct DropEvidence(Arc<AtomicBool>);
+            impl Drop for DropEvidence {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _evidence = DropEvidence(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let drain = tokio::spawn(drain_tasks(vec![task], Duration::from_secs(3)));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(!drain.is_finished());
+        assert!(!dropped.load(Ordering::SeqCst));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(drain.await.unwrap(), 1);
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

@@ -9,9 +9,6 @@ use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchJobId, BatchJobSnapshot, BatchReadableSegment, BatchRecognitionResult,
     BatchSegment, ProviderReference,
 };
-use voicetext_speech::application::result_bound::{
-    MAX_SERIALIZED_RESULT_BYTES, serialized_result_fits,
-};
 use voicetext_speech::domain::batch::{
     BatchFailure, BatchJob, BatchJobState, BatchProfile, BatchRequestFingerprint,
     BatchUnknownOutcome,
@@ -26,6 +23,11 @@ const MAX_SEGMENTS: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READABLE_REFERENCES: usize = 100_000;
 const MAX_RETRY_AFTER_MILLIS: u64 = 3_600_000;
+// This exact compact representation cap is owned by the PostgreSQL adapter. The same serialized
+// bytes are stored as text and measured by the database constraint. It safely covers the
+// application's 4 MiB content budget at JSON's worst six-byte escaping expansion, plus fewer than
+// 20,001 bounded records and 100,000 four-digit source indices.
+pub(crate) const MAX_SERIALIZED_RESULT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct JobRecord {
@@ -44,7 +46,7 @@ pub(crate) struct JobRecord {
     pub unknown_reason: Option<String>,
     pub provider_reference: Option<String>,
     pub retry_after_millis: Option<i64>,
-    pub result_json: Option<Value>,
+    pub result_json: Option<String>,
     pub revision: i64,
 }
 
@@ -65,7 +67,7 @@ pub(crate) struct WritableRecord {
     pub unknown_reason: Option<&'static str>,
     pub provider_reference: Option<String>,
     pub retry_after_millis: Option<i64>,
-    pub result_json: Option<Value>,
+    pub result_json: Option<String>,
     pub revision: i64,
 }
 
@@ -378,7 +380,7 @@ fn restore_state(
 fn serialize_result(
     snapshot: &BatchJobSnapshot,
     result: &BatchRecognitionResult,
-) -> Result<Value, RecordError> {
+) -> Result<String, RecordError> {
     if result.profile != *snapshot.job.profile()
         || result.duration_millis != snapshot.authoritative_duration_millis
         || result.provider_reference != snapshot.provider_reference
@@ -413,13 +415,13 @@ fn serialize_result(
                 .collect()
         }),
     };
-    let value = serde_json::to_value(record).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
+    let value = serde_json::to_string(&record).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
     bounded_json(&value)?;
     Ok(value)
 }
 
 fn restore_result(
-    value: Option<Value>,
+    value: Option<String>,
     profile: &BatchProfile,
     duration: u64,
     provider_reference: Option<ProviderReference>,
@@ -427,7 +429,7 @@ fn restore_result(
     let Some(value) = value else { return Ok(None) };
     bounded_json(&value)?;
     let record: ResultRecord =
-        serde_json::from_value(value).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
+        serde_json::from_str(&value).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
     let result = BatchRecognitionResult {
         profile: profile.clone(),
         text: record.text,
@@ -464,22 +466,15 @@ fn restore_result(
     Ok(Some(result))
 }
 
-fn bounded_json(value: &Value) -> Result<(), RecordError> {
-    if serde_json::to_vec(value)
-        .map_err(|_| RecordError("INVALID_RESULT_JSON"))?
-        .len()
-        > MAX_SERIALIZED_RESULT_BYTES
-    {
+fn bounded_json(value: &str) -> Result<(), RecordError> {
+    if value.len() > MAX_SERIALIZED_RESULT_BYTES {
         return Err(RecordError("RESULT_TOO_LARGE"));
     }
     Ok(())
 }
 
 fn validate_result(result: &BatchRecognitionResult) -> Result<(), RecordError> {
-    if result.text.len() > MAX_TEXT_BYTES
-        || result.segments.len() > MAX_SEGMENTS
-        || !serialized_result_fits(result)
-    {
+    if result.text.len() > MAX_TEXT_BYTES || result.segments.len() > MAX_SEGMENTS {
         return Err(RecordError("RESULT_TOO_LARGE"));
     }
     let mut previous_end = 0;

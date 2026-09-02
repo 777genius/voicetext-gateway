@@ -175,7 +175,7 @@ fn spawn_execution(
     audio_bytes: u64,
 ) {
     let task_state = (*state).clone();
-    state.spawn_batch_task(async move {
+    let _registered = state.spawn_batch_task(async move {
         let _permits = (global_permit, batch_permit, provider_permit);
         task_state.metrics().batch_execution_started();
         let Some(outcome) = execute_fenced(&task_state, identity, &id).await else {

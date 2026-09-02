@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
-sandbox=$(mktemp -d /tmp/voicetext-release-evidence-test.XXXXXX)
+sandbox=$(mktemp -d "${TMPDIR:-/tmp}/voicetext-release-evidence-test.XXXXXX")
 cleanup() {
   find "$sandbox" -depth -delete
 }

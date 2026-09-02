@@ -32,6 +32,8 @@ pub const ELEVENLABS_LIVE_ENDPOINT_ENV: &str = "VOICETEXT_ELEVENLABS_LIVE_ENDPOI
 pub const ALLOW_INSECURE_ENDPOINTS_ENV: &str = "VOICETEXT_ALLOW_INSECURE_PROVIDER_ENDPOINTS";
 /// Final provider-result drain timeout in milliseconds.
 pub const FINALIZE_TIMEOUT_ENV: &str = "VOICETEXT_FINALIZE_TIMEOUT_MS";
+/// Maximum graceful batch-task drain interval in milliseconds.
+pub const SHUTDOWN_DRAIN_TIMEOUT_ENV: &str = "VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS";
 /// Maximum concurrent inbound connections.
 pub const MAX_CONNECTIONS_ENV: &str = "VOICETEXT_MAX_CONNECTIONS";
 /// Maximum accepted batch upload size in bytes.
@@ -45,6 +47,9 @@ const DEFAULT_ELEVENLABS_LIVE_ENDPOINT: &str = "wss://api.elevenlabs.io/v1/speec
 const DEFAULT_FINALIZE_TIMEOUT_MILLIS: u64 = 5_000;
 const MIN_FINALIZE_TIMEOUT_MILLIS: u64 = 250;
 const MAX_FINALIZE_TIMEOUT_MILLIS: u64 = 30_000;
+const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MILLIS: u64 = 245_000;
+const MIN_SHUTDOWN_DRAIN_TIMEOUT_MILLIS: u64 = 1_000;
+const MAX_SHUTDOWN_DRAIN_TIMEOUT_MILLIS: u64 = 600_000;
 const DEFAULT_MAX_CONNECTIONS: usize = 128;
 const MAX_MAX_CONNECTIONS: usize = 10_000;
 const DEFAULT_MAX_UPLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -72,6 +77,8 @@ pub struct GatewayConfig {
     pub provider_endpoints: ProviderEndpoints,
     /// Maximum time to drain final provider results after finalize begins.
     pub finalize_timeout: Duration,
+    /// Maximum time to preserve in-flight paid batch work after shutdown begins.
+    pub shutdown_drain_timeout: Duration,
     /// Maximum concurrent inbound connections.
     pub max_connections: usize,
     /// Maximum accepted batch upload size.
@@ -170,6 +177,13 @@ impl GatewayConfig {
                 DEFAULT_FINALIZE_TIMEOUT_MILLIS,
                 MIN_FINALIZE_TIMEOUT_MILLIS,
                 MAX_FINALIZE_TIMEOUT_MILLIS,
+            )?),
+            shutdown_drain_timeout: Duration::from_millis(parse_bounded_u64(
+                optional(&mut lookup, SHUTDOWN_DRAIN_TIMEOUT_ENV)?,
+                SHUTDOWN_DRAIN_TIMEOUT_ENV,
+                DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
+                MIN_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
+                MAX_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
             )?),
             max_connections: parse_bounded_usize(
                 optional(&mut lookup, MAX_CONNECTIONS_ENV)?,
@@ -401,6 +415,7 @@ mod tests {
         let config = load(&required()).unwrap();
         assert_eq!(config.bind_address, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.finalize_timeout, Duration::from_secs(5));
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(245));
         assert_eq!(config.max_connections, 128);
         assert_eq!(config.max_upload_bytes, 64 * 1024 * 1024);
         assert_eq!(config.deepgram_api_key_file, None);
@@ -423,12 +438,14 @@ mod tests {
                 "/run/secrets/elevenlabs".into(),
             ),
             (FINALIZE_TIMEOUT_ENV, "750".into()),
+            (SHUTDOWN_DRAIN_TIMEOUT_ENV, "120000".into()),
             (MAX_CONNECTIONS_ENV, "32".into()),
             (MAX_UPLOAD_BYTES_ENV, (2 * 1024 * 1024).to_string()),
         ]);
         let config = load(&values).unwrap();
         assert_eq!(config.bind_address, "127.0.0.1:9080".parse().unwrap());
         assert_eq!(config.finalize_timeout, Duration::from_millis(750));
+        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(120));
         assert_eq!(config.max_connections, 32);
         assert_eq!(config.max_upload_bytes, 2 * 1024 * 1024);
         assert_eq!(
@@ -495,6 +512,7 @@ mod tests {
 
         for (name, value) in [
             (FINALIZE_TIMEOUT_ENV, "249"),
+            (SHUTDOWN_DRAIN_TIMEOUT_ENV, "999"),
             (MAX_CONNECTIONS_ENV, "0"),
             (MAX_UPLOAD_BYTES_ENV, "67108865"),
         ] {

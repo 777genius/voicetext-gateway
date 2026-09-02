@@ -1,5 +1,6 @@
 //! `VoiceText` Gateway process composition.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -9,6 +10,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use url::Url;
@@ -153,12 +155,42 @@ async fn run() -> Result<(), BootstrapFailure> {
         .map_err(|_| BootstrapFailure::Bind)?;
     log_listening(config.bind_address);
     start_startup_recovery(&state, recovery);
-    let serve_result = axum::serve(listener, router(state.clone()))
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
-    state.shutdown_batch_tasks().await;
+    let (stop_server, server_shutdown) = oneshot::channel();
+    let server_state = state.clone();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router(server_state))
+            .with_graceful_shutdown(async move {
+                let _signal = server_shutdown.await;
+            })
+            .await
+    });
+    let shutdown_state = state.clone();
+    tokio::select! {
+        result = &mut server => {
+            pool.close().await;
+            return result.map_err(|_| BootstrapFailure::Serve)?
+                .map_err(|_| BootstrapFailure::Serve);
+        }
+        () = after_shutdown_signal(wait_for_process_signal(), move || shutdown_state.begin_shutdown()) => {}
+    }
+    let _notified = stop_server.send(());
+    let shutdown_deadline = tokio::time::Instant::now() + config.shutdown_drain_timeout;
+    let aborted = state.shutdown_batch_tasks(shutdown_deadline).await;
+    if aborted != 0 {
+        tracing::warn!(aborted, "batch shutdown drain deadline reached");
+    }
+    let serve_result = match tokio::time::timeout_at(shutdown_deadline, &mut server).await {
+        Ok(Ok(result)) => result.map_err(|_| BootstrapFailure::Serve),
+        Ok(Err(_)) => Err(BootstrapFailure::Serve),
+        Err(_) => {
+            tracing::warn!("server graceful shutdown deadline reached");
+            server.abort();
+            let _joined = server.await;
+            Ok(())
+        }
+    };
     pool.close().await;
-    serve_result.map_err(|_| BootstrapFailure::Serve)
+    serve_result
 }
 
 async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, BootstrapFailure> {
@@ -234,21 +266,24 @@ fn log_listening(address: SocketAddr) {
     tracing::info!(%address, "gateway listening");
 }
 
-async fn shutdown_signal() {
+async fn wait_for_process_signal() {
     let interrupt = tokio::signal::ctrl_c();
     #[cfg(unix)]
+    if let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
     {
-        if let Ok(mut terminate) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            tokio::select! {
-                _ = interrupt => {}
-                _ = terminate.recv() => {}
-            }
-            return;
+        tokio::select! {
+            _ = interrupt => {}
+            _ = terminate.recv() => {}
         }
+        return;
     }
     let _signal = interrupt.await;
+}
+
+async fn after_shutdown_signal(signal: impl Future<Output = ()>, stop_admission: impl FnOnce()) {
+    signal.await;
+    stop_admission();
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,12 +327,35 @@ impl BootstrapFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::install_crypto_provider;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::sync::oneshot;
+
+    use super::{after_shutdown_signal, install_crypto_provider};
 
     #[test]
     fn crypto_provider_installation_is_idempotent() {
         assert!(install_crypto_provider().is_ok());
         assert!(install_crypto_provider().is_ok());
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn sigterm_transition_stops_admission_only_after_the_signal() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let task_stopped = Arc::clone(&stopped);
+        let (send_signal, receive_signal) = oneshot::channel();
+        let transition = tokio::spawn(after_shutdown_signal(
+            async move {
+                let _signal = receive_signal.await;
+            },
+            move || task_stopped.store(true, Ordering::SeqCst),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!stopped.load(Ordering::SeqCst));
+        send_signal.send(()).unwrap();
+        transition.await.unwrap();
+        assert!(stopped.load(Ordering::SeqCst));
     }
 }

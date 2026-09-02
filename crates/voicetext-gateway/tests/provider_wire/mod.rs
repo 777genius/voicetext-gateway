@@ -244,8 +244,16 @@ async fn elevenlabs_live(
     websocket: WebSocketUpgrade,
     State(counters): State<ProviderWireCounters>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
 ) -> Response {
     assert_eq!(headers["xi-api-key"].to_str().unwrap(), ELEVENLABS_KEY);
+    let query = uri.query().unwrap_or_default();
+    assert!(
+        query
+            .split('&')
+            .any(|pair| pair == "commit_strategy=manual")
+    );
+    assert!(!query.contains("vad_silence_threshold_secs"));
     counters.elevenlabs_live.fetch_add(1, Ordering::SeqCst);
     websocket.on_upgrade(elevenlabs_live_session)
 }
@@ -259,12 +267,11 @@ async fn elevenlabs_live_session(mut socket: WebSocket) {
         ))
         .await
         .unwrap();
-    let mut audio_messages = 0_usize;
     while let Some(Ok(message)) = socket.next().await {
         match message {
             Message::Text(payload) if payload.contains("input_audio_chunk") => {
-                audio_messages += 1;
-                if audio_messages == 4 {
+                let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+                if value["commit"] == true {
                     for kind in [
                         "partial_transcript",
                         "final_transcript",

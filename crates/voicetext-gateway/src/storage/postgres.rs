@@ -319,12 +319,14 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::storage::records::{JobRecord, WritableRecord};
+    use crate::storage::records::{JobRecord, MAX_SERIALIZED_RESULT_BYTES, WritableRecord};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use voicetext_speech::application::ports::{
         BatchRecognitionResult, BatchSegment, ProviderReference,
     };
-    use voicetext_speech::domain::batch::{BatchFailure, BatchProfile, BatchRequestFingerprint};
+    use voicetext_speech::domain::batch::{
+        BatchFailure, BatchJobState, BatchProfile, BatchRequestFingerprint,
+    };
 
     fn snapshot() -> BatchJobSnapshot {
         let profile = BatchProfile::new(2, "deepgram", "nova-3", "multi").unwrap();
@@ -401,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn adapter_envelope_covers_worst_escaped_application_boundary() {
+        let mut boundary = snapshot();
+        let result = boundary.result.as_mut().unwrap();
+        result.text = "\u{0001}".repeat(4 * 1024 * 1024);
+        result.segments.clear();
+        let encoded = WritableRecord::try_from(&boundary)
+            .unwrap()
+            .result_json
+            .unwrap();
+
+        assert!(encoded.len() > 16 * 1024 * 1024);
+        assert!(encoded.len() <= MAX_SERIALIZED_RESULT_BYTES);
+    }
+
+    #[test]
     fn malformed_state_and_result_fail_closed() {
         let mut writable = WritableRecord::try_from(&snapshot()).unwrap();
         writable.attempt = None;
@@ -410,7 +427,7 @@ mod tests {
         );
 
         let mut writable = WritableRecord::try_from(&snapshot()).unwrap();
-        writable.result_json = Some(serde_json::json!({ "unexpected": true }));
+        writable.result_json = Some(serde_json::json!({ "unexpected": true }).to_string());
         assert_eq!(
             BatchJobSnapshot::try_from(job_record(writable)),
             Err(RecordError("INVALID_RESULT_JSON"))
@@ -470,6 +487,44 @@ mod tests {
             panic!("CAS did not store")
         };
         assert_eq!(updated.revision, 1);
+        let mut boundary = updated.clone();
+        boundary.result = Some(BatchRecognitionResult {
+            profile: boundary.job.profile().clone(),
+            // One-byte control characters exercise JSON's worst six-byte escaping expansion at
+            // the application's exact persistence-neutral content boundary.
+            text: "\u{0001}".repeat(4 * 1024 * 1024),
+            duration_millis: boundary.authoritative_duration_millis,
+            provider_duration_millis: Some(boundary.authoritative_duration_millis),
+            segments: Vec::new(),
+            readable_segments: None,
+            provider_reference: None,
+        });
+        boundary.job.complete().unwrap();
+        let compact_bytes = WritableRecord::try_from(&boundary)
+            .unwrap()
+            .result_json
+            .as_ref()
+            .unwrap()
+            .len();
+        assert!(compact_bytes > 16 * 1024 * 1024);
+        assert!(compact_bytes <= MAX_SERIALIZED_RESULT_BYTES);
+        let BatchJobUpdateOutcome::Stored(boundary) =
+            store.compare_and_swap(1, boundary).await.unwrap()
+        else {
+            panic!("boundary completion CAS did not store the paid result")
+        };
+        assert!(matches!(
+            boundary.job.state(),
+            BatchJobState::Completed { .. }
+        ));
+        let stored_bytes: i32 = sqlx::query_scalar(
+            "SELECT octet_length(result_json) FROM voicetext_batch_jobs WHERE job_id=$1",
+        )
+        .bind(uuid::Uuid::parse_str(id.as_str()).unwrap())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(usize::try_from(stored_bytes).unwrap(), compact_bytes);
         let first = store
             .list_recovery_candidates(None, NonZeroUsize::new(1).unwrap())
             .await

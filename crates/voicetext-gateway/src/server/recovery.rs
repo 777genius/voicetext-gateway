@@ -115,7 +115,7 @@ pub fn start_startup_recovery(state: &GatewayState, plan: StartupRecoveryPlan) {
         return;
     };
     let task_state = state.clone();
-    state.spawn_batch_task(async move {
+    let _registered = state.spawn_batch_task(async move {
         if let Err(failure) = drain_backlog(&task_state, head).await {
             task_state.metrics().batch_failure();
             tracing::error!(code = failure.code(), "startup backlog recovery stopped");

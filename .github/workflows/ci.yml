@@ -75,8 +75,10 @@ jobs:
       - name: Verify fail-closed release evidence policy
         run: |
           sh -n scripts/create-release-evidence.sh scripts/verify-release-evidence.sh \
-            scripts/run-production-composition-gate.sh scripts/test-release-evidence.sh
+            scripts/run-production-composition-gate.sh scripts/test-release-evidence.sh \
+            scripts/test-release-workflow.sh
           scripts/test-release-evidence.sh
+          scripts/test-release-workflow.sh
 
       - name: Validate Compose, Caddy semantics, secrets, and runtime hardening
         run: |
@@ -176,6 +178,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [exact-head, production-composition]
     runs-on: ubuntu-latest
+    services:
+      quarantine-registry:
+        image: registry:2.8.3@sha256:1fc7de654f2ac1247f0b67e8a459e273b0993be7d2beda1f3f56fbf1001ed3e7
+        ports:
+          - 5000:5000
     permissions:
       attestations: write
       contents: write
@@ -211,50 +218,50 @@ jobs:
         run: |
           go install github.com/anchore/syft/cmd/syft@v1.51.1
           go install github.com/anchore/grype/cmd/grype@v0.118.0
+          go install github.com/google/go-containerregistry/cmd/crane@v0.21.2
           go_bin="$(go env GOPATH)/bin"
           echo "$go_bin" >> "$GITHUB_PATH"
           "$go_bin/syft" version
           "$go_bin/grype" version
-
-      - name: Authenticate to the release registry
-        env:
-          GHCR_TOKEN: ${{ github.token }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          "$go_bin/crane" version
 
       - name: Install Buildx with Git checksum support
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         with:
           version: v0.36.1
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
+              insecure = true
 
-      - name: Publish exact remote source as an immutable image
-        id: publish
+      - name: Build exact remote source into the job-local quarantine registry
+        id: quarantine
         run: |
-          image="ghcr.io/${SOURCE_REPOSITORY,,}/voicetext-gateway"
+          image="localhost:5000/voicetext-gateway-quarantine"
           remote_context="${GITHUB_SERVER_URL}/${SOURCE_REPOSITORY}.git?ref=${SOURCE_REF}&checksum=${SOURCE_SHA}"
-          docker buildx build --target runtime --push --provenance=false \
+          docker buildx build --target runtime --push --provenance=mode=max \
             --build-arg "SOURCE_SHA=${SOURCE_SHA}" \
-            --tag "${image}:${SOURCE_SHA}" --tag "${image}:${RELEASE_TAG}" \
-            --metadata-file image-metadata.json "$remote_context"
-          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' image-metadata.json)
+            --tag "${image}:${SOURCE_SHA}" \
+            --metadata-file quarantine-metadata.json "$remote_context"
+          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' quarantine-metadata.json)
+          exact_image="${image}@${digest}"
+          docker buildx imagetools inspect --raw "$exact_image" | jq -e '
+            [.manifests[] | select(.annotations["vnd.docker.reference.type"] == "attestation-manifest")]
+            | length > 0
+          '
+          docker pull "$exact_image"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$exact_image")" = "$SOURCE_SHA"
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "digest_hex=${digest#sha256:}" >> "$GITHUB_OUTPUT"
-          docker pull "${image}@${digest}"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "${image}@${digest}")" = "$SOURCE_SHA"
-
-      - name: Cryptographically attest source-to-image build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          push-to-registry: true
 
       - name: Generate digest-bearing CycloneDX SBOM
         run: |
           mkdir evidence
-          image='${{ steps.publish.outputs.image }}'
-          digest='${{ steps.publish.outputs.digest }}'
-          syft "${image}@${digest}" -o cyclonedx-json=evidence/sbom.raw.json
+          image='${{ steps.quarantine.outputs.image }}'
+          digest='${{ steps.quarantine.outputs.digest }}'
+          syft "docker:${image}@${digest}" -o cyclonedx-json=evidence/sbom.raw.json
           jq -S --arg source_sha "$SOURCE_SHA" --arg image_digest "$digest" '
             .metadata.properties = ((.metadata.properties // []) + [
               {name: "org.opencontainers.image.revision", value: $source_sha},
@@ -262,14 +269,6 @@ jobs:
             ] | unique_by(.name) | sort_by(.name))
           ' evidence/sbom.raw.json > evidence/voicetext-gateway.sbom.cdx.json
           rm evidence/sbom.raw.json
-
-      - name: Cryptographically attest the digest-bearing SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
-        with:
-          subject-name: ${{ steps.publish.outputs.image }}
-          subject-digest: ${{ steps.publish.outputs.digest }}
-          sbom-path: evidence/voicetext-gateway.sbom.cdx.json
-          push-to-registry: true
 
       - name: Apply fail-closed vulnerability policy
         run: |
@@ -289,7 +288,7 @@ jobs:
 
       - name: Inspect license and notice in the exact image digest
         run: |
-          exact_image='${{ steps.publish.outputs.image }}@${{ steps.publish.outputs.digest }}'
+          exact_image='${{ steps.quarantine.outputs.image }}@${{ steps.quarantine.outputs.digest }}'
           container=$(docker create "$exact_image")
           trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
           docker export "$container" --output exact-image-rootfs.tar
@@ -304,8 +303,40 @@ jobs:
       - name: Create and verify deterministic release predicate
         run: |
           scripts/create-release-evidence.sh "$SOURCE_SHA" \
-            '${{ steps.publish.outputs.image }}' '${{ steps.publish.outputs.digest }}' evidence
+            "ghcr.io/${SOURCE_REPOSITORY,,}/voicetext-gateway" \
+            '${{ steps.quarantine.outputs.digest }}' evidence
           scripts/verify-release-evidence.sh evidence
+
+      - name: Publish only the exact image that passed every quarantine gate
+        id: publish
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          source='${{ steps.quarantine.outputs.image }}@${{ steps.quarantine.outputs.digest }}'
+          image="ghcr.io/${SOURCE_REPOSITORY,,}/voicetext-gateway"
+          docker buildx imagetools create --tag "${image}:${SOURCE_SHA}" "$source"
+          test "$(crane digest "${image}:${SOURCE_SHA}")" = '${{ steps.quarantine.outputs.digest }}'
+          docker buildx imagetools create --tag "${image}:${RELEASE_TAG}" "$source"
+          test "$(crane digest "${image}:${RELEASE_TAG}")" = '${{ steps.quarantine.outputs.digest }}'
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=${{ steps.quarantine.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          echo "digest_hex=${{ steps.quarantine.outputs.digest_hex }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cryptographically attest source-to-image build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.publish.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+
+      - name: Cryptographically attest the digest-bearing SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ${{ steps.publish.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          sbom-path: evidence/voicetext-gateway.sbom.cdx.json
+          push-to-registry: true
 
       - name: Cryptographically bind all release policy evidence to the image digest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

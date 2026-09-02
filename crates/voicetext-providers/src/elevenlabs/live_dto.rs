@@ -6,7 +6,6 @@ pub(super) const MAX_PROVIDER_MESSAGE_BYTES: usize = 1_024 * 1_024;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1_024;
 const MALFORMED_RESPONSE: &str = "ELEVENLABS_LIVE_MALFORMED_RESPONSE";
 const REALTIME_MODEL: &str = "scribe_v2_realtime";
-const VAD_SILENCE_THRESHOLD_SECS: &str = "1.5";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TranscriptKind {
@@ -63,8 +62,10 @@ pub(super) fn build_url(
     for (name, value) in [
         ("model_id", REALTIME_MODEL),
         ("audio_format", &format!("pcm_{sample_rate_hz}")),
-        ("commit_strategy", "vad"),
-        ("vad_silence_threshold_secs", VAD_SILENCE_THRESHOLD_SECS),
+        // Scribe realtime does not correlate committed transcripts with the request that
+        // committed them. Manual commit is therefore required: with VAD enabled a delayed
+        // automatic result could be mistaken for the explicit-finalize result.
+        ("commit_strategy", "manual"),
         ("include_timestamps", "false"),
     ] {
         query.append_pair(name, value);

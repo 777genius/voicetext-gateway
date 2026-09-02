@@ -123,6 +123,11 @@ The authoritative batch path remains valid. Check provider connectivity and late
 Increase `VOICETEXT_FINALIZE_TIMEOUT_MS` only within its bound and only with latency evidence.
 `flushed` is valid only after an actual provider result; the gateway will not synthesize one.
 
+Graceful shutdown immediately makes readiness fail and stops new batch/live admission. The default
+`VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS=245000` allows the one-minute upload deadline, three-minute
+batch provider deadline, and cleanup; Compose grants 250 seconds for the same bounded sequence.
+Only tasks still running at that deadline are aborted and recovered fail-closed on restart.
+
 ### Batch job is `outcome_unknown`
 
 Do not retry or switch providers under the same idempotency key. Retain the source recording, job

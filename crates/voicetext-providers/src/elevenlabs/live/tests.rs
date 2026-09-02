@@ -56,6 +56,16 @@ async fn spawn_success() -> (
         let mut socket = accept_hdr_async(stream, callback).await.unwrap();
         let (target, api_key) = receiver.await.unwrap();
         let (audio, audio_commit) = decode_audio(socket.next().await.unwrap().unwrap());
+        // Model the adversarial ordering from the rejected VAD strategy: an automatic commit can
+        // be delayed in the wire queue until immediately before the explicit commit result.
+        if target.contains("commit_strategy=vad") {
+            socket
+                .send(Message::text(
+                    r#"{"message_type":"committed_transcript","text":"delayed automatic"}"#,
+                ))
+                .await
+                .unwrap();
+        }
         let (commit_audio, commit) = decode_audio(socket.next().await.unwrap().unwrap());
         assert!(!audio_commit);
         assert!(commit);
@@ -105,7 +115,7 @@ fn canonicalizes_keyterms_after_checked_validation() {
 }
 
 #[tokio::test]
-async fn supports_legacy_16k_pcm_vad_segments_terminal_flush_and_deduplicated_events() {
+async fn manual_commit_prevents_delayed_vad_from_preceding_the_explicit_result() {
     let (endpoint, server) = spawn_success().await;
     let factory = ElevenLabsLiveRecognizer::new("test-secret", endpoint).unwrap();
     let session = factory
@@ -157,11 +167,11 @@ async fn supports_legacy_16k_pcm_vad_segments_terminal_flush_and_deduplicated_ev
     );
     assert!(
         url.query_pairs()
-            .any(|pair| pair == ("commit_strategy".into(), "vad".into()))
+            .any(|pair| pair == ("commit_strategy".into(), "manual".into()))
     );
     assert!(
-        url.query_pairs()
-            .any(|pair| pair == ("vad_silence_threshold_secs".into(), "1.5".into()))
+        !url.query_pairs()
+            .any(|(key, _)| key == "vad_silence_threshold_secs")
     );
     assert_eq!(
         url.query_pairs()

@@ -149,11 +149,11 @@ pub(crate) async fn compatibility(State(state): State<GatewayState>) -> Response
 }
 
 async fn dependencies_ready(state: &GatewayState) -> bool {
-    if !state.startup_reconciled() {
+    if !state.startup_reconciled() || !state.accepting_work() {
         return false;
     }
     match state.readiness().check().await {
-        Ok(()) => true,
+        Ok(()) => state.accepting_work(),
         Err(failure) => {
             tracing::warn!(code = failure.code(), "gateway readiness failed");
             false

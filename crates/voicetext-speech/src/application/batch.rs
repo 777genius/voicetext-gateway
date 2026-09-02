@@ -237,6 +237,7 @@ mod tests {
         calls: AtomicUsize,
         cas_calls: AtomicUsize,
         conflict_at: AtomicUsize,
+        fail_cas_at: AtomicUsize,
         removes: AtomicUsize,
         fail_insert: AtomicBool,
         fail_spool: AtomicBool,
@@ -250,6 +251,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 cas_calls: AtomicUsize::new(0),
                 conflict_at: AtomicUsize::new(0),
+                fail_cas_at: AtomicUsize::new(0),
                 removes: AtomicUsize::new(0),
                 fail_insert: AtomicBool::new(false),
                 fail_spool: AtomicBool::new(false),
@@ -368,6 +370,9 @@ mod tests {
             mut replacement: BatchJobSnapshot,
         ) -> BoxFuture<'_, Result<BatchJobUpdateOutcome, BatchJobStoreFailure>> {
             let call = self.cas_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_cas_at.load(Ordering::SeqCst) == call {
+                return Box::pin(async { Err(unavailable()) });
+            }
             let mut jobs = self.jobs.lock().unwrap();
             let outcome = match jobs.iter_mut().find(|row| row.id == replacement.id) {
                 None => BatchJobUpdateOutcome::Missing,
@@ -512,6 +517,22 @@ mod tests {
         assert_eq!(report.recovered_unknown.len(), 1);
         assert!(fake.audio.lock().unwrap().is_none());
         assert_eq!(fake.removes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn paid_result_persistence_failure_is_post_egress_and_preserves_audio() {
+        let fake = Fake::new();
+        let coordinator = BatchCoordinator::new(&fake, &fake, &fake);
+        run(coordinator.admit(request(1))).unwrap();
+        fake.fail_cas_at.store(2, Ordering::SeqCst);
+
+        assert!(matches!(
+            run(coordinator.execute(&BatchJobId::new("job"))),
+            Err(BatchCoordinatorFailure::PostEgressStore(_))
+        ));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.audio.lock().unwrap().is_some());
+        assert_eq!(fake.removes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -4,12 +4,13 @@ use crate::application::ports::{
     BatchAudioSpoolFailure, BatchJobId, BatchJobSnapshot, BatchJobStoreFailure,
     BatchRecognitionResult, RecognitionFailure,
 };
-use crate::application::result_bound::serialized_result_fits;
 use crate::domain::batch::{
     BatchFailure, BatchProfile, BatchRequestFingerprint, BatchTransitionError,
 };
 
 const MAX_SEGMENTS: usize = 10_000;
+// Provider-neutral in-memory text budget across the transcript, segments, speakers, and readable
+// projection. Persistence adapters independently choose and validate their representation.
 const MAX_TRANSCRIPT_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_READABLE_REFERENCES: usize = 100_000;
 
@@ -145,14 +146,22 @@ fn valid_result(snapshot: &BatchJobSnapshot, result: &BatchRecognitionResult) ->
         || result.duration_millis != snapshot.authoritative_duration_millis
         || result.text.len() > MAX_TRANSCRIPT_BYTES
         || result.segments.len() > MAX_SEGMENTS
-        || !serialized_result_fits(result)
     {
         return false;
     }
     let mut previous_end = 0;
-    let mut text_bytes = 0_usize;
+    let mut text_bytes = result.text.len();
     for segment in &result.segments {
         let Some(next_text_bytes) = text_bytes.checked_add(segment.text.len()) else {
+            return false;
+        };
+        let Some(next_text_bytes) = segment
+            .speaker
+            .as_ref()
+            .map_or(Some(next_text_bytes), |speaker| {
+                next_text_bytes.checked_add(speaker.len())
+            })
+        else {
             return false;
         };
         if segment.start_millis < previous_end
@@ -175,14 +184,14 @@ fn valid_result(snapshot: &BatchJobSnapshot, result: &BatchRecognitionResult) ->
         }
         let mut previous_end = 0;
         let mut references = 0_usize;
-        let mut text_bytes = 0_usize;
+        let mut total_text_bytes = text_bytes;
         segments.iter().all(|segment| {
             let Some(next_references) =
                 references.checked_add(segment.source_segment_indices.len())
             else {
                 return false;
             };
-            let Some(next_text_bytes) = text_bytes.checked_add(segment.text.len()) else {
+            let Some(next_text_bytes) = total_text_bytes.checked_add(segment.text.len()) else {
                 return false;
             };
             let sources_valid = !segment.source_segment_indices.is_empty()
@@ -202,7 +211,7 @@ fn valid_result(snapshot: &BatchJobSnapshot, result: &BatchRecognitionResult) ->
                 && next_text_bytes <= MAX_TRANSCRIPT_BYTES
                 && sources_valid;
             references = next_references;
-            text_bytes = next_text_bytes;
+            total_text_bytes = next_text_bytes;
             previous_end = segment.end_millis;
             valid
         })
@@ -305,5 +314,18 @@ mod tests {
         for invalid in invalid {
             assert_eq!(outcome_state(Ok(invalid)).0, BatchJobStatus::Failed);
         }
+
+        let mut boundary = result();
+        boundary.text = "x".repeat(MAX_TRANSCRIPT_BYTES);
+        boundary.segments.clear();
+        assert_eq!(outcome_state(Ok(boundary)).0, BatchJobStatus::Completed);
+
+        let mut over_content_budget = result();
+        over_content_budget.text = "x".repeat(MAX_TRANSCRIPT_BYTES + 1);
+        over_content_budget.segments.clear();
+        assert_eq!(
+            outcome_state(Ok(over_content_budget)).0,
+            BatchJobStatus::Failed
+        );
     }
 }
