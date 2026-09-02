@@ -54,7 +54,7 @@ pub fn parse_client_command(json: &str) -> Result<ClientCommand, ContractViolati
     }
 }
 
-const fn identity_wire(identity: LiveIdentity) -> (Provider, Model) {
+pub(super) const fn identity_wire(identity: LiveIdentity) -> (Provider, Model) {
     match identity {
         LiveIdentity::DeepgramNova3 => (Provider::Deepgram, Model::Nova3),
         LiveIdentity::ElevenlabsScribeV2Realtime => (Provider::Elevenlabs, Model::ScribeV2Realtime),

@@ -5,7 +5,9 @@ use uuid::{Uuid, Variant};
 
 use super::ContractViolation;
 pub use super::live::{ClientCommand, parse_client_command};
-use super::live::{FinalizeStatus, LiveIdentity, Model, Provider, TranscriptSegment};
+use super::live::{
+    FinalizeStatus, LiveIdentity, Model, Provider, TranscriptSegment, identity_wire,
+};
 
 const MAX_ERROR_CODE_CHARS: usize = 128;
 const MAX_ERROR_MESSAGE_CHARS: usize = 2_048;
@@ -50,11 +52,12 @@ pub fn serialize_server_message(
             identity,
         } => {
             validate_session_id(*session_id)?;
+            let (provider, model) = identity_wire(*identity);
             serde_json::to_string(&ReadyWire {
                 message_type: "ready",
                 session_id,
-                provider: identity.provider(),
-                model: identity.model(),
+                provider,
+                model,
             })
         }
         OutboundServerMessage::Ack { seq } => {
