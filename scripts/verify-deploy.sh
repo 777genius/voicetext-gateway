@@ -22,7 +22,7 @@ grep -Fq 'VOICETEXT_HEALTHCHECK_URL=http://127.0.0.1:8080/health/ready' Dockerfi
   fail "image healthcheck default is missing"
 grep -Fq '${VOICETEXT_HEALTHCHECK_URL}' Dockerfile ||
   fail "image healthcheck does not honor its configured URL"
-grep -Eq 'https://.*\.git\?ref=.*&checksum=' .github/workflows/ci.yml ||
+grep -Eq 'remote_context=.*\.git\?ref=.*&checksum=' .github/workflows/ci.yml ||
   fail "CI does not exercise a remote Git ref+checksum build context"
 
 for route in \

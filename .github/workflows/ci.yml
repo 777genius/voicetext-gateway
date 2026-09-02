@@ -22,6 +22,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ env.SOURCE_SHA }}
+          repository: ${{ env.SOURCE_REPOSITORY }}
 
       - name: Assert exact head and clean tracked tree
         run: |
@@ -69,7 +70,7 @@ jobs:
 
       - name: Check and build the pinned image from exact remote Git source
         run: |
-          remote_context="https://github.com/${SOURCE_REPOSITORY}.git?ref=refs/heads/${SOURCE_REF}&checksum=${SOURCE_SHA}"
+          remote_context="${GITHUB_SERVER_URL}/${SOURCE_REPOSITORY}.git?ref=refs/heads/${SOURCE_REF}&checksum=${SOURCE_SHA}"
           docker buildx build --check "$remote_context"
           docker buildx build --target verification --progress plain "$remote_context"
           docker buildx build --target runtime --load \
