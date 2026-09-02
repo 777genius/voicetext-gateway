@@ -311,7 +311,8 @@ jobs:
         run: |
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
           mkdir -p evidence/acceptance
-          gh release download "$RELEASE_TAG" --dir evidence/acceptance --pattern reviewer-approval.json --pattern provider-canary.json
+          gh release download "$RELEASE_TAG" --dir evidence/acceptance --pattern reviewer-approval.json --pattern reviewer-approval.sigstore.json \
+            --pattern provider-canary.json --pattern campaign-manifest.json --pattern fixture-manifest.json
           scripts/verify-release-acceptance.sh "$SOURCE_SHA" '${{ steps.quarantine.outputs.digest }}' evidence
       - name: Create and verify deterministic release predicate
         run: |

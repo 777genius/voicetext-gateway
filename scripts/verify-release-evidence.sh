@@ -8,6 +8,15 @@ set -eu
 evidence_dir=$1
 predicate="$evidence_dir/release-evidence.json"
 
+scripts/verify_json_record.py "$predicate" \
+  "$evidence_dir/policy/vulnerability-policy.json" \
+  "$evidence_dir/voicetext-gateway.sbom.cdx.json" \
+  "$evidence_dir/vulnerabilities.grype.json" \
+  "$evidence_dir/acceptance/reviewer-approval.json" \
+  "$evidence_dir/acceptance/provider-canary.json" \
+  "$evidence_dir/acceptance/campaign-manifest.json" \
+  "$evidence_dir/acceptance/fixture-manifest.json"
+
 [ "$(sha256sum LICENSE | cut -d' ' -f1)" = \
   c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 ]
 jq -e '
@@ -31,7 +40,11 @@ jq -e '
   .sbom.format == "CycloneDX" and
   .vulnerability_policy.result == "pass" and
   (.protected_acceptance.reviewer_sha256 | test("^[0-9a-f]{64}$")) and
+  (.protected_acceptance.reviewer_attestation_sha256 | test("^[0-9a-f]{64}$")) and
   (.protected_acceptance.canary_sha256 | test("^[0-9a-f]{64}$")) and
+  (.protected_acceptance.campaign_manifest_sha256 | test("^[0-9a-f]{64}$")) and
+  (.protected_acceptance.fixture_manifest_sha256 | test("^[0-9a-f]{64}$")) and
+  (.protected_acceptance.trust_policy_sha256 | test("^[0-9a-f]{64}$")) and
   .composition_gate.result == "pass"
 ' "$predicate" >/dev/null
 
@@ -69,3 +82,11 @@ jq -e '
   "$(sha256sum "$evidence_dir/acceptance/reviewer-approval.json" | cut -d' ' -f1)" ]
 [ "$(jq -r .protected_acceptance.canary_sha256 "$predicate")" = \
   "$(sha256sum "$evidence_dir/acceptance/provider-canary.json" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.reviewer_attestation_sha256 "$predicate")" = \
+  "$(sha256sum "$evidence_dir/acceptance/reviewer-approval.sigstore.json" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.campaign_manifest_sha256 "$predicate")" = \
+  "$(sha256sum "$evidence_dir/acceptance/campaign-manifest.json" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.fixture_manifest_sha256 "$predicate")" = \
+  "$(sha256sum "$evidence_dir/acceptance/fixture-manifest.json" | cut -d' ' -f1)" ]
+[ "$(jq -r .protected_acceptance.trust_policy_sha256 "$predicate")" = \
+  "$(sha256sum security/release-trust-policy.json | cut -d' ' -f1)" ]

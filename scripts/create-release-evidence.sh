@@ -49,7 +49,11 @@ license_sha=$(sha256sum "$evidence_dir/distribution/LICENSE" | cut -d' ' -f1)
 notice_sha=$(sha256sum "$evidence_dir/distribution/NOTICE" | cut -d' ' -f1)
 fixture_sha=$(sha256sum "$evidence_dir/composition/voicetext-gateway-contract.ts" | cut -d' ' -f1)
 reviewer_sha=$(sha256sum "$evidence_dir/acceptance/reviewer-approval.json" | cut -d' ' -f1)
+reviewer_bundle_sha=$(sha256sum "$evidence_dir/acceptance/reviewer-approval.sigstore.json" | cut -d' ' -f1)
 canary_sha=$(sha256sum "$evidence_dir/acceptance/provider-canary.json" | cut -d' ' -f1)
+campaign_sha=$(sha256sum "$evidence_dir/acceptance/campaign-manifest.json" | cut -d' ' -f1)
+canary_fixture_sha=$(sha256sum "$evidence_dir/acceptance/fixture-manifest.json" | cut -d' ' -f1)
+trust_policy_sha=$(sha256sum security/release-trust-policy.json | cut -d' ' -f1)
 
 jq -S -n \
   --arg source_sha "$source_sha" \
@@ -62,7 +66,11 @@ jq -S -n \
   --arg notice_sha "$notice_sha" \
   --arg fixture_sha "$fixture_sha" \
   --arg reviewer_sha "$reviewer_sha" \
+  --arg reviewer_bundle_sha "$reviewer_bundle_sha" \
   --arg canary_sha "$canary_sha" \
+  --arg campaign_sha "$campaign_sha" \
+  --arg canary_fixture_sha "$canary_fixture_sha" \
+  --arg trust_policy_sha "$trust_policy_sha" \
   '{
     predicate_type: "https://voicetext.dev/attestations/release-evidence/v1",
     source: {git_sha: $source_sha},
@@ -77,7 +85,11 @@ jq -S -n \
     distribution: {license_sha256: $license_sha, notice_sha256: $notice_sha},
     protected_acceptance: {
       reviewer_sha256: $reviewer_sha,
-      canary_sha256: $canary_sha
+      reviewer_attestation_sha256: $reviewer_bundle_sha,
+      canary_sha256: $canary_sha,
+      campaign_manifest_sha256: $campaign_sha,
+      fixture_manifest_sha256: $canary_fixture_sha,
+      trust_policy_sha256: $trust_policy_sha
     },
     composition_gate: {
       result: "pass",

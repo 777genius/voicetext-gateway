@@ -82,15 +82,37 @@ exists.
 ## Immutable release evidence and retention
 
 For a `v*` tag, `release-evidence` runs only after both required jobs succeed and enters the
-protected `release-publication` environment. Configure that environment with required reviewers.
-Before the job starts, an authorized operator must create the draft GitHub Release for the exact
-tag and attach `reviewer-approval.json` plus `provider-canary.json`. Both bounded records must name
-the exact source SHA and quarantine image digest; the canary record must contain passing results for
-each provider/mode and both mixed-profile combinations. The workflow rejects a non-draft release,
-missing evidence, malformed identities, or incomplete canary coverage.
+protected `release-publication` environment. Configure both that environment and the separate
+`canary-approval` environment with required reviewers who cannot be bypassed by a committer. The
+operator first creates a draft GitHub Release for the exact tag and attaches the retained, real
+canary's canonical `provider-canary.json`, `campaign-manifest.json`, and `fixture-manifest.json`.
+These records come from the test-only runner identity pinned in `security/release-trust-policy.json`
+and carry its exact revision; they are not hand-authored PASS claims. Retain runner logs, the
+synthetic fixture, and bounded provider receipts for audit (never credentials, customer audio, or
+provider response bodies).
 
-The checked-in `scripts/verify-release-acceptance.sh` defines the fail-closed JSON schema, exact
-six-profile canary set, identity matching, and 64 KiB per-record bound.
+Dispatch `.github/workflows/canary-approval.yml` at the candidate source SHA. Its protected
+`canary-approval` review verifies the candidate tag/image, trusted runner identity, strict canonical
+records, manifest bindings, and all eight fresh effects. It emits `reviewer-approval.json` whose
+SHA-256 bindings cover the canary payload, both manifests, trust policy, exact source SHA, image
+digest, campaign ID, and runner identity/revision. GitHub OIDC signs that approval as a
+build-provenance attestation, which is attached as `reviewer-approval.sigstore.json` without
+overwrite. No private signing key or caller-selected trust root is accepted.
+
+The publication workflow downloads all five records and verifies the attestation against the
+repository, exact candidate workflow revision, checked-in signer workflow, and GitHub-hosted runner
+before staging or publishing a public tag. A committer may write canary-shaped JSON, but cannot
+produce the OIDC attestation from the protected job without its independent environment review.
+Missing, concatenated, non-canonical, duplicate-key, unknown-key, partial, reused-effect, or
+digest-mismatched records fail closed. Synthetic fixtures in `scripts/test-release-evidence.sh`
+prove parser/policy behavior only and are never real-provider qualification evidence.
+
+`scripts/verify-release-acceptance.sh` defines the exact six-profile/eight-effect policy. Provider
+request, result, and effect IDs are globally unique, so mixed checks cannot reuse standalone halves.
+Every effect binds outcome and timestamps. Batch terminal status is tied to its provider result; live
+evidence ties the complete ACK range and accepted-frame digest to a flushed finalize and the same
+provider result. Each bounded JSON record is at most 64 KiB and contains exactly one top-level value;
+the Sigstore bundle is bounded separately at 1 MiB.
 
 The job rebuilds the image from the exact remote Git ref plus checksum and first assigns only the
 deterministic `quarantine-<source-sha>` GHCR identity. GitHub artifact attestations

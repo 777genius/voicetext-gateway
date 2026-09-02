@@ -27,6 +27,9 @@ test -z "$(tail -n +$((publish + 1)) "$workflow" | grep -E '^[[:space:]]+- name:
 grep -F 'environment: release-publication' "$workflow" >/dev/null
 grep -F 'quarantine_tag="quarantine-${SOURCE_SHA}"' "$workflow" >/dev/null
 grep -F 'scripts/verify-release-acceptance.sh "$SOURCE_SHA"' "$workflow" >/dev/null
+grep -F 'environment: canary-approval' .github/workflows/canary-approval.yml >/dev/null
+grep -F 'test "${{ github.workflow_sha }}" = "$SOURCE_SHA"' .github/workflows/canary-approval.yml >/dev/null
+grep -F 'uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8' .github/workflows/canary-approval.yml >/dev/null
 grep -F 'durable_startup_recovery_is_exactly_once -- --ignored --exact' \
   scripts/run-production-composition-gate.sh >/dev/null
 grep -F 'ref=${SOURCE_REF}&checksum=${SOURCE_SHA}' "$workflow" >/dev/null
