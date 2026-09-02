@@ -1,14 +1,17 @@
 //! Exact VoiceText-compatible batch HTTP handlers.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Multipart, Path, State, multipart::Field};
 use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 use voicetext_audio::ogg_opus::validate_complete_ogg_opus;
 use voicetext_speech::application::batch::{
     BatchAdmissionOutcome, BatchAdmissionRequest, BatchCoordinator, BatchCoordinatorFailure,
+    BatchExecutionOutcome,
 };
 use voicetext_speech::application::ports::{BatchJobId, BatchJobSnapshot};
 use voicetext_speech::domain::batch::{BatchJobState, BatchProfile, BatchUnknownOutcome};
@@ -29,6 +32,7 @@ const IDEMPOTENCY_HEADER: &str = "x-idempotency-key";
 const MAX_TEXT_FIELD_BYTES: usize = 24 * 1024;
 const DEFAULT_POLL_MILLIS: u64 = 1_000;
 const DEFAULT_RETRY_MILLIS: u64 = 1_000;
+const UPLOAD_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Accepts one exact, bounded `VoiceText` batch multipart request.
 pub(crate) async fn post(
@@ -38,8 +42,19 @@ pub(crate) async fn post(
 ) -> Result<Response, GatewayHttpError> {
     authenticate(&headers, state.auth()).map_err(GatewayHttpError::unauthorized)?;
     state.metrics().batch_request();
+    let global_permit = state
+        .try_acquire_global_batch_slot()
+        .ok_or_else(|| admission_rejected(&state))?;
+    let batch_permit = state
+        .try_acquire_batch_slot()
+        .ok_or_else(|| admission_rejected(&state))?;
     let key = parse_idempotency_key(&headers)?;
-    let form = parse_multipart(multipart, state.limits().batch_upload_bytes).await?;
+    let form = tokio::time::timeout(
+        UPLOAD_DEADLINE,
+        parse_multipart(multipart, state.limits().batch_upload_bytes, &state),
+    )
+    .await
+    .map_err(|_| GatewayHttpError::bad_request("UPLOAD_DEADLINE_EXCEEDED"))??;
     let identity = form.identity()?;
     let recognizer = state
         .profiles()
@@ -47,6 +62,8 @@ pub(crate) async fn post(
         .cloned()
         .ok_or_else(GatewayHttpError::unsupported_profile)?;
 
+    let audio_bytes = u64::try_from(form.audio.len())
+        .map_err(|_| GatewayHttpError::bad_request("MULTIPART_FIELD_TOO_LARGE"))?;
     let shared_audio = Arc::new(form.audio);
     let validation_audio = Arc::clone(&shared_audio);
     let validated = tokio::task::spawn_blocking(move || {
@@ -85,15 +102,25 @@ pub(crate) async fn post(
         }
     };
     let snapshot = match outcome {
-        BatchAdmissionOutcome::Accepted(snapshot) | BatchAdmissionOutcome::Replay(snapshot) => {
+        BatchAdmissionOutcome::Accepted(snapshot) => {
+            state.metrics().spool_admitted(audio_bytes);
             snapshot
         }
+        BatchAdmissionOutcome::Replay(snapshot) => snapshot,
     };
     if matches!(
         snapshot.job.state(),
         BatchJobState::Accepted | BatchJobState::Retryable { .. }
     ) {
-        spawn_execution(state, identity, job_id);
+        spawn_execution(
+            &state,
+            identity,
+            job_id,
+            global_permit,
+            batch_permit,
+            form.provider_permit,
+            audio_bytes,
+        );
     }
     response_for_snapshot(identity, job_uuid, &snapshot)
 }
@@ -123,15 +150,50 @@ pub(crate) async fn get(
     response_for_snapshot(identity, job_uuid, &snapshot)
 }
 
-fn spawn_execution(state: GatewayState, identity: BatchIdentity, id: BatchJobId) {
-    tokio::spawn(async move {
-        let Some(recognizer) = state.profiles().batch(identity).cloned() else {
+fn spawn_execution(
+    state: &GatewayState,
+    identity: BatchIdentity,
+    id: BatchJobId,
+    global_permit: OwnedSemaphorePermit,
+    batch_permit: OwnedSemaphorePermit,
+    provider_permit: OwnedSemaphorePermit,
+    audio_bytes: u64,
+) {
+    let task_state = (*state).clone();
+    state.spawn_batch_task(async move {
+        let _permits = (global_permit, batch_permit, provider_permit);
+        let Some(recognizer) = task_state.profiles().batch(identity).cloned() else {
             return;
         };
-        let coordinator = BatchCoordinator::new(recognizer.as_ref(), state.jobs(), state.spool());
-        if coordinator.execute(&id).await.is_err() {
-            state.metrics().batch_failure();
-            tracing::error!(job_id = %id.as_str(), "batch execution did not persist a safe outcome");
+        let coordinator = BatchCoordinator::new(
+            recognizer.as_ref(),
+            task_state.jobs(),
+            task_state.spool(),
+        );
+        task_state.metrics().batch_execution_started();
+        let outcome = coordinator.execute(&id).await;
+        task_state.metrics().batch_execution_finished();
+        match outcome {
+            Ok(BatchExecutionOutcome::Persisted(snapshot)) => {
+                task_state.metrics().batch_provider_effect();
+                if snapshot.job.state().is_terminal() {
+                    task_state.metrics().spool_terminal_cleaned(audio_bytes);
+                }
+                match snapshot.job.state() {
+                    BatchJobState::OutcomeUnknown { .. } => {
+                        task_state.metrics().batch_outcome_unknown();
+                    }
+                    BatchJobState::Failed { .. } => {
+                        task_state.metrics().batch_known_terminal_failure();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(BatchExecutionOutcome::NotClaimed(_) | BatchExecutionOutcome::NotActionable(_)) => {}
+            Err(_) => {
+                task_state.metrics().batch_failure();
+                tracing::error!(job_id = %id.as_str(), "batch execution did not persist a safe outcome");
+            }
         }
     });
 }
@@ -230,6 +292,7 @@ struct BatchForm {
     language: String,
     keyterms: Vec<String>,
     audio: Vec<u8>,
+    provider_permit: OwnedSemaphorePermit,
 }
 
 impl BatchForm {
@@ -252,21 +315,28 @@ impl BatchForm {
 async fn parse_multipart(
     mut multipart: Multipart,
     audio_limit: usize,
+    state: &GatewayState,
 ) -> Result<BatchForm, GatewayHttpError> {
     let mut text = Vec::with_capacity(5);
-    for expected in [
-        "contract_version",
-        "provider",
-        "model",
-        "language",
-        "keyterms",
-    ] {
+    for expected in ["contract_version", "provider", "model", "language"] {
         let field = next_field(&mut multipart).await?;
         if field.name() != Some(expected) || field.file_name().is_some() {
             return Err(GatewayHttpError::bad_request("INVALID_MULTIPART_ORDER"));
         }
         text.push(read_text(field).await?);
     }
+    let identity = identity_from_fields(&text[0], &text[1], &text[2], &text[3])?;
+    if state.profiles().batch(identity).is_none() {
+        return Err(GatewayHttpError::unsupported_profile());
+    }
+    let provider_permit = state
+        .try_acquire_provider_batch_slot(identity)
+        .ok_or_else(|| admission_rejected(state))?;
+    let keyterms = next_field(&mut multipart).await?;
+    if keyterms.name() != Some("keyterms") || keyterms.file_name().is_some() {
+        return Err(GatewayHttpError::bad_request("INVALID_MULTIPART_ORDER"));
+    }
+    text.push(read_text(keyterms).await?);
     let file = next_field(&mut multipart).await?;
     if file.name() != Some("file")
         || file.file_name() != Some("speaker-track.ogg")
@@ -294,7 +364,26 @@ async fn parse_multipart(
         language: text.remove(0),
         keyterms,
         audio,
+        provider_permit,
     })
+}
+
+fn admission_rejected(state: &GatewayState) -> GatewayHttpError {
+    state.metrics().batch_admission_rejection();
+    GatewayHttpError::rate_limited()
+}
+
+fn identity_from_fields(
+    contract_version: &str,
+    provider: &str,
+    model: &str,
+    language: &str,
+) -> Result<BatchIdentity, GatewayHttpError> {
+    match (contract_version, provider, model, language) {
+        ("2", "deepgram", "nova-3", "multi") => Ok(BatchIdentity::DeepgramNova3MultiV2),
+        ("3", "elevenlabs", "scribe_v2", "multi") => Ok(BatchIdentity::ElevenlabsScribeV2MultiV3),
+        _ => Err(GatewayHttpError::bad_request("UNSUPPORTED_PROFILE")),
+    }
 }
 
 async fn next_field(multipart: &mut Multipart) -> Result<Field<'_>, GatewayHttpError> {

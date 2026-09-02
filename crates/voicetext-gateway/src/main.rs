@@ -21,6 +21,8 @@ use voicetext_gateway::server::{
     GatewayLimits, GatewayState, PostgresSpoolReadiness, recover_startup, router,
 };
 use voicetext_gateway::storage::{DurableFileSpool, PostgresBatchJobStore};
+
+const SPOOL_ORPHAN_RETENTION: Duration = Duration::from_hours(24);
 use voicetext_providers::deepgram::{DeepgramBatchRecognizer, DeepgramLiveRecognizer};
 use voicetext_providers::elevenlabs::{ElevenLabsBatchRecognizer, ElevenLabsLiveRecognizer};
 
@@ -90,8 +92,10 @@ async fn run() -> Result<(), BootstrapFailure> {
         .await
         .map_err(|_| BootstrapFailure::DatabaseMigration)?;
 
-    let spool = DurableFileSpool::new(&config.spool_directory, config.max_upload_bytes)
-        .map_err(|_| BootstrapFailure::Spool)?;
+    let spool = Arc::new(
+        DurableFileSpool::new(&config.spool_directory, config.max_upload_bytes)
+            .map_err(|_| BootstrapFailure::Spool)?,
+    );
     let profiles = build_profiles(&config).await?;
     if !profiles.is_operational() {
         return Err(BootstrapFailure::NoProvider);
@@ -111,36 +115,49 @@ async fn run() -> Result<(), BootstrapFailure> {
         pool.clone(),
         config.spool_directory.clone(),
     ));
-    let state = GatewayState::new(auth, jobs, Arc::new(spool), profiles, readiness, limits);
+    let state = GatewayState::new(
+        auth,
+        jobs.clone(),
+        spool.clone(),
+        profiles,
+        readiness,
+        limits,
+    );
 
-    let recovery_state = state.clone();
-    let recovery = tokio::spawn(async move {
-        match recover_startup(&recovery_state).await {
-            Ok(summary) => tracing::info!(
-                pages = summary.pages,
-                recovered_unknown = summary.recovered_unknown,
-                executed = summary.executed,
-                skipped_unconfigured = summary.skipped_unconfigured,
-                "batch startup recovery completed"
-            ),
-            Err(error) => tracing::error!(
-                code = error.code(),
-                "batch startup recovery failed; readiness remains dependency-based"
-            ),
-        }
-    });
+    let recovery = recover_startup(&state)
+        .await
+        .map_err(|_| BootstrapFailure::Recovery)?;
+    let maintenance = spool
+        .reconcile(jobs.as_ref(), SPOOL_ORPHAN_RETENTION)
+        .await
+        .map_err(|_| BootstrapFailure::Spool)?;
+    state.record_startup_metrics(
+        recovery.executed,
+        recovery.recovered_unknown,
+        maintenance.terminal_removed,
+        maintenance.orphan_removed,
+        maintenance.used_bytes,
+        maintenance.capacity_bytes,
+    );
+    tracing::info!(
+        pages = recovery.pages,
+        recovered_unknown = recovery.recovered_unknown,
+        executed = recovery.executed,
+        terminal_audio_removed = maintenance.terminal_removed,
+        orphan_audio_removed = maintenance.orphan_removed,
+        spool_used_bytes = maintenance.used_bytes,
+        spool_capacity_bytes = maintenance.capacity_bytes,
+        "batch startup recovery completed"
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind_address)
         .await
         .map_err(|_| BootstrapFailure::Bind)?;
     log_listening(config.bind_address);
-    let serve_result = axum::serve(listener, router(state))
+    let serve_result = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown_signal())
         .await;
-    if !recovery.is_finished() {
-        recovery.abort();
-    }
-    let _recovery_result = recovery.await;
+    state.shutdown_batch_tasks().await;
     pool.close().await;
     serve_result.map_err(|_| BootstrapFailure::Serve)
 }
@@ -243,6 +260,7 @@ enum BootstrapFailure {
     DatabaseSecret,
     DatabaseConnect,
     DatabaseMigration,
+    Recovery,
     Spool,
     ProviderSecret,
     ProviderConfiguration,
@@ -261,6 +279,7 @@ impl BootstrapFailure {
             Self::DatabaseSecret => "DATABASE_SECRET_INVALID",
             Self::DatabaseConnect => "DATABASE_CONNECT_FAILED",
             Self::DatabaseMigration => "DATABASE_MIGRATION_FAILED",
+            Self::Recovery => "BATCH_RECOVERY_FAILED",
             Self::Spool => "SPOOL_INVALID",
             Self::ProviderSecret => "PROVIDER_SECRET_INVALID",
             Self::ProviderConfiguration => "PROVIDER_CONFIGURATION_INVALID",

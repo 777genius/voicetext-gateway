@@ -182,6 +182,12 @@ impl<'a> BatchCoordinator<'a> {
                 .await
             {
                 Ok(BatchJobUpdateOutcome::Stored(snapshot)) => {
+                    if snapshot.job.state().is_terminal() {
+                        self.spool
+                            .remove(&snapshot.audio)
+                            .await
+                            .map_err(BatchCoordinatorFailure::Spool)?;
+                    }
                     Ok(BatchExecutionOutcome::Persisted(snapshot))
                 }
                 Ok(BatchJobUpdateOutcome::RevisionConflict(_) | BatchJobUpdateOutcome::Missing) => {
@@ -225,6 +231,10 @@ impl<'a> BatchCoordinator<'a> {
                             .map_err(store)?
                         {
                             BatchJobUpdateOutcome::Stored(snapshot) => {
+                                self.spool
+                                    .remove(&snapshot.audio)
+                                    .await
+                                    .map_err(BatchCoordinatorFailure::Spool)?;
                                 report.recovered_unknown.push(snapshot);
                             }
                             BatchJobUpdateOutcome::RevisionConflict(snapshot) => {
@@ -517,23 +527,28 @@ mod tests {
         let winner = run(coordinator.execute(&BatchJobId::new("job"))).unwrap();
         assert!(matches!(winner, BatchExecutionOutcome::Persisted(_)));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.removes.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn post_egress_conflict_recovers_unknown_and_never_retries() {
+    fn audio_survives_until_a_terminal_cas_is_durable() {
         let fake = Fake::new();
         let coordinator = BatchCoordinator::new(&fake, &fake, &fake);
         run(coordinator.admit(request(1))).unwrap();
+        assert!(fake.audio.lock().unwrap().is_some());
+
         fake.conflict_at.store(2, Ordering::SeqCst);
-        let outcome = run(coordinator.execute(&BatchJobId::new("job")));
-        assert_eq!(outcome, Err(BatchCoordinatorFailure::PostEgressConflict));
-        fake.jobs.lock().unwrap().push(accepted_snapshot("pending"));
+        assert_eq!(
+            run(coordinator.execute(&BatchJobId::new("job"))),
+            Err(BatchCoordinatorFailure::PostEgressConflict)
+        );
+        assert!(fake.audio.lock().unwrap().is_some());
+        assert_eq!(fake.removes.load(Ordering::SeqCst), 0);
+
         let report = run(coordinator.recover_startup(None)).unwrap();
         assert_eq!(report.recovered_unknown.len(), 1);
-        assert_eq!(report.actionable.len(), 1);
-        let replay = run(coordinator.execute(&BatchJobId::new("job"))).unwrap();
-        assert!(matches!(replay, BatchExecutionOutcome::NotActionable(_)));
-        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert!(fake.audio.lock().unwrap().is_none());
+        assert_eq!(fake.removes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

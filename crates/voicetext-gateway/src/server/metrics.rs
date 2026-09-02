@@ -14,6 +14,17 @@ pub struct GatewayMetrics {
     batch_requests: AtomicU64,
     batch_conflicts: AtomicU64,
     batch_failures: AtomicU64,
+    batch_admission_rejections: AtomicU64,
+    batch_inflight: AtomicU64,
+    batch_provider_effects: AtomicU64,
+    batch_outcome_unknown: AtomicU64,
+    batch_known_terminal_failures: AtomicU64,
+    batch_recovery_executed: AtomicU64,
+    batch_recovery_unknown: AtomicU64,
+    spool_terminal_removed: AtomicU64,
+    spool_orphan_removed: AtomicU64,
+    spool_used_bytes: AtomicU64,
+    spool_capacity_bytes: AtomicU64,
     live_sessions: AtomicU64,
     live_frames: AtomicU64,
     live_failures: AtomicU64,
@@ -30,6 +41,68 @@ impl GatewayMetrics {
 
     pub(crate) fn batch_failure(&self) {
         self.batch_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_admission_rejection(&self) {
+        self.batch_admission_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_execution_started(&self) {
+        self.batch_inflight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_execution_finished(&self) {
+        self.batch_inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_provider_effect(&self) {
+        self.batch_provider_effects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_outcome_unknown(&self) {
+        self.batch_outcome_unknown.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn batch_known_terminal_failure(&self) {
+        self.batch_known_terminal_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_recovery(&self, executed: u64, unknown: u64) {
+        self.batch_recovery_executed
+            .fetch_add(executed, Ordering::Relaxed);
+        self.batch_recovery_unknown
+            .fetch_add(unknown, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_spool(
+        &self,
+        terminal_removed: u64,
+        orphan_removed: u64,
+        used_bytes: u64,
+        capacity_bytes: u64,
+    ) {
+        self.spool_terminal_removed
+            .fetch_add(terminal_removed, Ordering::Relaxed);
+        self.spool_orphan_removed
+            .fetch_add(orphan_removed, Ordering::Relaxed);
+        self.spool_used_bytes.store(used_bytes, Ordering::Relaxed);
+        self.spool_capacity_bytes
+            .store(capacity_bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn spool_admitted(&self, bytes: u64) {
+        self.spool_used_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn spool_terminal_cleaned(&self, bytes: u64) {
+        self.spool_terminal_removed.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .spool_used_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            });
     }
 
     pub(crate) fn live_session(&self) {
@@ -63,6 +136,61 @@ impl GatewayMetrics {
                 self.batch_failures.load(Ordering::Relaxed),
             ),
             (
+                "voicetext_batch_admission_rejections_total",
+                "Batch requests rejected before audio buffering or provider egress.",
+                self.batch_admission_rejections.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_inflight",
+                "Batch provider executions currently tracked.",
+                self.batch_inflight.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_provider_effects_total",
+                "Batch provider executions started after durable fencing.",
+                self.batch_provider_effects.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_outcome_unknown_total",
+                "Batch executions durably classified with unknown provider outcome.",
+                self.batch_outcome_unknown.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_known_terminal_failures_total",
+                "Batch executions with a known terminal failure class.",
+                self.batch_known_terminal_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_recovery_executed_total",
+                "Pre-egress batch jobs resumed during startup recovery.",
+                self.batch_recovery_executed.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_batch_recovery_unknown_total",
+                "Interrupted submissions made terminally unknown during recovery.",
+                self.batch_recovery_unknown.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_spool_terminal_removed_total",
+                "Terminal batch audio artifacts removed.",
+                self.spool_terminal_removed.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_spool_orphan_removed_total",
+                "Expired orphan batch audio artifacts removed.",
+                self.spool_orphan_removed.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_spool_used_bytes",
+                "Current durable batch audio spool bytes.",
+                self.spool_used_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "voicetext_spool_capacity_bytes",
+                "Configured durable batch audio spool capacity.",
+                self.spool_capacity_bytes.load(Ordering::Relaxed),
+            ),
+            (
                 "voicetext_live_sessions_total",
                 "Accepted live WebSocket sessions.",
                 self.live_sessions.load(Ordering::Relaxed),
@@ -79,7 +207,12 @@ impl GatewayMetrics {
             ),
         ] {
             let _write = writeln!(output, "# HELP {name} {help}");
-            let _write = writeln!(output, "# TYPE {name} counter");
+            let metric_type = if name.ends_with("_bytes") || name.ends_with("_inflight") {
+                "gauge"
+            } else {
+                "counter"
+            };
+            let _write = writeln!(output, "# TYPE {name} {metric_type}");
             let _write = writeln!(output, "{name} {value}");
         }
         output

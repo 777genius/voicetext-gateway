@@ -4,6 +4,7 @@ use crate::application::ports::{
     BatchAudioSpoolFailure, BatchJobId, BatchJobSnapshot, BatchJobStoreFailure,
     BatchRecognitionResult, RecognitionFailure,
 };
+use crate::application::result_bound::serialized_result_fits;
 use crate::domain::batch::{
     BatchFailure, BatchProfile, BatchRequestFingerprint, BatchTransitionError,
 };
@@ -144,6 +145,7 @@ fn valid_result(snapshot: &BatchJobSnapshot, result: &BatchRecognitionResult) ->
         || result.duration_millis != snapshot.authoritative_duration_millis
         || result.text.len() > MAX_TRANSCRIPT_BYTES
         || result.segments.len() > MAX_SEGMENTS
+        || !serialized_result_fits(result)
     {
         return false;
     }

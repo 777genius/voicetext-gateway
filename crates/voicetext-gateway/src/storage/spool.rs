@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -14,8 +15,10 @@ use voicetext_speech::application::ports::{
 /// Durable content-addressed spool rooted in one canonical, non-symlink directory.
 #[derive(Clone, Debug)]
 pub struct DurableFileSpool {
-    root: PathBuf,
+    pub(super) root: PathBuf,
     maximum_bytes: usize,
+    pub(super) maximum_total_bytes: u64,
+    mutation: Arc<Mutex<()>>,
 }
 
 impl DurableFileSpool {
@@ -37,10 +40,30 @@ impl DurableFileSpool {
             return Err(invalid_storage());
         }
         let canonical = fs::canonicalize(root).map_err(unavailable)?;
+        let maximum_total_bytes = u64::try_from(maximum_bytes)
+            .map_err(|_| BatchAudioSpoolFailure::CapacityExceeded)?
+            .saturating_mul(16);
         Ok(Self {
             root: canonical,
             maximum_bytes,
+            maximum_total_bytes,
+            mutation: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Overrides the bounded aggregate capacity while preserving the per-upload bound.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an aggregate capacity smaller than one maximum upload.
+    pub fn with_total_capacity(mut self, bytes: u64) -> Result<Self, BatchAudioSpoolFailure> {
+        let minimum = u64::try_from(self.maximum_bytes)
+            .map_err(|_| BatchAudioSpoolFailure::CapacityExceeded)?;
+        if bytes < minimum {
+            return Err(BatchAudioSpoolFailure::CapacityExceeded);
+        }
+        self.maximum_total_bytes = bytes;
+        Ok(self)
     }
 
     fn store_blocking(
@@ -55,6 +78,15 @@ impl DurableFileSpool {
         let digest = hex::encode(Sha256::digest(audio));
         let handle = format!("{job_id}-{digest}.ogg");
         let final_path = self.root.join(&handle);
+        let _mutation = self.mutation.lock().map_err(|_| invalid_storage())?;
+        if !final_path.exists() {
+            let used = spool_audio_bytes(&self.root)?;
+            let incoming =
+                u64::try_from(audio.len()).map_err(|_| BatchAudioSpoolFailure::CapacityExceeded)?;
+            if used.saturating_add(incoming) > self.maximum_total_bytes {
+                return Err(BatchAudioSpoolFailure::CapacityExceeded);
+            }
+        }
         let created = create_file_atomic(&self.root, &final_path, audio)?;
         if created {
             sync_directory(&self.root)?;
@@ -94,6 +126,7 @@ impl DurableFileSpool {
     }
 
     fn remove_blocking(&self, handle: &BatchAudioHandle) -> Result<(), BatchAudioSpoolFailure> {
+        let _mutation = self.mutation.lock().map_err(|_| invalid_storage())?;
         let parsed = parse_handle(handle.as_str())?;
         let path = self.root.join(handle.as_str());
         match fs::symlink_metadata(&path) {
@@ -158,8 +191,8 @@ impl BatchAudioSpool for DurableFileSpool {
     }
 }
 
-struct ParsedHandle<'a> {
-    job_id: &'a str,
+pub(super) struct ParsedHandle<'a> {
+    pub(super) job_id: &'a str,
     digest: &'a str,
 }
 
@@ -177,7 +210,7 @@ fn canonical_job_id(id: &BatchJobId) -> Result<String, BatchAudioSpoolFailure> {
     clippy::case_sensitive_file_extension_comparisons,
     reason = "the opaque handle grammar requires lowercase .ogg exactly"
 )]
-fn parse_handle(value: &str) -> Result<ParsedHandle<'_>, BatchAudioSpoolFailure> {
+pub(super) fn parse_handle(value: &str) -> Result<ParsedHandle<'_>, BatchAudioSpoolFailure> {
     const HANDLE_BYTES: usize = 36 + 1 + 64 + 4;
     if value.len() != HANDLE_BYTES || !value.is_ascii() || !value.ends_with(".ogg") {
         return Err(invalid_storage());
@@ -193,6 +226,26 @@ fn parse_handle(value: &str) -> Result<ParsedHandle<'_>, BatchAudioSpoolFailure>
         return Err(invalid_storage());
     }
     Ok(ParsedHandle { job_id, digest })
+}
+
+pub(super) fn spool_audio_bytes(root: &Path) -> Result<u64, BatchAudioSpoolFailure> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(root).map_err(unavailable)? {
+        let entry = entry.map_err(unavailable)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if parse_handle(name).is_err() {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(unavailable)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(invalid_storage());
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or(BatchAudioSpoolFailure::CapacityExceeded)?;
+    }
+    Ok(total)
 }
 
 fn create_file_atomic(
@@ -430,6 +483,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn aggregate_quota_rejects_before_creating_an_artifact() {
+        let directory = tempdir().unwrap();
+        let spool = DurableFileSpool::new(directory.path(), 8)
+            .unwrap()
+            .with_total_capacity(8)
+            .unwrap();
+        spool.store(id(), b"12345".to_vec()).await.unwrap();
+        let other = BatchJobId::new("223e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(
+            spool.store(other, b"6789".to_vec()).await,
+            Err(BatchAudioSpoolFailure::CapacityExceeded)
+        );
+        assert_eq!(spool_audio_bytes(directory.path()).unwrap(), 5);
     }
 
     #[cfg(unix)]

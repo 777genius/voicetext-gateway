@@ -9,6 +9,9 @@ use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchJobId, BatchJobSnapshot, BatchReadableSegment, BatchRecognitionResult,
     BatchSegment, ProviderReference,
 };
+use voicetext_speech::application::result_bound::{
+    MAX_SERIALIZED_RESULT_BYTES, serialized_result_fits,
+};
 use voicetext_speech::domain::batch::{
     BatchFailure, BatchJob, BatchJobState, BatchProfile, BatchRequestFingerprint,
     BatchUnknownOutcome,
@@ -19,7 +22,6 @@ const MAX_KEYTERM_BYTES: usize = 256;
 const MAX_KEYTERMS_BYTES: usize = 16_384;
 const MAX_PROVIDER_REFERENCE_BYTES: usize = 256;
 const MAX_PROFILE_FIELD_BYTES: usize = 256;
-const MAX_RESULT_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEGMENTS: usize = 10_000;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_READABLE_REFERENCES: usize = 100_000;
@@ -466,7 +468,7 @@ fn bounded_json(value: &Value) -> Result<(), RecordError> {
     if serde_json::to_vec(value)
         .map_err(|_| RecordError("INVALID_RESULT_JSON"))?
         .len()
-        > MAX_RESULT_JSON_BYTES
+        > MAX_SERIALIZED_RESULT_BYTES
     {
         return Err(RecordError("RESULT_TOO_LARGE"));
     }
@@ -474,7 +476,10 @@ fn bounded_json(value: &Value) -> Result<(), RecordError> {
 }
 
 fn validate_result(result: &BatchRecognitionResult) -> Result<(), RecordError> {
-    if result.text.len() > MAX_TEXT_BYTES || result.segments.len() > MAX_SEGMENTS {
+    if result.text.len() > MAX_TEXT_BYTES
+        || result.segments.len() > MAX_SEGMENTS
+        || !serialized_result_fits(result)
+    {
         return Err(RecordError("RESULT_TOO_LARGE"));
     }
     let mut previous_end = 0;

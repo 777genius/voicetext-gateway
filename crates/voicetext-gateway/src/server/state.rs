@@ -1,14 +1,17 @@
 //! Cloneable gateway dependencies and bounded transport settings.
 
 use std::fmt;
+use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use voicetext_speech::application::ports::{BatchAudioSpool, BatchJobStore, BoxFuture};
 
+use crate::contracts::batch::BatchIdentity;
 use crate::profiles::ProfileRegistry;
 use crate::secret::MachineSecret;
 
@@ -113,6 +116,11 @@ struct GatewayStateInner {
     readiness: Arc<dyn GatewayReadiness>,
     limits: GatewayLimits,
     live_slots: Arc<Semaphore>,
+    global_batch_slots: Arc<Semaphore>,
+    batch_slots: Arc<Semaphore>,
+    deepgram_batch_slots: Arc<Semaphore>,
+    elevenlabs_batch_slots: Arc<Semaphore>,
+    batch_tasks: Mutex<Vec<JoinHandle<()>>>,
     metrics: GatewayMetrics,
     startup_reconciled: AtomicBool,
 }
@@ -129,6 +137,8 @@ impl GatewayState {
         limits: GatewayLimits,
     ) -> Self {
         let live_slots = Arc::new(Semaphore::new(limits.live_connections.get()));
+        let batch_capacity = limits.live_connections.get();
+        let provider_capacity = batch_capacity.div_ceil(2).max(1);
         Self(Arc::new(GatewayStateInner {
             auth,
             jobs,
@@ -137,6 +147,11 @@ impl GatewayState {
             readiness,
             limits,
             live_slots,
+            global_batch_slots: Arc::new(Semaphore::new(batch_capacity)),
+            batch_slots: Arc::new(Semaphore::new(batch_capacity)),
+            deepgram_batch_slots: Arc::new(Semaphore::new(provider_capacity)),
+            elevenlabs_batch_slots: Arc::new(Semaphore::new(provider_capacity)),
+            batch_tasks: Mutex::new(Vec::new()),
             metrics: GatewayMetrics::default(),
             startup_reconciled: AtomicBool::new(false),
         }))
@@ -170,8 +185,79 @@ impl GatewayState {
         Arc::clone(&self.0.live_slots).try_acquire_owned().ok()
     }
 
+    pub(crate) fn try_acquire_global_batch_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0.global_batch_slots)
+            .try_acquire_owned()
+            .ok()
+    }
+
+    pub(crate) fn try_acquire_batch_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0.batch_slots).try_acquire_owned().ok()
+    }
+
+    pub(crate) fn try_acquire_provider_batch_slot(
+        &self,
+        identity: BatchIdentity,
+    ) -> Option<OwnedSemaphorePermit> {
+        let slots = match identity {
+            BatchIdentity::DeepgramNova3MultiV2 => &self.0.deepgram_batch_slots,
+            BatchIdentity::ElevenlabsScribeV2MultiV3 => &self.0.elevenlabs_batch_slots,
+        };
+        Arc::clone(slots).try_acquire_owned().ok()
+    }
+
+    pub(crate) fn spawn_batch_task(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(task);
+        let mut tasks = self
+            .0
+            .batch_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
+    }
+
+    /// Cancels and joins every tracked batch task during process shutdown.
+    pub async fn shutdown_batch_tasks(&self) {
+        let tasks = {
+            let mut tracked = self
+                .0
+                .batch_tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *tracked)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
     pub(crate) fn metrics(&self) -> &GatewayMetrics {
         &self.0.metrics
+    }
+
+    /// Records fixed-cardinality startup recovery and spool capacity evidence.
+    pub fn record_startup_metrics(
+        &self,
+        recovery_executed: u64,
+        recovery_unknown: u64,
+        terminal_removed: u64,
+        orphan_removed: u64,
+        spool_used_bytes: u64,
+        spool_capacity_bytes: u64,
+    ) {
+        self.0
+            .metrics
+            .record_recovery(recovery_executed, recovery_unknown);
+        self.0.metrics.record_spool(
+            terminal_removed,
+            orphan_removed,
+            spool_used_bytes,
+            spool_capacity_bytes,
+        );
     }
 
     pub(crate) fn mark_startup_reconciled(&self) {
