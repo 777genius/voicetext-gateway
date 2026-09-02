@@ -219,6 +219,7 @@ pub(super) fn store(failure: BatchJobStoreFailure) -> BatchCoordinatorFailure {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
+    use std::num::NonZeroUsize;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};

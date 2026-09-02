@@ -20,7 +20,10 @@ pub(crate) async fn execute_fenced(
     id: &BatchJobId,
 ) -> Option<Result<BatchExecutionOutcome, BatchCoordinatorFailure>> {
     let recognizer = state.profiles().batch(identity)?;
-    let observed = EffectObservedRecognizer { state, recognizer };
+    let observed = EffectObservedRecognizer {
+        state,
+        recognizer: recognizer.as_ref(),
+    };
     let coordinator = BatchCoordinator::new(&observed, state.jobs(), state.spool());
     let outcome = coordinator.execute(id).await;
     observe_outcome(state, &outcome);
