@@ -70,6 +70,8 @@ VOICETEXT_TEST_DATABASE_URL=postgresql://.../voicetext_test_<unique> \
 
 It proves that pre-egress accepted work resumes once, interrupted `submitting` work becomes
 terminally unknown without a second provider call, and already persisted work remains terminal.
+The production-composition script executes this exact ignored test after its provider-adapter and
+TypeScript-consumer test, so the same recovery proof is required by CI and tagged releases.
 
 The canary retains only bounded non-secret evidence: selected identity, request/result IDs, fixture
 digest, result digest, timestamps, ACK counts, finalize status, latency, and error classification.

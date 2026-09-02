@@ -340,7 +340,11 @@ impl AudioTiming {
                     return Err(OggOpusValidationError::InvalidGranulePosition);
                 }
             }
-            None if granule < self.page_samples => {
+            // This bounded profile accepts only streams whose PCM timeline starts at zero. For a
+            // non-final first audio page, RFC 7845 granule position is therefore exactly the sum
+            // of the completed packets on that page; accepting a larger absolute offset would
+            // turn an unrelated timeline origin into apparent recording duration.
+            None if granule != self.page_samples => {
                 return Err(OggOpusValidationError::InvalidGranulePosition);
             }
             Some(previous) => {

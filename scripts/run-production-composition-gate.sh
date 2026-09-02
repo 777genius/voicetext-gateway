@@ -22,3 +22,6 @@ VOICETEXT_GATEWAY_PRODUCTION_BINARY="$production_binary" \
   cargo test --locked -p voicetext-gateway --test production_composition_e2e \
   production_binary_matches_the_typescript_consumer_through_real_provider_adapters \
   -- --ignored --exact
+
+cargo test --locked -p voicetext-gateway --test startup_recovery_e2e \
+  durable_startup_recovery_is_exactly_once -- --ignored --exact

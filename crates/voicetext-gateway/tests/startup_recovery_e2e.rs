@@ -121,7 +121,7 @@ async fn durable_startup_recovery_is_exactly_once() {
 
     let profiles = ProfileRegistry::new().with_batch(recognizer.clone());
     let state = GatewayState::new(
-        MachineSecret::from_token(b"recovery-e2e-token").unwrap(),
+        MachineSecret::from_token(b"recovery-e2e-token-32-byte-fixture").unwrap(),
         store.clone(),
         spool,
         profiles,

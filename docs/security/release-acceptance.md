@@ -23,7 +23,8 @@ private repository content in that bundle.
   under the release policy.
 - [ ] Required `exact-head` and `production-composition` jobs pass for the tagged SHA. The latter
   runs the release-mode binary, disposable PostgreSQL, loopback provider fakes, and the
-  SHA-256-pinned independent TypeScript fixture without provider keys or mutable consumer input.
+  SHA-256-pinned independent TypeScript fixture without provider keys or mutable consumer input,
+  then executes the exact ignored durable startup-recovery test against disposable PostgreSQL.
 - [ ] The non-root/read-only/no-new-privileges runtime assertions and mounted-file secret-custody
   checks pass. A rollback image digest and compatible database/spool backup are recorded.
 - [ ] Each real-provider and private-guild gate uses only test identities and synthetic fixtures and

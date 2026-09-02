@@ -61,6 +61,46 @@ fn fixture(serial: u32, final_granule: u64, end_stream: bool) -> Vec<u8> {
     )
 }
 
+fn multipage_fixture(first_page_granule: u64, final_granule: u64) -> Vec<u8> {
+    let mut writer = PacketWriter::new(Vec::new());
+    writer
+        .write_packet(
+            identification_header(312),
+            SERIAL,
+            PacketWriteEndInfo::EndPage,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_packet(comment_header(), SERIAL, PacketWriteEndInfo::EndPage, 0)
+        .unwrap();
+    writer
+        .write_packet(
+            Vec::from(SILENCE),
+            SERIAL,
+            PacketWriteEndInfo::NormalPacket,
+            0,
+        )
+        .unwrap();
+    writer
+        .write_packet(
+            Vec::from(SILENCE),
+            SERIAL,
+            PacketWriteEndInfo::EndPage,
+            first_page_granule,
+        )
+        .unwrap();
+    writer
+        .write_packet(
+            Vec::from(SILENCE),
+            SERIAL,
+            PacketWriteEndInfo::EndStream,
+            final_granule,
+        )
+        .unwrap();
+    writer.into_inner()
+}
+
 #[test]
 fn validates_complete_mono_stream_and_rounds_duration_up() {
     let validated = validate_complete_ogg_opus(&fixture(SERIAL, 960, true)).unwrap();
@@ -69,6 +109,24 @@ fn validates_complete_mono_stream_and_rounds_duration_up() {
     assert_eq!(validated.duration_samples, 648);
     assert_eq!(validated.duration_millis, 14);
     assert_eq!(validated.audio_packet_count, 1);
+}
+
+#[test]
+fn validates_zero_origin_multi_packet_and_multi_page_stream() {
+    let validated = validate_complete_ogg_opus(&multipage_fixture(1_920, 2_880)).unwrap();
+
+    assert_eq!(validated.pre_skip_samples, 312);
+    assert_eq!(validated.duration_samples, 2_568);
+    assert_eq!(validated.duration_millis, 54);
+    assert_eq!(validated.audio_packet_count, 3);
+}
+
+#[test]
+fn rejects_large_first_audio_page_timeline_offset() {
+    assert_eq!(
+        validate_complete_ogg_opus(&multipage_fixture(48_001_920, 48_002_880)),
+        Err(OggOpusValidationError::InvalidGranulePosition)
+    );
 }
 
 #[test]
