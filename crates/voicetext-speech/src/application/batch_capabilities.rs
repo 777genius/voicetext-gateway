@@ -103,6 +103,10 @@ pub enum BatchCapabilityError {
 
 impl BatchCapabilityDescriptor {
     /// Rejects unsupported or out-of-bound features before a provider can be called.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first unsupported capability or invalid bounded request value.
     pub fn validate(
         &self,
         request: &BatchCapabilityRequest<'_>,

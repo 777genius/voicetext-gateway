@@ -92,6 +92,10 @@ pub enum LiveCapabilityError {
 
 impl LiveCapabilityDescriptor {
     /// Rejects unsupported or out-of-bound features before a provider can be called.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first unsupported capability or invalid bounded request value.
     pub fn validate(&self, request: &LiveCapabilityRequest<'_>) -> Result<(), LiveCapabilityError> {
         if request.timestamps && self.timestamps == LiveTimestampCapability::None {
             return Err(LiveCapabilityError::UnsupportedTimestamps);
