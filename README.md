@@ -31,8 +31,10 @@ The domain and application layers know no provider SDK or wire type. Batch and l
 consumer-owned ports; adapters implement only capabilities they actually support. Composition binds
 an exact provider/model before a job or session starts, and automatic provider fallback is forbidden.
 
-Deepgram and ElevenLabs are the native qualified adapters in V1. A new provider can be added without
-changing Discord or the domain state machines, but must pass the same conformance suite.
+Deepgram and ElevenLabs are the native qualified adapters in V1. A new provider can implement the
+narrow ports without changing domain or application code, but must pass the same conformance suite.
+Exposing it as a new public V1 profile still requires an explicit identity/config addition in
+gateway composition and each consumer's closed profile union.
 
 Pipecat is intentionally not included. A future optional sidecar adapter is documented in
 [`docs/extensions/pipecat.md`](docs/extensions/pipecat.md) and must pass conformance before it can be
