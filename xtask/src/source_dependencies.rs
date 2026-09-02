@@ -69,18 +69,17 @@ impl ModuleIndex {
             let Some(root) = source_roots.iter().find(|root| file.starts_with(root)) else {
                 continue;
             };
-            if let Some(module) = module_path(root, file) {
-                if let Some(existing) = modules.insert((root.clone(), module.clone()), file.clone())
-                    && existing != *file
-                    && (!module.is_empty() || !standard_root_pair(&existing, file))
-                {
-                    errors.push(format!(
-                        "ambiguous first-party module `{}` for {} and {}",
-                        module.join("::"),
-                        existing.display(),
-                        file.display()
-                    ));
-                }
+            if let Some(module) = module_path(root, file)
+                && let Some(existing) = modules.insert((root.clone(), module.clone()), file.clone())
+                && existing != *file
+                && (!module.is_empty() || !standard_root_pair(&existing, file))
+            {
+                errors.push(format!(
+                    "ambiguous first-party module `{}` for {} and {}",
+                    module.join("::"),
+                    existing.display(),
+                    file.display()
+                ));
             }
         }
         Self { modules, crates }
