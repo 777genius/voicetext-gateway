@@ -161,6 +161,11 @@ pub struct BatchResultProjectionFailure;
 /// Consumer-owned check performed before a successful provider result becomes durable completion.
 pub trait BatchResultProjection: Send + Sync {
     /// Validates the exact externally served projection without exposing serialization here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchResultProjectionFailure`] when the result cannot be represented by the
+    /// consumer-owned completion contract.
     fn validate(
         &self,
         id: &BatchJobId,
