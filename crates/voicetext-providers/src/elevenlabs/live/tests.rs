@@ -196,7 +196,15 @@ async fn connect_stall_is_cancelled_at_the_exact_bound() {
     let factory = ElevenLabsLiveRecognizer::new("key", endpoint).unwrap();
     let opening =
         tokio::spawn(async move { factory.open(recognition_request(16_000, "multi")).await });
+    // Poll the spawned task once so the TCP handshake and timeout registration have started.
+    tokio::task::yield_now().await;
     accepted_rx.await.unwrap();
+    // Let the spawned client poll through the handshake and arm its timeout before advancing
+    // the paused clock. Without these scheduling points the exact-boundary assertion races with
+    // task startup and can leave the test waiting forever for a timer that was never registered.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
     tokio::time::advance(CONNECT_TIMEOUT).await;
     let error = opening.await.unwrap().err().unwrap();
     assert_eq!(error.code(), "ELEVENLABS_LIVE_CONNECT_TIMEOUT");
