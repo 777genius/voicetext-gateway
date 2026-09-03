@@ -6,25 +6,27 @@ the gateway requests, normalizes, and exposes through its versioned contracts.
 
 ## Qualification terms
 
-- **Implemented** means the native Rust adapter and gateway composition exist.
-- **Conformance-qualified** means deterministic contract, adapter-wire, and gateway tests cover the
-  capability with synthetic audio and local provider fakes. These tests make no paid request.
-- **Provider-qualified language** requires a retained, test-only real-provider canary for that exact
-  provider, model, mode, language selection, and synthetic fixture. Provider documentation, an
-  accepted language code, or a fake-provider test is not qualification evidence.
+- **Implemented** means the Rust adapter and gateway composition exist.
+- **Conformance-tested** means deterministic contract, adapter-wire, and gateway tests cover the
+  capability with synthetic audio and local provider fakes. These tests make no paid request and do
+  not qualify real-provider behavior or recognition quality.
+- **Real-provider-qualified** requires a retained, test-only canary receipt tied to the exact source
+  revision and image digest, provider, model, mode, language selection, and synthetic fixture.
+  Provider documentation, an accepted language code, or a fake-provider test is not qualification
+  evidence.
 
-All four native profiles below are implemented and conformance-qualified. This repository does not
-contain retained real-provider canary evidence that qualifies English or Russian recognition
-quality for any row. The canaries remain opt-in publication gates. Accordingly, `multi`, `en`,
-`en-US`, and `ru` below describe configured or accepted routing, not a universal language-quality
-claim.
+All four profiles below are implemented and conformance-tested. This repository does not contain
+retained real-provider canary receipts tied to an exact revision that qualify English or Russian
+recognition quality for any row. The canaries remain opt-in publication gates. Accordingly, `multi`,
+`en`, `en-US`, and `ru` below describe configured or accepted routing, not a universal
+language-quality claim.
 
 The exact mapping from each claim to checked-in conformance tests and the additional bounded canary
 record required for publication is maintained in the
 [`release acceptance checklist`](security/release-acceptance.md). Missing real-provider evidence
 means “unqualified,” never “implicitly supported.”
 
-## Current native adapters
+## Current provider adapters
 
 | Provider / model | Mode and contract | Gateway input | Timestamps exposed | Partials and finals | Finalize | Keyterms | Diarization / speakers | Language selection and qualification |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |

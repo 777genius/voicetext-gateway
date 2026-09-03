@@ -31,8 +31,12 @@ The domain and application layers know no provider SDK or wire type. Batch and l
 consumer-owned ports; adapters implement only capabilities they actually support. Composition binds
 an exact provider/model before a job or session starts, and automatic provider fallback is forbidden.
 
-Deepgram and ElevenLabs are the native qualified adapters in V1. A new provider can implement the
-narrow ports without changing domain or application code, but must pass the same conformance suite.
+Deepgram and ElevenLabs are the implemented provider adapters in V1, with deterministic conformance
+coverage. That does not by itself qualify provider behavior or recognition quality: real-provider
+qualification requires a retained, test-only canary receipt tied to the exact source revision and
+image digest, provider/model, mode, language selection and synthetic fixture. A new provider can
+implement the narrow ports without changing domain or application code, but must pass the same
+conformance suite before it can be advertised as supported.
 Exposing it as a new public V1 profile still requires an explicit identity/config addition in
 gateway composition and each consumer's closed profile union.
 
