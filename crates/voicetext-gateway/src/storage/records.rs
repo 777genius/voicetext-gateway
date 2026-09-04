@@ -7,7 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchJobId, BatchJobSnapshot, BatchReadableSegment, BatchRecognitionResult,
-    BatchSegment, ProviderOperationKind, ProviderReference,
+    BatchSegment, ProviderReference,
 };
 use voicetext_speech::domain::batch::{
     BatchFailure, BatchJob, BatchJobState, BatchProfile, BatchRequestFingerprint,
@@ -84,18 +84,18 @@ struct ResultRecord {
     provider_duration_millis: Option<u64>,
     segments: Vec<SegmentRecord>,
     readable_segments: Option<Vec<ReadableRecord>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    provider_operation_kind: Option<OperationKindRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-enum OperationKindRecord {
-    #[serde(rename = "request_id")]
-    Request,
-    #[serde(rename = "transcription_id")]
-    Transcription,
-    #[serde(rename = "session_id")]
-    Session,
+/// Exact rollback decoder shape from baseline b9f2c73.
+#[cfg(test)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BaselineResultRecord {
+    pub text: String,
+    pub duration_millis: u64,
+    pub provider_duration_millis: Option<u64>,
+    pub segments: Vec<Value>,
+    pub readable_segments: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -460,15 +460,6 @@ fn serialize_result(
                 })
                 .collect()
         }),
-        provider_operation_kind: result
-            .provider_reference
-            .as_ref()
-            .and_then(ProviderReference::provider_operation)
-            .map(|operation| match operation.kind() {
-                ProviderOperationKind::RequestId => OperationKindRecord::Request,
-                ProviderOperationKind::TranscriptionId => OperationKindRecord::Transcription,
-                ProviderOperationKind::SessionId => OperationKindRecord::Session,
-            }),
     };
     let value = serde_json::to_string(&record).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
     bounded_json(&value)?;
@@ -485,17 +476,6 @@ fn restore_result(
     bounded_json(&value)?;
     let record: ResultRecord =
         serde_json::from_str(&value).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
-    let provider_reference = match (record.provider_operation_kind, provider_reference) {
-        (Some(kind), Some(reference)) => Some(ProviderReference::operation(
-            match kind {
-                OperationKindRecord::Request => ProviderOperationKind::RequestId,
-                OperationKindRecord::Transcription => ProviderOperationKind::TranscriptionId,
-                OperationKindRecord::Session => ProviderOperationKind::SessionId,
-            },
-            reference.as_str(),
-        )),
-        (_, reference) => reference,
-    };
     let result = BatchRecognitionResult {
         profile: profile.clone(),
         text: record.text,

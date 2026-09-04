@@ -37,8 +37,21 @@ pub(crate) async fn execute_fenced(
         capture: &capture,
     };
     let coordinator = BatchCoordinator::new(&observed, state.jobs(), state.spool());
-    let outcome = coordinator.execute(id, &GatewayBatchResultProjection).await;
+    let execution = coordinator
+        .execute_with_cleanup_report(id, &GatewayBatchResultProjection)
+        .await;
+    let (outcome, cleanup_failure) = match execution {
+        Ok(report) => (Ok(report.outcome), report.post_persistence_cleanup_failure),
+        Err(failure) => (Err(failure), None),
+    };
     observe_outcome(state, &outcome);
+    if let Some(failure) = cleanup_failure {
+        tracing::warn!(
+            job_id = %id.as_str(),
+            ?failure,
+            "batch outcome persisted but terminal spool cleanup failed"
+        );
+    }
     let capture = capture
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

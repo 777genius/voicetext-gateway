@@ -321,7 +321,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::storage::records::{JobRecord, MAX_SERIALIZED_RESULT_BYTES, WritableRecord};
+    use crate::storage::records::{
+        BaselineResultRecord, JobRecord, MAX_SERIALIZED_RESULT_BYTES, WritableRecord,
+    };
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use voicetext_speech::application::ports::{
         BatchRecognitionResult, BatchSegment, ProviderOperationKind, ProviderReference,
@@ -406,35 +408,36 @@ mod tests {
     }
 
     #[test]
-    fn typed_operation_round_trip_and_older_untyped_record_remain_distinct() {
+    fn typed_operation_keeps_baseline_result_json_byte_compatible_and_reloads_untyped() {
         let mut typed = snapshot();
         let reference = ProviderReference::operation(ProviderOperationKind::RequestId, "request-1");
         typed.provider_reference = Some(reference.clone());
         typed.result.as_mut().unwrap().provider_reference = Some(reference);
-        let restored =
-            BatchJobSnapshot::try_from(job_record(WritableRecord::try_from(&typed).unwrap()))
-                .unwrap();
-        assert_eq!(restored, typed);
+        let writable = WritableRecord::try_from(&typed).unwrap();
+        let exact = writable.result_text.as_deref().unwrap();
         assert_eq!(
-            restored
-                .provider_reference
-                .unwrap()
-                .provider_operation()
-                .unwrap()
-                .kind(),
-            ProviderOperationKind::RequestId
+            exact,
+            r#"{"text":"hello","duration_millis":100,"provider_duration_millis":100,"segments":[{"start_millis":0,"end_millis":100,"text":"hello","confidence":0.9,"speaker":null}],"readable_segments":null}"#
         );
+        let baseline: BaselineResultRecord = serde_json::from_str(exact).unwrap();
+        assert_eq!(baseline.text, "hello");
+        assert_eq!(baseline.duration_millis, 100);
+        assert_eq!(baseline.provider_duration_millis, Some(100));
+        assert_eq!(baseline.segments.len(), 1);
+        assert!(baseline.readable_segments.is_none());
 
-        let older = snapshot();
-        let restored =
-            BatchJobSnapshot::try_from(job_record(WritableRecord::try_from(&older).unwrap()))
-                .unwrap();
+        let restored = BatchJobSnapshot::try_from(job_record(writable)).unwrap();
         assert!(
             restored
                 .provider_reference
+                .as_ref()
                 .unwrap()
                 .provider_operation()
                 .is_none()
+        );
+        assert_eq!(
+            restored.result.unwrap().provider_reference,
+            restored.provider_reference
         );
     }
 
