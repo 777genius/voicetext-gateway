@@ -10,12 +10,14 @@ line_of() {
 quarantine=$(line_of "Build exact remote source into the job-local quarantine registry")
 scan=$(line_of "Apply fail-closed vulnerability policy")
 acceptance=$(line_of "Consume protected reviewer and provider-canary evidence")
+authorization=$(line_of "Verify actual independent publication environment review")
 stage=$(line_of "Stage the verified digest under a deterministic quarantine identity")
 attest=$(line_of "Cryptographically attest source-to-image build provenance")
 verify=$(line_of "Verify registry attestations against the exact repository identity")
 assets=$(line_of "Publish evidence as immutable release-lifetime assets")
 publish=$(line_of "Publish final public image tags as the last irreversible step")
 
+test "$authorization" -lt "$quarantine"
 test "$quarantine" -lt "$scan"
 test "$scan" -lt "$acceptance"
 test "$acceptance" -lt "$stage"
@@ -25,9 +27,16 @@ test "$verify" -lt "$assets"
 test "$assets" -lt "$publish"
 test -z "$(tail -n +$((publish + 1)) "$workflow" | grep -E '^[[:space:]]+- name:' || true)"
 grep -F 'environment: release-publication' "$workflow" >/dev/null
+test "$(grep -cF 'actions: read' .github/workflows/canary-approval.yml)" -eq 1
+test "$(grep -cF 'actions: read' "$workflow")" -eq 1
 grep -F 'quarantine_tag="quarantine-${SOURCE_SHA}"' "$workflow" >/dev/null
 grep -F 'scripts/verify-release-acceptance.sh "$SOURCE_SHA"' "$workflow" >/dev/null
 grep -F 'environment: canary-approval' .github/workflows/canary-approval.yml >/dev/null
+canary_guard=$(grep -nF "Verify actual independent canary environment review" \
+  .github/workflows/canary-approval.yml | cut -d: -f1)
+canary_artifact=$(grep -nF "Create canonical protected-environment approval" \
+  .github/workflows/canary-approval.yml | cut -d: -f1)
+test "$canary_guard" -lt "$canary_artifact"
 grep -F 'test "${{ github.workflow_sha }}" = "$SOURCE_SHA"' .github/workflows/canary-approval.yml >/dev/null
 grep -F 'uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8' .github/workflows/canary-approval.yml >/dev/null
 grep -F 'durable_startup_recovery_is_exactly_once -- --ignored --exact' \

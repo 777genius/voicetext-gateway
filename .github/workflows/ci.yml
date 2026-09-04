@@ -76,7 +76,11 @@ jobs:
         run: |
           sh -n scripts/create-release-evidence.sh scripts/verify-release-evidence.sh \
             scripts/run-production-composition-gate.sh scripts/test-release-evidence.sh \
-            scripts/verify-release-acceptance.sh scripts/test-release-workflow.sh
+            scripts/verify-release-acceptance.sh scripts/test-release-workflow.sh \
+            scripts/test-github-environment-review.sh
+          python3 -c 'compile(open("scripts/verify-github-environment-review.py").read(), \
+            "scripts/verify-github-environment-review.py", "exec")'
+          scripts/test-github-environment-review.sh
           scripts/test-release-evidence.sh
           scripts/test-release-workflow.sh
 
@@ -189,6 +193,7 @@ jobs:
         ports:
           - 5000:5000
     permissions:
+      actions: read
       attestations: write
       contents: write
       id-token: write
@@ -205,6 +210,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ env.SOURCE_SHA }}
+
+      - name: Verify actual independent publication environment review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-github-environment-review.py \
+            '${{ github.repository }}' release-publication '${{ github.run_id }}' \
+            '${{ github.run_attempt }}' '${{ github.actor }}' '${{ github.actor_id }}'
 
       - name: Assert annotated release identity and clean tree
         run: |

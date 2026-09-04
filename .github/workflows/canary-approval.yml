@@ -17,6 +17,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: write
   attestations: write
   id-token: write
@@ -32,6 +33,14 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
           ref: ${{ inputs.source_sha }}
+
+      - name: Verify actual independent canary environment review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-github-environment-review.py \
+            '${{ github.repository }}' canary-approval '${{ github.run_id }}' \
+            '${{ github.run_attempt }}' '${{ github.actor }}' '${{ github.actor_id }}'
 
       - name: Validate immutable candidate identity
         env:

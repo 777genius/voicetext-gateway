@@ -134,6 +134,20 @@ Do not retry or switch providers under the same idempotency key. Retain the sour
 identity, provider reference, and logs, then reconcile manually. A new provider effect requires an
 explicit new job identity and operator decision.
 
+### Release authorization is refused
+
+Confirm the workflow is running in exactly `777genius/voicetext-gateway` and that the applicable
+`canary-approval` or `release-publication` environment has a nonempty required-reviewer rule with
+self-review prevention enabled. The run must contain exactly one unambiguous approved review for
+that environment by a human other than the workflow actor. API errors, missing or changed
+environment IDs, rejected or bot reviews, and empty review history deliberately stop the job before
+approval evidence or publication effects.
+
+Do not rerun a failed attempt: GitHub exposes review history for the run but cannot bind it to an
+individual attempt, so the guard refuses every attempt after the first. Start a new run and obtain a
+fresh environment review. Disable administrator bypass in repository settings and audit it there;
+the documented environment REST response has no administrator-bypass field for the guard to check.
+
 ### Timestamps or transcript shape are rejected
 
 Check that the selected provider/model identity matches the job, timestamps are finite, monotonic,

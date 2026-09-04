@@ -83,7 +83,10 @@ exists.
 
 For a `v*` tag, `release-evidence` runs only after both required jobs succeed and enters the
 protected `release-publication` environment. Configure both that environment and the separate
-`canary-approval` environment with required reviewers who cannot be bypassed by a committer. The
+`canary-approval` environment with at least one required user or team, enable prevention of
+self-review, and disable administrator bypass in repository settings. The documented REST
+environment response does not expose an administrator-bypass field, so the workflow cannot claim
+to verify that setting through the API; repository owners must audit it separately. The
 operator first creates a draft GitHub Release for the exact tag and attaches the retained, real
 canary's canonical `provider-canary.json`, `campaign-manifest.json`, and `fixture-manifest.json`.
 These records come from the test-only runner identity pinned in `security/release-trust-policy.json`
@@ -91,15 +94,24 @@ and carry its exact revision; they are not hand-authored PASS claims. Retain run
 synthetic fixture, and bounded provider receipts for audit (never credentials, customer audio, or
 provider response bodies).
 
-Dispatch `.github/workflows/canary-approval.yml` at the candidate source SHA. Its protected
-`canary-approval` review verifies the candidate tag/image, trusted runner identity, strict canonical
+Dispatch `.github/workflows/canary-approval.yml` at the candidate source SHA. Before creating any
+approval record, the job reads the exact repository environment and this run's review history. It
+requires the expected environment name and ID, a nonempty `required_reviewers` rule with
+`prevent_self_review=true`, and exactly one approved review for that environment by a human other
+than the workflow actor. Missing, rejected, mismatched, bot, self, duplicate, unreadable, or
+ambiguous evidence fails closed. Because GitHub's review-history endpoint is run-scoped rather than
+attempt-scoped, reruns are refused; dispatch a new run and obtain a new review instead. The protected
+`canary-approval` review then verifies the candidate tag/image, trusted runner identity, strict canonical
 records, manifest bindings, and all eight fresh effects. It emits `reviewer-approval.json` whose
 SHA-256 bindings cover the canary payload, both manifests, trust policy, exact source SHA, image
 digest, campaign ID, and runner identity/revision. GitHub OIDC signs that approval as a
 build-provenance attestation, which is attached as `reviewer-approval.sigstore.json` without
 overwrite. No private signing key or caller-selected trust root is accepted.
 
-The publication workflow downloads all five records and verifies the attestation against the
+The publication job applies the same live configuration and independent-review check to its
+`release-publication` environment before any image staging, attestation, release upload, or public
+tagging. Current environment configuration is not treated as historical approval. The publication
+workflow downloads all five records and verifies the attestation against the
 repository, exact candidate workflow revision, checked-in signer workflow, and GitHub-hosted runner
 before staging or publishing a public tag. A committer may write canary-shaped JSON, but cannot
 produce the OIDC attestation from the protected job without its independent environment review.
