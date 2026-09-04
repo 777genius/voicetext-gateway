@@ -108,11 +108,11 @@ fn receipt_wait_cannot_lose_accept_notification() {
         .unwrap();
     release_wait_sender.send(()).unwrap();
 
-    let waited = waited_receiver.recv_timeout(Duration::from_secs(1));
-    if waited.is_err() {
+    let completion = waited_receiver.recv_timeout(Duration::from_secs(1));
+    if completion.is_err() {
         receipt.cancel();
     }
-    assert_eq!(waited.unwrap(), ReceiptState::Accepted);
+    assert_eq!(completion.unwrap(), ReceiptState::Accepted);
     assert!(accepter.join().unwrap());
     waiter.join().unwrap();
 }
