@@ -389,7 +389,7 @@ async fn submit(client: &reqwest::Client, origin: &str) -> reqwest::Response {
                 .text("language", "multi")
                 .text("keyterms", "[]")
                 .part(
-                    "audio",
+                    "file",
                     Part::bytes(support::synthetic_ogg_opus())
                         .file_name("audio.ogg")
                         .mime_str("audio/ogg")
