@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+PYTHONDONTWRITEBYTECODE=1; export PYTHONDONTWRITEBYTECODE
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
@@ -88,6 +89,35 @@ rebind_approval() {
      fixture_manifest_sha256:$fixtures,trust_policy_sha256:$policy}' >"$acceptance/reviewer-approval.json"
 }
 rebind_approval
+sync_canary_to_campaign() {
+  campaign_sha=$(sha256sum "$acceptance/campaign-manifest.json" | cut -d' ' -f1)
+  jq -S -c --arg campaign_sha "$campaign_sha" \
+    --slurpfile manifest "$acceptance/campaign-manifest.json" '
+    def found($position): $manifest[0].effects[] | select(.position == $position);
+    def bind_effect:
+      found(.position) as $campaign
+      | .fixture_id = $campaign.fixture_id
+      | .fixture_digest = $campaign.fixture_digest
+      | .result_digest = $campaign.result_digest
+      | .effect_id = $campaign.effect_id
+      | .provider_operation = $campaign.provider_operation
+      | if .mode == "batch" then
+          .provider_terminal.provider_operation = $campaign.provider_operation
+          | .provider_terminal.effect_id = $campaign.effect_id
+          | .provider_terminal.result_digest = $campaign.result_digest
+        else
+          .finalize.provider_operation = $campaign.provider_operation
+          | .finalize.effect_id = $campaign.effect_id
+          | .finalize.result_digest = $campaign.result_digest
+        end;
+    .campaign_manifest_sha256 = $campaign_sha
+    | .checks |= map(
+        .batch = (if .batch == null then null else (.batch | bind_effect) end)
+        | .live = (if .live == null then null else (.live | bind_effect) end)
+      )
+  ' "$acceptance/provider-canary.json" >"$sandbox/provider-canary.synced.json"
+  mv "$sandbox/provider-canary.synced.json" "$acceptance/provider-canary.json"
+}
 printf '%s\n' '{}' >"$acceptance/reviewer-approval.sigstore.json"
 cat >"$sandbox/bin/gh" <<'MOCK'
 #!/bin/sh
@@ -109,27 +139,43 @@ scripts/verify-release-acceptance.sh "$source_sha" "$image_digest" "$evidence"
 scripts/create-release-evidence.sh "$source_sha" ghcr.io/777genius/voicetext-gateway "$image_digest" "$evidence"
 scripts/verify-release-evidence.sh "$evidence"
 
+verifier=scripts/verify_release_acceptance.py
 reject_policy() {
-  description=$1; file=$2; filter=$3
+  description=$1; file=$2; filter=$3; expected=${4-}
   cp "$file" "$sandbox/original.json"
   jq -S -c "$filter" "$sandbox/original.json" >"$file"
+  if [ "$file" = "$acceptance/campaign-manifest.json" ]; then
+    sync_canary_to_campaign
+  fi
   rebind_approval
-  if scripts/verify_release_acceptance.py "$source_sha" "$image_digest" "$evidence" >/dev/null 2>&1; then
-    echo "$description unexpectedly passed" >&2; exit 1
+  result=0
+  if diagnostic=$(PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root/scripts" \
+    python3 "$verifier" "$source_sha" "$image_digest" "$evidence" 2>&1); then
+    echo "$description unexpectedly passed" >&2
+    result=1
+  elif [ -n "$expected" ] && [ "$diagnostic" != "$expected" ]; then
+    echo "$description returned unexpected diagnostic: $diagnostic" >&2
+    result=1
   fi
   mv "$sandbox/original.json" "$file"
+  if [ "$file" = "$acceptance/campaign-manifest.json" ]; then
+    sync_canary_to_campaign
+  fi
   rebind_approval
+  return "$result"
 }
 reject_policy "unknown canary key" "$acceptance/provider-canary.json" '.unexpected=true'
 reject_policy "partial canary" "$acceptance/provider-canary.json" '.checks=.checks[:-1]'
 reject_policy "failed outcome" "$acceptance/provider-canary.json" '.checks[0].batch.outcome="fail"'
 reject_policy "mismatched result digest" "$acceptance/provider-canary.json" '.checks[0].batch.result_digest="sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"'
 reject_policy "bad fixture binding" "$acceptance/campaign-manifest.json" '.effects[0].fixture_digest="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"'
-reject_policy "duplicate provider operation in same role" "$acceptance/campaign-manifest.json" '.effects[2].provider_operation.id=.effects[0].provider_operation.id'
-reject_policy "duplicate provider operation in different role" "$acceptance/campaign-manifest.json" '.effects[7].provider_operation.id=.effects[0].provider_operation.id'
-reject_policy "duplicate provider operation in mixed profile" "$acceptance/campaign-manifest.json" '.effects[3].provider_operation.id=.effects[5].provider_operation.id'
-reject_policy "operation kind relabel cannot hide reuse" "$acceptance/campaign-manifest.json" '.effects[6].provider_operation.id=.effects[4].provider_operation.id'
-reject_policy "duplicate global effect ID" "$acceptance/campaign-manifest.json" '.effects[1].effect_id=.effects[0].effect_id'
+reuse_diagnostic='invalid release acceptance evidence: provider operation was reused'
+effect_diagnostic='invalid release acceptance evidence: effect IDs are not globally unique'
+reject_policy "duplicate provider operation in same role" "$acceptance/campaign-manifest.json" '.effects[2].provider_operation.id=.effects[0].provider_operation.id' "$reuse_diagnostic"
+reject_policy "duplicate provider operation in different role" "$acceptance/campaign-manifest.json" '.effects[7].provider_operation.id=.effects[0].provider_operation.id' "$reuse_diagnostic"
+reject_policy "duplicate provider operation in mixed profile" "$acceptance/campaign-manifest.json" '.effects[3].provider_operation.id=.effects[5].provider_operation.id' "$reuse_diagnostic"
+reject_policy "operation kind relabel cannot hide reuse" "$acceptance/campaign-manifest.json" '.effects[6].provider_operation.id=.effects[4].provider_operation.id' "$reuse_diagnostic"
+reject_policy "duplicate global effect ID" "$acceptance/campaign-manifest.json" '.effects[1].effect_id=.effects[0].effect_id' "$effect_diagnostic"
 reject_policy "wrong operation kind" "$acceptance/campaign-manifest.json" '.effects[0].provider_operation.kind="elevenlabs_transcription_id"'
 reject_policy "missing operation kind" "$acceptance/campaign-manifest.json" 'del(.effects[0].provider_operation.kind)'
 reject_policy "missing operation ID" "$acceptance/campaign-manifest.json" 'del(.effects[0].provider_operation.id)'
@@ -155,6 +201,42 @@ reject_policy "excess timestamp precision" "$acceptance/provider-canary.json" '.
 reject_policy "legacy canary schema" "$acceptance/provider-canary.json" '.schema_version=1'
 reject_policy "legacy campaign schema" "$acceptance/campaign-manifest.json" '.schema_version=1'
 reject_policy "runner mismatch" "$acceptance/provider-canary.json" '.runner.revision="cccccccccccccccccccccccccccccccccccccccc"'
+
+# Mutation-test the four operation anti-reuse cases against an isolated verifier copy with only
+# the production provider-operation uniqueness guard removed. Each regression test must then fail,
+# proving that its rejection depends on that guard rather than a stale canary or SHA binding.
+sed '/        if operation_key in operations:/,+1d' "$verifier" >"$sandbox/verify_release_acceptance_no_operation_uniqueness.py"
+if grep -F 'if operation_key in operations:' "$sandbox/verify_release_acceptance_no_operation_uniqueness.py" >/dev/null; then
+  echo "failed to disable provider-operation uniqueness guard in mutation verifier" >&2; exit 1
+fi
+verifier="$sandbox/verify_release_acceptance_no_operation_uniqueness.py"
+mutation_is_accepted() {
+  filter=$1
+  cp "$acceptance/campaign-manifest.json" "$sandbox/original.json"
+  jq -S -c "$filter" "$sandbox/original.json" >"$acceptance/campaign-manifest.json"
+  sync_canary_to_campaign
+  rebind_approval
+  result=0
+  if ! PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$root/scripts" \
+    python3 "$verifier" "$source_sha" "$image_digest" "$evidence" >/dev/null 2>&1; then
+    result=1
+  fi
+  mv "$sandbox/original.json" "$acceptance/campaign-manifest.json"
+  sync_canary_to_campaign
+  rebind_approval
+  return "$result"
+}
+for mutation in \
+  '.effects[2].provider_operation.id=.effects[0].provider_operation.id' \
+  '.effects[7].provider_operation.id=.effects[0].provider_operation.id' \
+  '.effects[3].provider_operation.id=.effects[5].provider_operation.id' \
+  '.effects[6].provider_operation.id=.effects[4].provider_operation.id'
+do
+  if ! mutation_is_accepted "$mutation"; then
+    echo "anti-reuse mutation was rejected after disabling only the uniqueness guard" >&2; exit 1
+  fi
+done
+verifier=scripts/verify_release_acceptance.py
 
 cp "$acceptance/provider-canary.json" "$sandbox/original.json"
 python3 - "$acceptance/provider-canary.json" <<'PY'

@@ -73,8 +73,9 @@ terminally unknown without a second provider call, and already persisted work re
 The production-composition script executes this exact ignored test after its provider-adapter and
 TypeScript-consumer test, so the same recovery proof is required by CI and tagged releases.
 
-The canary retains only bounded non-secret evidence: selected identity, request/result IDs, fixture
-digest, result digest, timestamps, ACK counts, finalize status, latency, and error classification.
+The canary retains only bounded non-secret evidence: selected identity, the typed actual
+`provider_operation`, a separate gateway `effect_id`, fixture digest, result digest, timestamps,
+ACK counts, finalize status, latency, and error classification.
 
 ## Discord qualification
 
