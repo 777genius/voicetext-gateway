@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use serde_json::Value;
 use std::time::Duration;
 
 const MALFORMED_RESPONSE: &str = "ELEVENLABS_MALFORMED_RESPONSE";
@@ -49,8 +48,8 @@ struct ResponseDto {
     words: Vec<WordDto>,
     #[serde(default)]
     audio_duration_secs: Option<f64>,
-    #[serde(default)]
-    transcription_id: Option<String>,
+    #[serde(default, rename = "transcription_id")]
+    _transcription_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,11 +125,11 @@ pub(super) fn parse_response(
     authoritative_duration_millis: u64,
     header_request_id: Option<String>,
 ) -> Result<ParsedBatchResult, ParseFailure> {
-    let payload: Value = serde_json::from_slice(bytes)
+    let payload: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|_| malformed(header_request_id.clone().map(ProviderIdentity::RequestId)))?;
     let provider_identity = payload
         .get("transcription_id")
-        .and_then(Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .and_then(safe_request_id)
         .map(ProviderIdentity::TranscriptionId)
         .or_else(|| header_request_id.map(ProviderIdentity::RequestId));
