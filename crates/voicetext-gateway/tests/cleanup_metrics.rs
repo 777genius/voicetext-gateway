@@ -391,7 +391,7 @@ async fn submit(client: &reqwest::Client, origin: &str) -> reqwest::Response {
                 .part(
                     "file",
                     Part::bytes(support::synthetic_ogg_opus())
-                        .file_name("audio.ogg")
+                        .file_name("speaker-track.ogg")
                         .mime_str("audio/ogg")
                         .unwrap(),
                 ),
