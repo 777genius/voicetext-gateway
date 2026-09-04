@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use voicetext_speech::application::ports::{
-    BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
-    BoxFuture,
+    BatchAudioHandle, BatchAudioRemoveOutcome, BatchAudioSpool, BatchAudioSpoolFailure,
+    BatchAudioStoreOutcome, BatchJobId, BoxFuture,
 };
 
 /// Durable content-addressed spool rooted in one canonical, non-symlink directory.
@@ -125,18 +125,29 @@ impl DurableFileSpool {
         read_verified_file(&path, parsed.digest, self.maximum_bytes)
     }
 
-    fn remove_blocking(&self, handle: &BatchAudioHandle) -> Result<(), BatchAudioSpoolFailure> {
+    fn remove_blocking(
+        &self,
+        handle: &BatchAudioHandle,
+    ) -> Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure> {
         let _mutation = self.mutation.lock().map_err(|_| invalid_storage())?;
         let parsed = parse_handle(handle.as_str())?;
         let path = self.root.join(handle.as_str());
-        match fs::symlink_metadata(&path) {
+        let outcome = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(invalid_storage());
             }
-            Ok(_) => fs::remove_file(&path).map_err(unavailable)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => match fs::remove_file(&path) {
+                Ok(()) => BatchAudioRemoveOutcome::Removed,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    BatchAudioRemoveOutcome::AlreadyMissing
+                }
+                Err(error) => return Err(unavailable(error)),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                BatchAudioRemoveOutcome::AlreadyMissing
+            }
             Err(error) => return Err(unavailable(error)),
-        }
+        };
 
         let claim = self.root.join(format!("{}.identity", parsed.job_id));
         match read_small_regular_file(&claim, 64) {
@@ -146,7 +157,8 @@ impl DurableFileSpool {
             Ok(_) | Err(BatchAudioSpoolFailure::Missing) => {}
             Err(error) => return Err(error),
         }
-        sync_directory(&self.root)
+        sync_directory(&self.root)?;
+        Ok(outcome)
     }
 }
 
@@ -180,7 +192,7 @@ impl BatchAudioSpool for DurableFileSpool {
     fn remove<'a>(
         &'a self,
         handle: &'a BatchAudioHandle,
-    ) -> BoxFuture<'a, Result<(), BatchAudioSpoolFailure>> {
+    ) -> BoxFuture<'a, Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>> {
         let spool = self.clone();
         let handle = handle.clone();
         Box::pin(async move {
@@ -416,8 +428,14 @@ mod tests {
         };
         assert_eq!(replay, BatchAudioStoreOutcome::Existing(handle.clone()));
         assert_eq!(spool.read(&handle).await.unwrap(), b"audio");
-        spool.remove(&handle).await.unwrap();
-        spool.remove(&handle).await.unwrap();
+        assert_eq!(
+            spool.remove(&handle).await.unwrap(),
+            BatchAudioRemoveOutcome::Removed
+        );
+        assert_eq!(
+            spool.remove(&handle).await.unwrap(),
+            BatchAudioRemoveOutcome::AlreadyMissing
+        );
     }
 
     #[tokio::test]

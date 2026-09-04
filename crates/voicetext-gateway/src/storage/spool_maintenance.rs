@@ -4,7 +4,8 @@ use std::fs;
 use std::time::{Duration, SystemTime};
 
 use voicetext_speech::application::ports::{
-    BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchJobId, BatchJobStore,
+    BatchAudioHandle, BatchAudioRemoveOutcome, BatchAudioSpool, BatchAudioSpoolFailure, BatchJobId,
+    BatchJobStore,
 };
 
 use super::spool::{DurableFileSpool, parse_handle, spool_audio_bytes};
@@ -76,12 +77,14 @@ impl DurableFileSpool {
             match snapshot {
                 Some(snapshot) if snapshot.audio != handle => return Err(ledger_failure()),
                 Some(snapshot) if snapshot.job.state().is_terminal() => {
-                    self.remove(&handle).await?;
-                    report.terminal_removed = report.terminal_removed.saturating_add(1);
+                    if self.remove(&handle).await? == BatchAudioRemoveOutcome::Removed {
+                        report.terminal_removed = report.terminal_removed.saturating_add(1);
+                    }
                 }
                 None if expired(&metadata, now, retention) => {
-                    self.remove(&handle).await?;
-                    report.orphan_removed = report.orphan_removed.saturating_add(1);
+                    if self.remove(&handle).await? == BatchAudioRemoveOutcome::Removed {
+                        report.orphan_removed = report.orphan_removed.saturating_add(1);
+                    }
                 }
                 Some(_) | None => report.preserved = report.preserved.saturating_add(1),
             }

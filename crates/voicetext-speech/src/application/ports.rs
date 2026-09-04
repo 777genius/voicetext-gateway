@@ -363,6 +363,15 @@ pub enum BatchAudioStoreOutcome {
     Existing(BatchAudioHandle),
 }
 
+/// Idempotent outcome of removing one durable batch-audio artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchAudioRemoveOutcome {
+    /// The artifact existed and this call removed it.
+    Removed,
+    /// The artifact was already absent, so this call made no custody change.
+    AlreadyMissing,
+}
+
 /// Durable atomic batch-audio storage capability.
 pub trait BatchAudioSpool: Send + Sync {
     /// Atomically stores bytes for one job and reports whether this call owns the artifact.
@@ -382,7 +391,7 @@ pub trait BatchAudioSpool: Send + Sync {
     fn remove<'a>(
         &'a self,
         handle: &'a BatchAudioHandle,
-    ) -> BoxFuture<'a, Result<(), BatchAudioSpoolFailure>>;
+    ) -> BoxFuture<'a, Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>>;
 }
 
 /// Immutable live provider/model identity selected before opening a session.

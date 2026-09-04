@@ -4,11 +4,11 @@ use std::sync::Mutex;
 use voicetext_gateway::contracts::batch::BatchIdentity;
 
 use voicetext_speech::application::ports::{
-    BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
-    BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore, BatchJobStoreFailure,
-    BatchJobUpdateOutcome, BatchReadableSegment, BatchRecognitionRequest, BatchRecognitionResult,
-    BatchRecognizer, BatchSegment, BoxFuture, ProviderOperationKind, ProviderReference,
-    RecognitionFailure,
+    BatchAudioHandle, BatchAudioRemoveOutcome, BatchAudioSpool, BatchAudioSpoolFailure,
+    BatchAudioStoreOutcome, BatchJobId, BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore,
+    BatchJobStoreFailure, BatchJobUpdateOutcome, BatchReadableSegment, BatchRecognitionRequest,
+    BatchRecognitionResult, BatchRecognizer, BatchSegment, BoxFuture, ProviderOperationKind,
+    ProviderReference, RecognitionFailure,
 };
 use voicetext_speech::domain::batch::BatchJob;
 
@@ -137,9 +137,13 @@ impl BatchAudioSpool for FakeBatchInfrastructure {
     fn remove<'a>(
         &'a self,
         handle: &'a BatchAudioHandle,
-    ) -> BoxFuture<'a, Result<(), BatchAudioSpoolFailure>> {
-        self.audio.lock().unwrap().remove(handle.as_str());
-        Box::pin(async { Ok(()) })
+    ) -> BoxFuture<'a, Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>> {
+        let outcome = if self.audio.lock().unwrap().remove(handle.as_str()).is_some() {
+            BatchAudioRemoveOutcome::Removed
+        } else {
+            BatchAudioRemoveOutcome::AlreadyMissing
+        };
+        Box::pin(async move { Ok(outcome) })
     }
 }
 

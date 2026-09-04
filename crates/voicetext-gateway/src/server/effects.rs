@@ -10,8 +10,8 @@ use voicetext_speech::application::batch::{
 };
 use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
 use voicetext_speech::application::ports::{
-    BatchJobId, BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer, BoxFuture,
-    ProviderReference, RecognitionFailure,
+    BatchAudioRemoveOutcome, BatchJobId, BatchRecognitionRequest, BatchRecognitionResult,
+    BatchRecognizer, BoxFuture, ProviderReference, RecognitionFailure,
 };
 use voicetext_speech::domain::batch::BatchJobState;
 
@@ -40,6 +40,7 @@ impl FencedExecution {
 enum TerminalCleanup {
     NotRequired,
     Removed,
+    AlreadyMissing,
     Retained,
 }
 
@@ -61,25 +62,24 @@ pub(crate) async fn execute_fenced(
         .await;
     let (outcome, terminal_cleanup, cleanup_failure) = match execution {
         Ok(report) => {
-            let terminal_cleanup = match &report.outcome {
-                BatchExecutionOutcome::Persisted(snapshot)
+            let terminal_cleanup = match (&report.outcome, &report.post_persistence_cleanup) {
+                (
+                    BatchExecutionOutcome::Persisted(snapshot),
+                    Some(Ok(BatchAudioRemoveOutcome::Removed)),
+                ) if snapshot.job.state().is_terminal() => TerminalCleanup::Removed,
+                (
+                    BatchExecutionOutcome::Persisted(snapshot),
+                    Some(Ok(BatchAudioRemoveOutcome::AlreadyMissing)),
+                ) if snapshot.job.state().is_terminal() => TerminalCleanup::AlreadyMissing,
+                (BatchExecutionOutcome::Persisted(snapshot), Some(Err(_)))
                     if snapshot.job.state().is_terminal() =>
                 {
-                    if report.post_persistence_cleanup_failure.is_some() {
-                        TerminalCleanup::Retained
-                    } else {
-                        TerminalCleanup::Removed
-                    }
+                    TerminalCleanup::Retained
                 }
-                BatchExecutionOutcome::Persisted(_)
-                | BatchExecutionOutcome::NotClaimed(_)
-                | BatchExecutionOutcome::NotActionable(_) => TerminalCleanup::NotRequired,
+                _ => TerminalCleanup::NotRequired,
             };
-            (
-                Ok(report.outcome),
-                terminal_cleanup,
-                report.post_persistence_cleanup_failure,
-            )
+            let cleanup_failure = report.post_persistence_cleanup.and_then(Result::err);
+            (Ok(report.outcome), terminal_cleanup, cleanup_failure)
         }
         Err(failure) => (Err(failure), TerminalCleanup::NotRequired, None),
     };

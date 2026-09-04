@@ -3,7 +3,7 @@ mod support;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,10 +23,10 @@ use voicetext_speech::application::batch::{
     BatchAdmissionOutcome, BatchAdmissionRequest, BatchCoordinator,
 };
 use voicetext_speech::application::ports::{
-    BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
-    BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore, BatchJobStoreFailure,
-    BatchJobUpdateOutcome, BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer,
-    BatchSegment, BoxFuture, ProviderReference, RecognitionFailure,
+    BatchAudioHandle, BatchAudioRemoveOutcome, BatchAudioSpool, BatchAudioSpoolFailure,
+    BatchAudioStoreOutcome, BatchJobId, BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore,
+    BatchJobStoreFailure, BatchJobUpdateOutcome, BatchRecognitionRequest, BatchRecognitionResult,
+    BatchRecognizer, BatchSegment, BoxFuture, ProviderReference, RecognitionFailure,
 };
 use voicetext_speech::domain::batch::{
     BatchJob, BatchJobState, BatchProfile, BatchRequestFingerprint,
@@ -35,18 +35,26 @@ use voicetext_speech::domain::batch::{
 const TOKEN: &str = "cleanup-metrics-test-token-000001";
 const IDEMPOTENCY_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[derive(Clone, Copy, Debug, Default)]
+enum RemoveMode {
+    #[default]
+    Present,
+    AlreadyMissing,
+    Failure,
+}
+
 #[derive(Debug, Default)]
 struct CleanupInfrastructure {
     jobs: Mutex<BTreeMap<String, BatchJobSnapshot>>,
     audio: Mutex<BTreeMap<String, Vec<u8>>>,
-    fail_remove: AtomicBool,
+    remove_mode: RemoveMode,
     remove_calls: AtomicUsize,
 }
 
 impl CleanupInfrastructure {
-    fn with_remove_failure(fail_remove: bool) -> Self {
+    fn with_remove_mode(remove_mode: RemoveMode) -> Self {
         Self {
-            fail_remove: AtomicBool::new(fail_remove),
+            remove_mode,
             ..Self::default()
         }
     }
@@ -175,23 +183,39 @@ impl BatchAudioSpool for CleanupInfrastructure {
     fn remove<'a>(
         &'a self,
         handle: &'a BatchAudioHandle,
-    ) -> BoxFuture<'a, Result<(), BatchAudioSpoolFailure>> {
+    ) -> BoxFuture<'a, Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>> {
         self.remove_calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_remove.load(Ordering::SeqCst) {
+        if matches!(self.remove_mode, RemoveMode::Failure) {
             return Box::pin(async {
                 Err(BatchAudioSpoolFailure::Unavailable {
                     code: "SYNTHETIC_REMOVE_FAILURE".into(),
                 })
             });
         }
-        self.audio.lock().unwrap().remove(handle.as_str());
-        Box::pin(async { Ok(()) })
+        let mut audio = self.audio.lock().unwrap();
+        let outcome = if audio.remove(handle.as_str()).is_some() {
+            BatchAudioRemoveOutcome::Removed
+        } else {
+            BatchAudioRemoveOutcome::AlreadyMissing
+        };
+        Box::pin(async move { Ok(outcome) })
     }
 }
 
 #[derive(Debug, Default)]
 struct CountingRecognizer {
     calls: AtomicUsize,
+    remove_before_completion: Option<Arc<CleanupInfrastructure>>,
+}
+
+impl CountingRecognizer {
+    fn for_cleanup(remove_mode: RemoveMode, infrastructure: &Arc<CleanupInfrastructure>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            remove_before_completion: matches!(remove_mode, RemoveMode::AlreadyMissing)
+                .then(|| Arc::clone(infrastructure)),
+        }
+    }
 }
 
 impl BatchRecognizer for CountingRecognizer {
@@ -206,6 +230,9 @@ impl BatchRecognizer for CountingRecognizer {
         request: BatchRecognitionRequest,
     ) -> BoxFuture<'_, Result<BatchRecognitionResult, RecognitionFailure>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(infrastructure) = &self.remove_before_completion {
+            infrastructure.audio.lock().unwrap().clear();
+        }
         let result = BatchRecognitionResult {
             profile: request.profile,
             text: "authoritative synthetic speech".into(),
@@ -259,22 +286,42 @@ fn state(
 
 #[tokio::test]
 async fn normal_cleanup_success_releases_custody_metrics() {
-    assert_normal_cleanup(false, 1, 0, false).await;
+    assert_normal_cleanup(RemoveMode::Present, 1, 0, false).await;
+}
+
+#[tokio::test]
+async fn normal_cleanup_already_missing_does_not_release_custody_metrics_twice() {
+    assert_normal_cleanup(
+        RemoveMode::AlreadyMissing,
+        0,
+        support::synthetic_ogg_opus().len(),
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn normal_cleanup_failure_retains_authoritative_result_and_custody_metrics() {
-    assert_normal_cleanup(true, 0, support::synthetic_ogg_opus().len(), true).await;
+    assert_normal_cleanup(
+        RemoveMode::Failure,
+        0,
+        support::synthetic_ogg_opus().len(),
+        true,
+    )
+    .await;
 }
 
 async fn assert_normal_cleanup(
-    fail_remove: bool,
+    remove_mode: RemoveMode,
     expected_removed: usize,
     expected_used_bytes: usize,
     expected_audio_present: bool,
 ) {
-    let infrastructure = Arc::new(CleanupInfrastructure::with_remove_failure(fail_remove));
-    let recognizer = Arc::new(CountingRecognizer::default());
+    let infrastructure = Arc::new(CleanupInfrastructure::with_remove_mode(remove_mode));
+    let recognizer = Arc::new(CountingRecognizer::for_cleanup(
+        remove_mode,
+        &infrastructure,
+    ));
     let (origin, task) = serve(state(infrastructure.clone(), recognizer.clone())).await;
     let client = reqwest::Client::new();
     let response = submit(&client, &origin).await;
@@ -284,7 +331,14 @@ async fn assert_normal_cleanup(
         .unwrap()
         .to_owned();
     wait_for_completed(&client, &origin, &job_id).await;
-    assert_metrics(&client, &origin, expected_removed, expected_used_bytes).await;
+    wait_for_metrics(
+        &client,
+        &origin,
+        expected_removed,
+        expected_used_bytes,
+        "voicetext_batch_provider_effects_total 1\n",
+    )
+    .await;
     assert_eq!(infrastructure.audio_present(), expected_audio_present);
     assert_eq!(infrastructure.remove_calls.load(Ordering::SeqCst), 1);
     assert_eq!(recognizer.calls.load(Ordering::SeqCst), 1);
@@ -299,22 +353,30 @@ async fn assert_normal_cleanup(
 
 #[tokio::test]
 async fn recovery_cleanup_success_releases_custody_metrics() {
-    assert_recovery_cleanup(false, 1, 0, false).await;
+    assert_recovery_cleanup(RemoveMode::Present, 1, 0, false).await;
+}
+
+#[tokio::test]
+async fn recovery_cleanup_already_missing_does_not_release_custody_metrics_twice() {
+    assert_recovery_cleanup(RemoveMode::AlreadyMissing, 0, 32, false).await;
 }
 
 #[tokio::test]
 async fn recovery_cleanup_failure_retains_authoritative_result_and_custody_metrics() {
-    assert_recovery_cleanup(true, 0, 32, true).await;
+    assert_recovery_cleanup(RemoveMode::Failure, 0, 32, true).await;
 }
 
 async fn assert_recovery_cleanup(
-    fail_remove: bool,
+    remove_mode: RemoveMode,
     expected_removed: usize,
     expected_used_bytes: usize,
     expected_audio_present: bool,
 ) {
-    let infrastructure = Arc::new(CleanupInfrastructure::with_remove_failure(fail_remove));
-    let recognizer = Arc::new(CountingRecognizer::default());
+    let infrastructure = Arc::new(CleanupInfrastructure::with_remove_mode(remove_mode));
+    let recognizer = Arc::new(CountingRecognizer::for_cleanup(
+        remove_mode,
+        &infrastructure,
+    ));
     let job_id = BatchJobId::new(Uuid::new_v4().hyphenated().to_string());
     let coordinator = BatchCoordinator::new(
         recognizer.as_ref(),
@@ -341,11 +403,12 @@ async fn assert_recovery_cleanup(
     start_startup_recovery(&state, recovery);
     wait_for_stored_completion(infrastructure.as_ref(), &job_id).await;
     let (origin, task) = serve(state.clone()).await;
-    assert_metrics(
+    wait_for_metrics(
         &reqwest::Client::new(),
         &origin,
         expected_removed,
         expected_used_bytes,
+        "voicetext_batch_recovery_executed_total 1\n",
     )
     .await;
     assert_eq!(infrastructure.audio_present(), expected_audio_present);
@@ -451,4 +514,34 @@ async fn assert_metrics(
         "voicetext_spool_terminal_removed_total {terminal_removed}\n"
     )));
     assert!(metrics.contains(&format!("voicetext_spool_used_bytes {used_bytes}\n")));
+}
+
+async fn wait_for_metrics(
+    client: &reqwest::Client,
+    origin: &str,
+    terminal_removed: usize,
+    used_bytes: usize,
+    completion_marker: &str,
+) {
+    for _ in 0..100 {
+        let metrics = client
+            .get(format!("{origin}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if metrics.contains(completion_marker)
+            && metrics.contains("voicetext_batch_inflight 0\n")
+            && metrics.contains(&format!(
+                "voicetext_spool_terminal_removed_total {terminal_removed}\n"
+            ))
+            && metrics.contains(&format!("voicetext_spool_used_bytes {used_bytes}\n"))
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("cleanup metrics were not emitted after execution completed");
 }

@@ -6,8 +6,8 @@ use std::task::{Context, Poll, Waker};
 
 use super::*;
 use crate::application::ports::{
-    BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchRecognitionResult,
-    BatchResultProjectionFailure, BatchSegment, RecognitionFailure,
+    BatchAudioRemoveOutcome, BatchAudioSpoolFailure, BatchAudioStoreOutcome,
+    BatchRecognitionResult, BatchResultProjectionFailure, BatchSegment, RecognitionFailure,
 };
 use crate::domain::batch::{BatchProfile, BatchRequestFingerprint};
 
@@ -106,7 +106,7 @@ impl BatchAudioSpool for Fake {
     fn remove<'b>(
         &'b self,
         _handle: &'b BatchAudioHandle,
-    ) -> BoxFuture<'b, Result<(), BatchAudioSpoolFailure>> {
+    ) -> BoxFuture<'b, Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>> {
         self.removes.fetch_add(1, Ordering::SeqCst);
         if self.fail_remove.load(Ordering::SeqCst) {
             return Box::pin(async {
@@ -115,8 +115,12 @@ impl BatchAudioSpool for Fake {
                 })
             });
         }
-        *self.audio.lock().unwrap() = None;
-        Box::pin(async { Ok(()) })
+        let outcome = if self.audio.lock().unwrap().take().is_some() {
+            BatchAudioRemoveOutcome::Removed
+        } else {
+            BatchAudioRemoveOutcome::AlreadyMissing
+        };
+        Box::pin(async move { Ok(outcome) })
     }
 }
 
@@ -365,7 +369,7 @@ fn terminal_cleanup_failure_preserves_the_stored_result_and_replays_without_egre
         panic!("terminal outcome was not stored")
     };
     assert!(stored.job.state().is_terminal());
-    assert!(report.post_persistence_cleanup_failure.is_some());
+    assert!(matches!(report.post_persistence_cleanup, Some(Err(_))));
     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
     assert!(fake.audio.lock().unwrap().is_some());
 

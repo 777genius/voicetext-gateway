@@ -8,10 +8,10 @@ pub use crate::application::batch_models::{
     BatchStartupRecovery,
 };
 use crate::application::ports::{
-    BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
-    BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore, BatchJobStoreFailure,
-    BatchJobUpdateOutcome, BatchRecognitionRequest, BatchRecognizer, BatchResultProjection,
-    BoxFuture,
+    BatchAudioHandle, BatchAudioRemoveOutcome, BatchAudioSpool, BatchAudioSpoolFailure,
+    BatchAudioStoreOutcome, BatchJobId, BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore,
+    BatchJobStoreFailure, BatchJobUpdateOutcome, BatchRecognitionRequest, BatchRecognizer,
+    BatchResultProjection, BoxFuture,
 };
 use crate::domain::batch::{BatchJob, BatchJobState};
 
@@ -22,8 +22,8 @@ pub(super) const RECOVERY_BATCH_LIMIT: NonZeroUsize = NonZeroUsize::new(100).unw
 pub struct BatchExecutionReport {
     /// The ledger outcome, including the exact terminal snapshot when stored.
     pub outcome: BatchExecutionOutcome,
-    /// Cleanup failure after the terminal snapshot was stored, if any.
-    pub post_persistence_cleanup_failure: Option<BatchAudioSpoolFailure>,
+    /// Actual cleanup outcome after the terminal snapshot was stored, if cleanup was required.
+    pub post_persistence_cleanup: Option<Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>>,
 }
 
 /// Coordinates admission, a single fenced provider call, and startup recovery.
@@ -208,7 +208,7 @@ impl<'a> BatchCoordinator<'a> {
             {
                 Ok(BatchJobUpdateOutcome::Stored(snapshot)) => {
                     let cleanup = if snapshot.job.state().is_terminal() {
-                        self.spool.remove(&snapshot.audio).await.err()
+                        Some(self.spool.remove(&snapshot.audio).await)
                     } else {
                         None
                     };
@@ -225,11 +225,11 @@ impl<'a> BatchCoordinator<'a> {
 
 fn report(
     outcome: BatchExecutionOutcome,
-    post_persistence_cleanup_failure: Option<BatchAudioSpoolFailure>,
+    post_persistence_cleanup: Option<Result<BatchAudioRemoveOutcome, BatchAudioSpoolFailure>>,
 ) -> BatchExecutionReport {
     BatchExecutionReport {
         outcome,
-        post_persistence_cleanup_failure,
+        post_persistence_cleanup,
     }
 }
 
