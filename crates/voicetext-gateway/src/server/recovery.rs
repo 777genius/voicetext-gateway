@@ -180,22 +180,21 @@ async fn execute_actionable(state: &GatewayState, snapshot: &BatchJobSnapshot) {
         .ok()
         .and_then(|audio| u64::try_from(audio.len()).ok());
     state.metrics().batch_execution_started();
-    let outcome = execute_fenced(state, identity, &snapshot.id).await;
+    let execution = execute_fenced(state, identity, &snapshot.id).await;
     state.metrics().batch_execution_finished();
-    match outcome {
-        Some(Ok(BatchExecutionOutcome::Persisted(snapshot))) => {
+    let Some(execution) = execution else {
+        return;
+    };
+    let terminal_audio_removed = execution.terminal_audio_removed();
+    match execution.outcome {
+        Ok(BatchExecutionOutcome::Persisted(_)) => {
             state.metrics().batch_recovery_executed();
-            if snapshot.job.state().is_terminal()
-                && let Some(audio_bytes) = audio_bytes
-            {
+            if terminal_audio_removed && let Some(audio_bytes) = audio_bytes {
                 state.metrics().spool_terminal_cleaned(audio_bytes);
             }
         }
-        Some(Ok(
-            BatchExecutionOutcome::NotClaimed(_) | BatchExecutionOutcome::NotActionable(_),
-        ))
-        | None => {}
-        Some(Err(_)) => {
+        Ok(BatchExecutionOutcome::NotClaimed(_) | BatchExecutionOutcome::NotActionable(_)) => {}
+        Err(_) => {
             state.metrics().batch_failure();
             tracing::error!(job_id = %snapshot.id.as_str(), "recovery execution did not persist a safe outcome");
         }

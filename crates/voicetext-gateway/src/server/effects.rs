@@ -24,11 +24,30 @@ use super::qualification_observation::{
 };
 use super::state::GatewayState;
 
+#[derive(Debug)]
+pub(crate) struct FencedExecution {
+    pub(crate) outcome: Result<BatchExecutionOutcome, BatchCoordinatorFailure>,
+    terminal_cleanup: TerminalCleanup,
+}
+
+impl FencedExecution {
+    pub(crate) const fn terminal_audio_removed(&self) -> bool {
+        matches!(self.terminal_cleanup, TerminalCleanup::Removed)
+    }
+}
+
+#[derive(Debug)]
+enum TerminalCleanup {
+    NotRequired,
+    Removed,
+    Retained,
+}
+
 pub(crate) async fn execute_fenced(
     state: &GatewayState,
     identity: BatchIdentity,
     id: &BatchJobId,
-) -> Option<Result<BatchExecutionOutcome, BatchCoordinatorFailure>> {
+) -> Option<FencedExecution> {
     let recognizer = state.profiles().batch(identity)?;
     let capture = Mutex::new(None);
     let observed = EffectObservedRecognizer {
@@ -40,9 +59,29 @@ pub(crate) async fn execute_fenced(
     let execution = coordinator
         .execute_with_cleanup_report(id, &GatewayBatchResultProjection)
         .await;
-    let (outcome, cleanup_failure) = match execution {
-        Ok(report) => (Ok(report.outcome), report.post_persistence_cleanup_failure),
-        Err(failure) => (Err(failure), None),
+    let (outcome, terminal_cleanup, cleanup_failure) = match execution {
+        Ok(report) => {
+            let terminal_cleanup = match &report.outcome {
+                BatchExecutionOutcome::Persisted(snapshot)
+                    if snapshot.job.state().is_terminal() =>
+                {
+                    if report.post_persistence_cleanup_failure.is_some() {
+                        TerminalCleanup::Retained
+                    } else {
+                        TerminalCleanup::Removed
+                    }
+                }
+                BatchExecutionOutcome::Persisted(_)
+                | BatchExecutionOutcome::NotClaimed(_)
+                | BatchExecutionOutcome::NotActionable(_) => TerminalCleanup::NotRequired,
+            };
+            (
+                Ok(report.outcome),
+                terminal_cleanup,
+                report.post_persistence_cleanup_failure,
+            )
+        }
+        Err(failure) => (Err(failure), TerminalCleanup::NotRequired, None),
     };
     observe_outcome(state, &outcome);
     if let Some(failure) = cleanup_failure {
@@ -59,7 +98,10 @@ pub(crate) async fn execute_fenced(
     if let Some(capture) = capture {
         observe_qualification(state, id, capture, &outcome).await;
     }
-    Some(outcome)
+    Some(FencedExecution {
+        outcome,
+        terminal_cleanup,
+    })
 }
 
 struct EffectObservedRecognizer<'a> {

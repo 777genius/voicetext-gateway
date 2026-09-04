@@ -176,14 +176,15 @@ fn spawn_execution(
     let _registered = state.spawn_batch_task(async move {
         let _permits = (global_permit, batch_permit, provider_permit);
         task_state.metrics().batch_execution_started();
-        let Some(outcome) = execute_fenced(&task_state, identity, &id).await else {
+        let Some(execution) = execute_fenced(&task_state, identity, &id).await else {
             task_state.metrics().batch_execution_finished();
             return;
         };
         task_state.metrics().batch_execution_finished();
-        match outcome {
-            Ok(BatchExecutionOutcome::Persisted(snapshot)) => {
-                if snapshot.job.state().is_terminal() {
+        let terminal_audio_removed = execution.terminal_audio_removed();
+        match execution.outcome {
+            Ok(BatchExecutionOutcome::Persisted(_)) => {
+                if terminal_audio_removed {
                     task_state.metrics().spool_terminal_cleaned(audio_bytes);
                 }
             }
