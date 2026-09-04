@@ -266,7 +266,7 @@ fn retry_after_millis(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn reference(request_id: Option<String>) -> Option<ProviderReference> {
-    request_id.map(ProviderReference::new)
+    request_id.map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id))
 }
 
 fn known_not_accepted(

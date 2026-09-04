@@ -178,6 +178,10 @@ impl GatewayState {
     }
 
     /// Replaces the default no-op qualification capabilities before state is cloned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if composition attempts to replace observers after cloning the state.
     #[must_use]
     pub fn with_qualification_observers(
         mut self,

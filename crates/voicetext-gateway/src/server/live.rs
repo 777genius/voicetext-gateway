@@ -4,7 +4,9 @@ use super::error::GatewayHttpError;
 use super::live_error::SafeLiveError;
 use super::live_request::recognition_request;
 use super::metrics::GatewayMetrics;
-use super::qualification_observation::{LiveObservationTracker, ObservationProfile};
+use super::qualification_observation::{
+    LiveObservationTracker, OBSERVATION_WRITE_TIMEOUT, ObservationProfile,
+};
 use super::state::GatewayState;
 use crate::auth::authenticate;
 use crate::contracts::live::{
@@ -94,9 +96,15 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
         .ok()
         .flatten();
         let record = observation.finish(operation, terminal_status);
-        if let Err(failure) = state.live_observations().observe_live(record).await {
-            state.metrics().qualification_observation_failure();
-            tracing::warn!(code = failure.0, "qualification observation missing");
+        match timeout(
+            OBSERVATION_WRITE_TIMEOUT,
+            state.live_observations().observe_live(record),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => observation_failure(&state, failure.0),
+            Err(_) => observation_failure(&state, "QUALIFICATION_WRITE_TIMEOUT"),
         }
     }
     close_coordinator(&mut opened.coordinator).await;
@@ -193,8 +201,7 @@ async fn stream(
                 handle_client_frame(
                     client,
                     socket,
-                    &mut opened.coordinator,
-                    &mut opened.decoder,
+                    opened,
                     limits.live_frame_bytes,
                     &mut accepted_audio,
                     state.metrics(),
@@ -227,8 +234,6 @@ async fn stream(
                 )
                 .await;
                 match finalized {
-                    // `finalize_complete` is the protocol terminal. Close immediately so queued
-                    // client frames cannot be classified as a second terminal `error`.
                     Ok(status) => return format!("finalize_{status:?}").to_ascii_lowercase(),
                     Err(error) => {
                         let terminal = error.code().to_owned();
@@ -268,8 +273,7 @@ async fn receive_config(
 async fn handle_client_frame(
     received: Option<Result<Message, axum::Error>>,
     socket: &mut WebSocket,
-    coordinator: &mut LiveCoordinator,
-    decoder: &mut Option<DiscordOpusDecoder>,
+    opened: &mut OpenedSession,
     maximum: usize,
     accepted_audio: &mut bool,
     metrics: &GatewayMetrics,
@@ -288,11 +292,11 @@ async fn handle_client_frame(
                 });
             }
             let raw = frame.to_vec();
+            let pcm = decode_audio(&mut opened.decoder, &raw)?;
             if let Some(observation) = observation.as_deref_mut() {
                 observation.accept_frame();
             }
-            let pcm = decode_audio(decoder, &raw)?;
-            let sequence = write_audio_or_cancel(socket, coordinator, pcm).await?;
+            let sequence = write_audio_or_cancel(socket, &mut opened.coordinator, pcm).await?;
             if let Some(observation) = observation.as_deref_mut() {
                 observation.provider_written(sequence.get());
             }
@@ -304,7 +308,8 @@ async fn handle_client_frame(
                 },
             )
             .await?;
-            coordinator
+            opened
+                .coordinator
                 .ack_sent(sequence)
                 .map_err(|error| SafeLiveError::from_coordinator(&error, "ack"))?;
             if let Some(observation) = observation {
@@ -561,6 +566,11 @@ async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &Gat
         },
     )
     .await;
+}
+
+fn observation_failure(state: &GatewayState, code: &'static str) {
+    state.metrics().qualification_observation_failure();
+    tracing::warn!(code, "qualification observation missing");
 }
 
 enum Raced {

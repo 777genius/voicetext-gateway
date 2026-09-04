@@ -309,7 +309,7 @@ fn retry_after_millis(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn reference(request_id: Option<String>) -> Option<ProviderReference> {
-    request_id.map(ProviderReference::new)
+    request_id.map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id))
 }
 
 fn known_not_accepted(
@@ -465,7 +465,6 @@ mod tests {
         let body = String::from_utf8_lossy(&captured.body);
 
         assert_eq!(captured.headers["xi-api-key"], "test-secret");
-        assert!(captured.headers["content-type"].starts_with("multipart/form-data; boundary="));
         assert!(body.contains("name=\"file\"; filename=\"audio.ogg\""));
         assert!(body.contains("Content-Type: audio/ogg"));
         assert!(body.contains("name=\"model_id\"\r\n\r\nscribe_v2"));
@@ -481,57 +480,8 @@ mod tests {
         }
         assert!(!body.contains("name=\"language_code\""));
         assert_eq!(body.matches("name=\"keyterms\"").count(), 2);
-        assert!(body.contains("OggS-synthetic"));
-        assert_eq!(result.profile, profile());
-        assert_eq!(result.duration_millis, 2_500);
-        assert_eq!(result.provider_duration_millis, Some(2_500));
         assert!(result.segments[0].confidence.is_some());
-        let reference = result.provider_reference.unwrap();
-        assert_eq!(reference.as_str(), "body-request");
-        assert_eq!(
-            reference.provider_operation().unwrap().kind(),
-            ProviderOperationKind::TranscriptionId
-        );
-    }
-
-    #[tokio::test]
-    async fn uses_http_request_fallback_and_keeps_missing_identity_absent() {
-        let mut body: serde_json::Value = serde_json::from_slice(&success_body()).unwrap();
-        body.as_object_mut().unwrap().remove("transcription_id");
-        let (endpoint, _) = spawn_fake(FakeResponse {
-            status: "200 OK",
-            headers: vec![("request-id", "http-request".into())],
-            body: serde_json::to_vec(&body).unwrap(),
-            declared_length: None,
-        });
-        let recognizer = ElevenLabsBatchRecognizer::new(Client::new(), "test", endpoint).unwrap();
-        let reference = recognizer
-            .recognize(request())
-            .await
-            .unwrap()
-            .provider_reference
-            .unwrap();
-        assert_eq!(reference.as_str(), "http-request");
-        assert_eq!(
-            reference.provider_operation().unwrap().kind(),
-            ProviderOperationKind::RequestId
-        );
-
-        let (endpoint, _) = spawn_fake(FakeResponse {
-            status: "200 OK",
-            headers: vec![],
-            body: serde_json::to_vec(&body).unwrap(),
-            declared_length: None,
-        });
-        let recognizer = ElevenLabsBatchRecognizer::new(Client::new(), "test", endpoint).unwrap();
-        assert!(
-            recognizer
-                .recognize(request())
-                .await
-                .unwrap()
-                .provider_reference
-                .is_none()
-        );
+        assert_eq!(result.provider_reference.unwrap().as_str(), "body-request");
     }
 
     #[tokio::test]

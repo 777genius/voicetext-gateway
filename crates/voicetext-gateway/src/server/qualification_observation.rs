@@ -1,8 +1,8 @@
-//! Opt-in, bounded qualification observations kept outside public VoiceText contracts.
+//! Opt-in, bounded qualification observations kept outside public `VoiceText` contracts.
 
 use std::fmt;
 use std::future::Future;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 use voicetext_speech::application::ports::{
     BatchRecognitionResult, LiveRecognitionEvent, ProviderOperation, ProviderOperationKind,
@@ -20,6 +20,7 @@ const MAX_OBSERVATIONS: usize = 64;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
 const FRAME_DIGEST_PREFIX: &[u8] = b"voicetext-acked-frames-v1\n";
 const RESULT_DIGEST_PREFIX: &[u8] = b"voicetext-normalized-result-v1\n";
+pub(crate) const OBSERVATION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub type ObservationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), ObservationSinkFailure>> + Send + 'a>>;
@@ -149,6 +150,11 @@ impl fmt::Debug for FileQualificationSink {
 }
 
 impl FileQualificationSink {
+    /// Opens a validated private output directory for one bounded campaign.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe failure code when the campaign or directory custody is invalid.
     pub fn new(directory: &Path, campaign: &str) -> Result<Self, ObservationSinkFailure> {
         if !valid_campaign(campaign) || !directory.is_absolute() {
             return Err(ObservationSinkFailure(
@@ -196,19 +202,43 @@ impl FileQualificationSink {
             }
             let mut options = tokio::fs::OpenOptions::new();
             options.write(true).create_new(true).mode(0o600);
-            let mut file = options
-                .open(path)
+            let file = options
+                .open(&path)
                 .await
                 .map_err(|_| ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))?;
-            file.write_all(&bytes)
-                .await
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_WRITE_FAILED"))?;
-            file.sync_all()
-                .await
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
-            Ok(())
+            persist_created_record(file, &path, &bytes).await
         })
     }
+}
+
+async fn persist_created_record(
+    mut file: tokio::fs::File,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ObservationSinkFailure> {
+    write_created_bytes(&mut file, path, bytes).await?;
+    if file.sync_all().await.is_err() {
+        drop(file);
+        remove_partial(path).await;
+        return Err(ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"));
+    }
+    Ok(())
+}
+
+async fn write_created_bytes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ObservationSinkFailure> {
+    if writer.write_all(bytes).await.is_err() {
+        remove_partial(path).await;
+        return Err(ObservationSinkFailure("QUALIFICATION_WRITE_FAILED"));
+    }
+    Ok(())
+}
+
+async fn remove_partial(path: &Path) {
+    let _removed = tokio::fs::remove_file(path).await;
 }
 
 impl BatchObservationSink for FileQualificationSink {
@@ -298,8 +328,7 @@ impl LiveObservationTracker {
                 self.result_digest.update(
                     value
                         .confidence
-                        .map(f32::to_bits)
-                        .unwrap_or(u32::MAX)
+                        .map_or(u32::MAX, f32::to_bits)
                         .to_be_bytes(),
                 );
                 self.result_digest.update([value.stability as u8]);
@@ -353,7 +382,11 @@ struct SequenceTracker {
 
 impl SequenceTracker {
     fn push(&mut self, value: u64) {
-        self.contiguous = self.count == 0 || self.last.is_some_and(|last| value == last + 1);
+        self.contiguous = self.count == 0
+            || (self.contiguous
+                && self
+                    .last
+                    .is_some_and(|last| last.checked_add(1) == Some(value)));
         self.first.get_or_insert(value);
         self.last = Some(value);
         self.count = self.count.saturating_add(1);
@@ -400,8 +433,7 @@ pub(crate) fn batch_result_digest(result: &BatchRecognitionResult) -> String {
         digest.update(
             segment
                 .confidence
-                .map(f32::to_bits)
-                .unwrap_or(u32::MAX)
+                .map_or(u32::MAX, f32::to_bits)
                 .to_be_bytes(),
         );
         digest_bytes(

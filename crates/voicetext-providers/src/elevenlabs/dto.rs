@@ -336,6 +336,18 @@ mod tests {
                 .is_some_and(|value| value > 0.8)
         );
         assert_eq!(result.provider_request_id.as_deref(), Some("tx-123"));
+        assert!(result.provider_identity_is_transcription);
+
+        let mut fallback = payload;
+        fallback.as_object_mut().unwrap().remove("transcription_id");
+        let result = parse_response(
+            fallback.to_string().as_bytes(),
+            2_000,
+            Some("header".into()),
+        )
+        .unwrap();
+        assert_eq!(result.provider_request_id.as_deref(), Some("header"));
+        assert!(!result.provider_identity_is_transcription);
     }
 
     #[test]

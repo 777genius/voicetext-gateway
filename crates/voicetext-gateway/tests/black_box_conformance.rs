@@ -22,6 +22,7 @@ const ELEVENLABS_IDEMPOTENCY_KEY: &str =
 
 #[tokio::test]
 async fn current_voicetext_health_contract_is_preserved() {
+    let _ = std::hint::black_box(TestGateway::start_with_observers);
     let gateway = TestGateway::start().await;
     let response = reqwest::get(gateway.http_url("/health")).await.unwrap();
 

@@ -14,14 +14,14 @@ use voicetext_speech::domain::batch::{
     BatchUnknownOutcome,
 };
 
+mod result_validation;
+use result_validation::validate_result;
+
 const MAX_KEYTERMS: usize = 100;
 const MAX_KEYTERM_BYTES: usize = 256;
 const MAX_KEYTERMS_BYTES: usize = 16_384;
 const MAX_PROVIDER_REFERENCE_BYTES: usize = 256;
 const MAX_PROFILE_FIELD_BYTES: usize = 256;
-const MAX_SEGMENTS: usize = 10_000;
-const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_READABLE_REFERENCES: usize = 100_000;
 const MAX_RETRY_AFTER_MILLIS: u64 = 3_600_000;
 // This exact compact representation cap is owned by the PostgreSQL adapter. The same serialized
 // bytes are stored as text and measured by the database constraint. It safely covers the
@@ -89,11 +89,13 @@ struct ResultRecord {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
 enum OperationKindRecord {
-    RequestId,
-    TranscriptionId,
-    SessionId,
+    #[serde(rename = "request_id")]
+    Request,
+    #[serde(rename = "transcription_id")]
+    Transcription,
+    #[serde(rename = "session_id")]
+    Session,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -463,9 +465,9 @@ fn serialize_result(
             .as_ref()
             .and_then(ProviderReference::provider_operation)
             .map(|operation| match operation.kind() {
-                ProviderOperationKind::RequestId => OperationKindRecord::RequestId,
-                ProviderOperationKind::TranscriptionId => OperationKindRecord::TranscriptionId,
-                ProviderOperationKind::SessionId => OperationKindRecord::SessionId,
+                ProviderOperationKind::RequestId => OperationKindRecord::Request,
+                ProviderOperationKind::TranscriptionId => OperationKindRecord::Transcription,
+                ProviderOperationKind::SessionId => OperationKindRecord::Session,
             }),
     };
     let value = serde_json::to_string(&record).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
@@ -486,9 +488,9 @@ fn restore_result(
     let provider_reference = match (record.provider_operation_kind, provider_reference) {
         (Some(kind), Some(reference)) => Some(ProviderReference::operation(
             match kind {
-                OperationKindRecord::RequestId => ProviderOperationKind::RequestId,
-                OperationKindRecord::TranscriptionId => ProviderOperationKind::TranscriptionId,
-                OperationKindRecord::SessionId => ProviderOperationKind::SessionId,
+                OperationKindRecord::Request => ProviderOperationKind::RequestId,
+                OperationKindRecord::Transcription => ProviderOperationKind::TranscriptionId,
+                OperationKindRecord::Session => ProviderOperationKind::SessionId,
             },
             reference.as_str(),
         )),
@@ -532,66 +534,6 @@ fn restore_result(
 
 fn bounded_json(value: &str) -> Result<(), RecordError> {
     if value.len() > MAX_SERIALIZED_RESULT_BYTES {
-        return Err(RecordError("RESULT_TOO_LARGE"));
-    }
-    Ok(())
-}
-
-fn validate_result(result: &BatchRecognitionResult) -> Result<(), RecordError> {
-    if result.text.len() > MAX_TEXT_BYTES || result.segments.len() > MAX_SEGMENTS {
-        return Err(RecordError("RESULT_TOO_LARGE"));
-    }
-    let mut previous_end = 0;
-    for segment in &result.segments {
-        if segment.start_millis < previous_end
-            || segment.end_millis <= segment.start_millis
-            || segment.end_millis > result.duration_millis
-            || segment.text.is_empty()
-            || segment.text.len() > MAX_TEXT_BYTES
-            || segment
-                .confidence
-                .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
-            || segment.speaker.as_ref().is_some_and(|value| {
-                value.is_empty()
-                    || value.len() > MAX_PROVIDER_REFERENCE_BYTES
-                    || value.chars().any(char::is_control)
-            })
-        {
-            return Err(RecordError("INVALID_RESULT"));
-        }
-        previous_end = segment.end_millis;
-    }
-    let mut references = 0_usize;
-    if let Some(segments) = &result.readable_segments {
-        if segments.len() > MAX_SEGMENTS {
-            return Err(RecordError("RESULT_TOO_LARGE"));
-        }
-        previous_end = 0;
-        for segment in segments {
-            references = references
-                .checked_add(segment.source_segment_indices.len())
-                .ok_or(RecordError("RESULT_TOO_LARGE"))?;
-            if segment.start_millis < previous_end
-                || segment.end_millis <= segment.start_millis
-                || segment.end_millis > result.duration_millis
-                || segment.text.is_empty()
-                || segment.text.len() > MAX_TEXT_BYTES
-                || segment.source_segment_indices.is_empty()
-                || !segment
-                    .source_segment_indices
-                    .windows(2)
-                    .all(|pair| pair[0] < pair[1])
-                || segment
-                    .source_segment_indices
-                    .last()
-                    .is_none_or(|index| *index >= result.segments.len())
-            {
-                return Err(RecordError("INVALID_RESULT"));
-            }
-            previous_end = segment.end_millis;
-        }
-    }
-    if references > MAX_READABLE_REFERENCES {
         return Err(RecordError("RESULT_TOO_LARGE"));
     }
     Ok(())

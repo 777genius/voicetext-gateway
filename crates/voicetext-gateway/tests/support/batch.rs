@@ -7,7 +7,8 @@ use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchAudioSpool, BatchAudioSpoolFailure, BatchAudioStoreOutcome, BatchJobId,
     BatchJobInsertOutcome, BatchJobSnapshot, BatchJobStore, BatchJobStoreFailure,
     BatchJobUpdateOutcome, BatchReadableSegment, BatchRecognitionRequest, BatchRecognitionResult,
-    BatchRecognizer, BatchSegment, BoxFuture, ProviderReference, RecognitionFailure,
+    BatchRecognizer, BatchSegment, BoxFuture, ProviderOperationKind, ProviderReference,
+    RecognitionFailure,
 };
 use voicetext_speech::domain::batch::BatchJob;
 
@@ -176,8 +177,14 @@ impl BatchRecognizer for FakeBatchRecognizer {
                     source_segment_indices: vec![0],
                 }]
             }),
-            provider_reference: (request.profile.contract_version() == 3)
-                .then(|| ProviderReference::new("fake-request-1")),
+            provider_reference: Some(ProviderReference::operation(
+                if request.profile.contract_version() == 3 {
+                    ProviderOperationKind::TranscriptionId
+                } else {
+                    ProviderOperationKind::RequestId
+                },
+                "fake-request-1",
+            )),
         };
         Box::pin(async move { Ok(result) })
     }

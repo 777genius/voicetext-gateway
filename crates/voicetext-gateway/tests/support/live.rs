@@ -4,7 +4,8 @@ use voicetext_gateway::contracts::live::LiveIdentity;
 use tokio::sync::{Mutex, mpsc};
 use voicetext_speech::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
-    LiveRecognizerSession, LiveTranscript, LiveTranscriptStability, RecognitionFailure,
+    LiveRecognizerSession, LiveTranscript, LiveTranscriptStability, ProviderOperation,
+    ProviderOperationKind, RecognitionFailure,
 };
 
 #[derive(Debug)]
@@ -39,6 +40,15 @@ struct FakeLiveSession {
 }
 
 impl LiveRecognizerSession for FakeLiveSession {
+    fn provider_operation(&self) -> BoxFuture<'_, Option<ProviderOperation>> {
+        Box::pin(async {
+            Some(ProviderOperation::new(
+                ProviderOperationKind::RequestId,
+                "fake-live-operation-1",
+            ))
+        })
+    }
+
     fn write_audio(&self, _frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
             let accepted_audio = self.accepted_audio.fetch_add(1, Ordering::SeqCst);

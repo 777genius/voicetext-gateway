@@ -23,6 +23,10 @@ Sink failures increment `voicetext_qualification_observation_failures_total` and
 machine code. They do not retry a provider effect and do not change the authoritative batch result,
 live terminal message, or recording custody. A missing or incomplete record means qualification
 evidence is missing; total disk failure cannot be rolled back by this facility.
+Each sink call has a one-second gateway-side deadline; a timeout is reported as
+`QUALIFICATION_WRITE_TIMEOUT` and the authoritative operation continues unchanged.
+If writing or syncing a newly created record fails, the sink makes a bounded best-effort removal of
+that partial file and still reports the original machine-readable failure.
 
 ## Records
 

@@ -446,7 +446,8 @@ fn handshake_status_failure(status: StatusCode, headers: &HeaderMap) -> Recognit
     known_not_accepted(
         retryable,
         code,
-        request_id_from_headers(headers).map(ProviderReference::new),
+        request_id_from_headers(headers)
+            .map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id)),
         retryable.then(|| retry_after_millis(headers)).flatten(),
     )
 }

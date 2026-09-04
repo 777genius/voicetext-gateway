@@ -324,7 +324,7 @@ mod tests {
     use crate::storage::records::{JobRecord, MAX_SERIALIZED_RESULT_BYTES, WritableRecord};
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use voicetext_speech::application::ports::{
-        BatchRecognitionResult, BatchSegment, ProviderReference,
+        BatchRecognitionResult, BatchSegment, ProviderOperationKind, ProviderReference,
     };
     use voicetext_speech::domain::batch::{
         BatchFailure, BatchJobState, BatchProfile, BatchRequestFingerprint,
@@ -403,6 +403,39 @@ mod tests {
         let expected = snapshot();
         let record = job_record(WritableRecord::try_from(&expected).unwrap());
         assert_eq!(BatchJobSnapshot::try_from(record).unwrap(), expected);
+    }
+
+    #[test]
+    fn typed_operation_round_trip_and_older_untyped_record_remain_distinct() {
+        let mut typed = snapshot();
+        let reference = ProviderReference::operation(ProviderOperationKind::RequestId, "request-1");
+        typed.provider_reference = Some(reference.clone());
+        typed.result.as_mut().unwrap().provider_reference = Some(reference);
+        let restored =
+            BatchJobSnapshot::try_from(job_record(WritableRecord::try_from(&typed).unwrap()))
+                .unwrap();
+        assert_eq!(restored, typed);
+        assert_eq!(
+            restored
+                .provider_reference
+                .unwrap()
+                .provider_operation()
+                .unwrap()
+                .kind(),
+            ProviderOperationKind::RequestId
+        );
+
+        let older = snapshot();
+        let restored =
+            BatchJobSnapshot::try_from(job_record(WritableRecord::try_from(&older).unwrap()))
+                .unwrap();
+        assert!(
+            restored
+                .provider_reference
+                .unwrap()
+                .provider_operation()
+                .is_none()
+        );
     }
 
     #[test]
