@@ -1,4 +1,6 @@
-use voicetext_speech::application::ports::{ProviderReference, RecognitionFailure};
+use voicetext_speech::application::ports::{
+    ProviderOperationKind, ProviderReference, RecognitionFailure,
+};
 
 use super::dto::ParsedBatchResult;
 
@@ -16,7 +18,7 @@ pub(super) fn normalize(
     let provider_reference = parsed
         .provider_request_id
         .clone()
-        .map(ProviderReference::new);
+        .map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id));
     for segment in &mut parsed.segments {
         normalize_end(
             segment.start_ms,
@@ -154,6 +156,13 @@ mod tests {
         let parsed = dto::parse_response(&timeline_body(3.0), None).unwrap();
         let failure = normalize(parsed, 2_500).unwrap_err();
         assert_eq!(failure.code(), "DEEPGRAM_INVALID_TIMING");
+        let operation = failure
+            .provider_reference()
+            .unwrap()
+            .provider_operation()
+            .unwrap();
+        assert_eq!(operation.id(), "timeline-request");
+        assert_eq!(operation.kind(), ProviderOperationKind::RequestId);
     }
 
     #[test]

@@ -17,8 +17,7 @@ pub(super) struct ParsedBatchResult {
     pub text: String,
     pub provider_duration_millis: Option<u64>,
     pub segments: Vec<ParsedSegment>,
-    pub provider_request_id: Option<String>,
-    pub provider_identity_is_transcription: bool,
+    pub provider_identity: Option<ProviderIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,7 +31,13 @@ pub(super) struct ParsedSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ParseFailure {
     pub code: &'static str,
-    pub provider_request_id: Option<String>,
+    pub provider_identity: Option<ProviderIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ProviderIdentity {
+    RequestId(String),
+    TranscriptionId(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,15 +125,15 @@ pub(super) fn parse_response(
     authoritative_duration_millis: u64,
     header_request_id: Option<String>,
 ) -> Result<ParsedBatchResult, ParseFailure> {
-    let payload: ResponseDto =
-        serde_json::from_slice(bytes).map_err(|_| malformed(header_request_id.clone()))?;
-    let transcription_id = payload
+    let payload: ResponseDto = serde_json::from_slice(bytes)
+        .map_err(|_| malformed(header_request_id.clone().map(ProviderIdentity::RequestId)))?;
+    let provider_identity = payload
         .transcription_id
         .as_deref()
-        .and_then(safe_request_id);
-    let provider_identity_is_transcription = transcription_id.is_some();
-    let provider_request_id = transcription_id.or(header_request_id);
-    validate_envelope(&payload, provider_request_id.clone())?;
+        .and_then(safe_request_id)
+        .map(ProviderIdentity::TranscriptionId)
+        .or_else(|| header_request_id.map(ProviderIdentity::RequestId));
+    validate_envelope(&payload, provider_identity.clone())?;
 
     let authoritative_seconds = Duration::from_millis(authoritative_duration_millis).as_secs_f64();
     let mut reconstructed = String::new();
@@ -138,7 +143,7 @@ pub(super) fn parse_response(
 
     for word in payload.words {
         if word.text.len() > MAX_TOKEN_BYTES {
-            return Err(malformed(provider_request_id));
+            return Err(malformed(provider_identity));
         }
         match word.kind.as_str() {
             "audio_event" => continue,
@@ -150,24 +155,21 @@ pub(super) fn parse_response(
             }
             "word" => {
                 if word.text.is_empty() {
-                    return Err(malformed(provider_request_id));
+                    return Err(malformed(provider_identity));
                 }
                 let start = bounded_timestamp(
                     word.start,
                     authoritative_seconds,
-                    provider_request_id.clone(),
+                    provider_identity.clone(),
                 )?;
-                let end = bounded_timestamp(
-                    word.end,
-                    authoritative_seconds,
-                    provider_request_id.clone(),
-                )?;
+                let end =
+                    bounded_timestamp(word.end, authoritative_seconds, provider_identity.clone())?;
                 if end <= start || previous_word_end.is_some_and(|previous| start < previous) {
-                    return Err(malformed(provider_request_id));
+                    return Err(malformed(provider_identity));
                 }
                 let confidence = word
                     .logprob
-                    .map(|value| log_probability(value, provider_request_id.clone()))
+                    .map(|value| log_probability(value, provider_identity.clone()))
                     .transpose()?;
                 let should_split = current.as_ref().is_some_and(|segment| {
                     previous_word_end
@@ -177,7 +179,7 @@ pub(super) fn parse_response(
                             && ends_sentence_punctuation(&segment.text))
                 });
                 if should_split {
-                    push_segment(&mut segments, current.take(), provider_request_id.clone())?;
+                    push_segment(&mut segments, current.take(), provider_identity.clone())?;
                 }
                 if let Some(segment) = &mut current {
                     segment.push_word(&word.text, end, confidence);
@@ -187,44 +189,43 @@ pub(super) fn parse_response(
                 previous_word_end = Some(end);
                 reconstructed.push_str(&word.text);
             }
-            _ => return Err(malformed(provider_request_id)),
+            _ => return Err(malformed(provider_identity)),
         }
         if reconstructed.len() > MAX_TRANSCRIPT_BYTES {
-            return Err(malformed(provider_request_id));
+            return Err(malformed(provider_identity));
         }
     }
-    push_segment(&mut segments, current, provider_request_id.clone())?;
+    push_segment(&mut segments, current, provider_identity.clone())?;
     if normalize_text(&reconstructed) != normalize_text(&payload.text)
         || payload.text.len() > MAX_TRANSCRIPT_BYTES
         || (payload.text.trim().is_empty() != segments.is_empty())
     {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
 
     let provider_duration_millis = payload
         .audio_duration_secs
         .map(seconds_to_millis)
         .transpose()
-        .map_err(|()| malformed(provider_request_id.clone()))?;
+        .map_err(|()| malformed(provider_identity.clone()))?;
     Ok(ParsedBatchResult {
         text: payload.text,
         provider_duration_millis,
         segments,
-        provider_request_id,
-        provider_identity_is_transcription,
+        provider_identity,
     })
 }
 
 fn validate_envelope(
     payload: &ResponseDto,
-    provider_request_id: Option<String>,
+    provider_identity: Option<ProviderIdentity>,
 ) -> Result<(), ParseFailure> {
     if payload.words.len() > MAX_WORDS
         || payload.language_code.trim().is_empty()
         || !payload.language_probability.is_finite()
         || !(0.0..=1.0).contains(&payload.language_probability)
     {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
     Ok(())
 }
@@ -232,20 +233,23 @@ fn validate_envelope(
 fn bounded_timestamp(
     value: Option<f64>,
     authoritative_seconds: f64,
-    provider_request_id: Option<String>,
+    provider_identity: Option<ProviderIdentity>,
 ) -> Result<f64, ParseFailure> {
-    let value = value.ok_or_else(|| malformed(provider_request_id.clone()))?;
+    let value = value.ok_or_else(|| malformed(provider_identity.clone()))?;
     let tolerance =
         TIMESTAMP_TOLERANCE_SECONDS.max(authoritative_seconds * TIMESTAMP_RELATIVE_TOLERANCE);
     if !value.is_finite() || value < 0.0 || value > authoritative_seconds + tolerance {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
     Ok(value.min(authoritative_seconds))
 }
 
-fn log_probability(value: f64, provider_request_id: Option<String>) -> Result<f64, ParseFailure> {
+fn log_probability(
+    value: f64,
+    provider_identity: Option<ProviderIdentity>,
+) -> Result<f64, ParseFailure> {
     if !value.is_finite() || value > 0.0 {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
     Ok(value.exp())
 }
@@ -253,23 +257,23 @@ fn log_probability(value: f64, provider_request_id: Option<String>) -> Result<f6
 fn push_segment(
     segments: &mut Vec<ParsedSegment>,
     segment: Option<SegmentBuilder>,
-    provider_request_id: Option<String>,
+    provider_identity: Option<ProviderIdentity>,
 ) -> Result<(), ParseFailure> {
     let Some(segment) = segment else {
         return Ok(());
     };
     if segment.text.trim().is_empty() || segments.len() == MAX_SEGMENTS {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
     let segment = segment
         .finish()
-        .ok_or_else(|| malformed(provider_request_id.clone()))?;
+        .ok_or_else(|| malformed(provider_identity.clone()))?;
     if segment.end_millis <= segment.start_millis
         || segments
             .last()
             .is_some_and(|previous| segment.start_millis < previous.end_millis)
     {
-        return Err(malformed(provider_request_id));
+        return Err(malformed(provider_identity));
     }
     segments.push(segment);
     Ok(())
@@ -294,17 +298,17 @@ fn ends_sentence_punctuation(value: &str) -> bool {
 }
 
 pub(super) fn safe_request_id(value: &str) -> Option<String> {
-    let value = value.trim();
     (!value.is_empty()
+        && value.trim() == value
         && value.len() <= 128
         && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
     .then(|| value.to_owned())
 }
 
-fn malformed(provider_request_id: Option<String>) -> ParseFailure {
+fn malformed(provider_identity: Option<ProviderIdentity>) -> ParseFailure {
     ParseFailure {
         code: MALFORMED_RESPONSE,
-        provider_request_id,
+        provider_identity,
     }
 }
 
@@ -335,8 +339,10 @@ mod tests {
                 .confidence
                 .is_some_and(|value| value > 0.8)
         );
-        assert_eq!(result.provider_request_id.as_deref(), Some("tx-123"));
-        assert!(result.provider_identity_is_transcription);
+        assert_eq!(
+            result.provider_identity,
+            Some(ProviderIdentity::TranscriptionId("tx-123".into()))
+        );
 
         let mut fallback = payload;
         fallback.as_object_mut().unwrap().remove("transcription_id");
@@ -346,8 +352,10 @@ mod tests {
             Some("header".into()),
         )
         .unwrap();
-        assert_eq!(result.provider_request_id.as_deref(), Some("header"));
-        assert!(!result.provider_identity_is_transcription);
+        assert_eq!(
+            result.provider_identity,
+            Some(ProviderIdentity::RequestId("header".into()))
+        );
     }
 
     #[test]
@@ -383,6 +391,46 @@ mod tests {
         ] {
             assert!(parse_response(payload.to_string().as_bytes(), 1_000, None).is_err());
         }
-        assert!(safe_request_id("bad\nid").is_none());
+        for rejected in ["", " padded", "padded ", "bad\nid", "bad\tid", "не-ascii"] {
+            assert!(safe_request_id(rejected).is_none(), "accepted {rejected:?}");
+        }
+        assert!(safe_request_id(&"x".repeat(129)).is_none());
+    }
+
+    #[test]
+    fn malformed_response_preserves_exact_typed_identity_provenance() {
+        let mut payload = serde_json::json!({
+            "language_code":"en", "language_probability":1.0,
+            "transcription_id":"body-transcription", "text":"different", "words":[
+                {"type":"word","text":"word","start":0.0,"end":0.5}
+            ]
+        });
+        let failure = parse_response(
+            payload.to_string().as_bytes(),
+            1_000,
+            Some("header-request".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.provider_identity,
+            Some(ProviderIdentity::TranscriptionId(
+                "body-transcription".into()
+            ))
+        );
+
+        payload["transcription_id"] = " padded".into();
+        let failure = parse_response(
+            payload.to_string().as_bytes(),
+            1_000,
+            Some("header-request".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.provider_identity,
+            Some(ProviderIdentity::RequestId("header-request".into()))
+        );
+
+        let failure = parse_response(payload.to_string().as_bytes(), 1_000, None).unwrap_err();
+        assert_eq!(failure.provider_identity, None);
     }
 }

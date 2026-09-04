@@ -167,8 +167,8 @@ fn terminal_error_code(kind: &str) -> Option<&'static str> {
 }
 
 pub(super) fn safe_reference(value: &str) -> Option<String> {
-    let value = value.trim();
     (!value.is_empty()
+        && value.trim() == value
         && value.len() <= 128
         && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
     .then(|| value.to_owned())
@@ -200,6 +200,22 @@ mod tests {
         assert_eq!(kind, TranscriptKind::SegmentFinal);
         assert_eq!(text, "hello");
         assert_eq!(confidence, Some(0.8));
+    }
+
+    #[test]
+    fn accepts_only_exact_bounded_printable_ascii_references() {
+        assert_eq!(safe_reference("session-1").as_deref(), Some("session-1"));
+        for rejected in [
+            "",
+            " session-1",
+            "session-1 ",
+            "bad\nid",
+            "bad\tid",
+            "не-ascii",
+        ] {
+            assert!(safe_reference(rejected).is_none(), "accepted {rejected:?}");
+        }
+        assert!(safe_reference(&"x".repeat(129)).is_none());
     }
 
     #[test]

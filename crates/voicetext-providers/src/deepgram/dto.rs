@@ -224,8 +224,11 @@ fn normalize_text(value: &str) -> String {
 }
 
 pub(super) fn safe_request_id(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty() && value.len() <= 128 && value.is_ascii()).then(|| value.to_owned())
+    (!value.is_empty()
+        && value.trim() == value
+        && value.len() <= 128
+        && value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)))
+    .then(|| value.to_owned())
 }
 
 fn malformed(provider_request_id: Option<String>) -> ParseFailure {
@@ -309,9 +312,16 @@ mod tests {
 
     #[test]
     fn unsafe_request_identifiers_are_discarded() {
-        assert_eq!(safe_request_id(" request-1 ").as_deref(), Some("request-1"));
-        assert_eq!(safe_request_id(""), None);
-        assert_eq!(safe_request_id("не-ascii"), None);
+        for rejected in [
+            "",
+            " request-1",
+            "request-1 ",
+            "bad\nid",
+            "bad\tid",
+            "не-ascii",
+        ] {
+            assert!(safe_request_id(rejected).is_none(), "accepted {rejected:?}");
+        }
         assert_eq!(safe_request_id(&"x".repeat(129)), None);
     }
 }

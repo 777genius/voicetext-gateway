@@ -266,8 +266,27 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_text(r#"{"type":"Metadata","request_id":" request-7 "}"#).unwrap(),
+            parse_text(r#"{"type":"Metadata","request_id":"request-7"}"#).unwrap(),
             ParsedLiveMessage::Metadata(Some("request-7".into()))
+        );
+        for request_id in [
+            "",
+            " request-7",
+            "request-7 ",
+            "bad\nid",
+            "bad\tid",
+            "не-ascii",
+        ] {
+            let payload = serde_json::json!({"type":"Metadata", "request_id":request_id});
+            assert_eq!(
+                parse_text(&payload.to_string()).unwrap(),
+                ParsedLiveMessage::Metadata(None)
+            );
+        }
+        let payload = serde_json::json!({"type":"Metadata", "request_id":"x".repeat(129)});
+        assert_eq!(
+            parse_text(&payload.to_string()).unwrap(),
+            ParsedLiveMessage::Metadata(None)
         );
     }
 

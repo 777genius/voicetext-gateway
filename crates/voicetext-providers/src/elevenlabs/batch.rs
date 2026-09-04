@@ -12,7 +12,7 @@ use voicetext_speech::application::ports::{
 
 use super::batch_capabilities::{self, CAPABILITIES};
 use super::batch_keyterms::canonicalize_keyterms;
-use super::dto::{self, ParsedBatchResult};
+use super::dto::{self, ParsedBatchResult, ProviderIdentity};
 
 pub(super) const CONTRACT_VERSION: u16 = 3;
 pub(super) const PROVIDER: &str = "elevenlabs";
@@ -113,7 +113,9 @@ impl ElevenLabsBatchRecognizer {
         }
         let body = read_bounded_success_body(response, provider_request_id.clone()).await?;
         let parsed = dto::parse_response(&body, authoritative_duration_millis, provider_request_id)
-            .map_err(|failure| unknown(failure.code, reference(failure.provider_request_id)))?;
+            .map_err(|failure| {
+                unknown(failure.code, identity_reference(failure.provider_identity))
+            })?;
         Ok(project_result(
             profile,
             authoritative_duration_millis,
@@ -189,11 +191,6 @@ fn project_result(
     authoritative_duration_millis: u64,
     parsed: ParsedBatchResult,
 ) -> BatchRecognitionResult {
-    let operation_kind = if parsed.provider_identity_is_transcription {
-        ProviderOperationKind::TranscriptionId
-    } else {
-        ProviderOperationKind::RequestId
-    };
     BatchRecognitionResult {
         profile,
         text: parsed.text,
@@ -211,9 +208,7 @@ fn project_result(
             })
             .collect(),
         readable_segments: None,
-        provider_reference: parsed
-            .provider_request_id
-            .map(|id| ProviderReference::operation(operation_kind, id)),
+        provider_reference: identity_reference(parsed.provider_identity),
     }
 }
 
@@ -312,6 +307,14 @@ fn reference(request_id: Option<String>) -> Option<ProviderReference> {
     request_id.map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id))
 }
 
+fn identity_reference(identity: Option<ProviderIdentity>) -> Option<ProviderReference> {
+    let (kind, id) = match identity? {
+        ProviderIdentity::RequestId(id) => (ProviderOperationKind::RequestId, id),
+        ProviderIdentity::TranscriptionId(id) => (ProviderOperationKind::TranscriptionId, id),
+    };
+    Some(ProviderReference::operation(kind, id))
+}
+
 fn known_not_accepted(
     retryable: bool,
     code: &str,
@@ -351,7 +354,6 @@ mod tests {
         headers: BTreeMap<String, String>,
         body: Vec<u8>,
     }
-
     #[derive(Debug)]
     struct FakeResponse {
         status: &'static str,
@@ -359,11 +361,9 @@ mod tests {
         body: Vec<u8>,
         declared_length: Option<usize>,
     }
-
     fn profile() -> BatchProfile {
         BatchProfile::new(CONTRACT_VERSION, PROVIDER, MODEL, LANGUAGE).unwrap()
     }
-
     fn request() -> BatchRecognitionRequest {
         BatchRecognitionRequest {
             profile: profile(),
@@ -372,7 +372,6 @@ mod tests {
             keyterms: vec!["Craig".into(), "release train".into()],
         }
     }
-
     fn spawn_fake(response: FakeResponse) -> (Url, Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -404,7 +403,6 @@ mod tests {
             receiver,
         )
     }
-
     fn read_request(stream: &mut impl Read) -> CapturedRequest {
         let mut bytes = Vec::new();
         let mut buffer = [0_u8; 2_048];
@@ -434,7 +432,6 @@ mod tests {
             body: bytes[header_end..header_end + content_length].to_vec(),
         }
     }
-
     fn success_body() -> Vec<u8> {
         serde_json::json!({
             "language_code":"en", "language_probability":0.99,
@@ -448,7 +445,6 @@ mod tests {
         .to_string()
         .into_bytes()
     }
-
     #[tokio::test]
     async fn sends_exact_scribe_v2_multipart_and_projects_response() {
         let (endpoint, captured) = spawn_fake(FakeResponse {
@@ -481,9 +477,14 @@ mod tests {
         assert!(!body.contains("name=\"language_code\""));
         assert_eq!(body.matches("name=\"keyterms\"").count(), 2);
         assert!(result.segments[0].confidence.is_some());
-        assert_eq!(result.provider_reference.unwrap().as_str(), "body-request");
+        let operation = result
+            .provider_reference
+            .unwrap()
+            .provider_operation()
+            .unwrap();
+        assert_eq!(operation.id(), "body-request");
+        assert_eq!(operation.kind(), ProviderOperationKind::TranscriptionId);
     }
-
     #[tokio::test]
     async fn classifies_statuses_without_unbounded_error_reads() {
         for (status, code) in [
@@ -529,7 +530,6 @@ mod tests {
             }
         }
     }
-
     #[tokio::test]
     async fn rejects_malformed_and_oversized_success_bodies_after_send() {
         for (body, declared_length, code) in [
