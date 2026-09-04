@@ -28,8 +28,9 @@ Each sink call gives its caller a one-second gateway-side deadline; the deadline
 All filesystem work and cleanup run on an isolated blocking worker. The worker checks both its own
 deadline and an explicit caller receipt before and after publication. A published name remains
 provisional until writing, record sync, create-only publication, temporary-name removal, directory
-sync, and the caller's acceptance have all completed. Timeout or cancellation wins that receipt, so
-later worker completion cannot turn the call into qualified evidence.
+sync, and the caller's acceptance have all completed. Caller acceptance rechecks the same absolute
+deadline while holding the receipt-state mutex. Timeout or cancellation wins that receipt, so later
+worker completion cannot turn the call into qualified evidence.
 
 Native filesystem syscalls are not preemptible and this is not a hard syscall-completion deadline.
 A syscall or inode-checked best-effort cleanup can finish after the caller has reported
@@ -37,9 +38,13 @@ A syscall or inode-checked best-effort cleanup can finish after the caller has r
 checks identity before unlinking, but check-then-unlink is not atomic against a same-UID process
 that can replace names. The directory must remain private mode `0700`, and an untrusted same-UID
 writer is outside the threat model. Filesystem failure, process termination, or power loss can
-leave cleanup ambiguous. Consumers must stop the gateway worker and reject sink-failure metrics,
-extra files, and incomplete campaigns; file presence alone never proves a successful sink call.
-The authoritative operation continues unchanged.
+leave cleanup ambiguous. In particular, a provisional final-looking JSON name can survive an
+abnormal process exit; this sink does not by itself close that B1 campaign-evidence gap. The
+separate external campaign producer must fail closed on forced or crashed process exit, await all
+blocking workers on an orderly stop, and require a clean gateway exit, zero sink-failure metrics,
+and the exact complete expected file inventory before joining observations into campaign evidence.
+File presence alone never proves a successful sink call. The authoritative operation continues
+unchanged.
 
 ## Records
 
@@ -95,10 +100,13 @@ actually normalized, not a provider response body.
 ## Canary producer consumption
 
 The later producer should start from an empty private directory, launch the shipped gateway with a
-unique validated campaign, drive its separately approved synthetic fixture, stop the gateway, and
-read create-only files. It must match planned effects by mode, profile, gateway job/session IDs, and
-typed native operation—not invent a `provider_result_id`. It should reject missing/null required
-identity, non-contiguous expected ACKs, non-established batch persistence, unexpected terminal or
-finalize evidence, duplicate effect IDs, count drift, digest mismatch, extra files, or sink-failure
-metrics. Source/image/runner/credential-owner/fixture provenance and acoustic scoring must be joined
-by that producer. These observations alone are never a campaign or release PASS.
+unique validated campaign, drive its separately approved synthetic fixture, and then stop the
+gateway. It must fail closed if the process was forced or crashed; on orderly shutdown it must await
+all blocking workers before reading create-only files. It must match planned effects by mode,
+profile, gateway job/session IDs, and typed native operation—not invent a `provider_result_id`. It
+must require clean process exit, zero sink-failure metrics, and an exact complete file inventory,
+and reject missing/null required identity, non-contiguous expected ACKs, non-established batch
+persistence, unexpected terminal or finalize evidence, duplicate effect IDs, count drift, digest
+mismatch, missing files, or extra files before any joins. Source/image/runner/credential-owner/
+fixture provenance and acoustic scoring must be joined by that producer. These observations alone
+are never a campaign or release PASS.

@@ -3,7 +3,6 @@ use crate::server::qualification_observation::{
     LiveObservationSink, LiveObservationTracker, ObservationProfile,
 };
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 
 fn record(effect_id: Uuid) -> LiveObservation {
@@ -45,8 +44,7 @@ async fn wait_until_empty(directory: &Path) {
 struct BlockingGate {
     stage: BlockingStage,
     entered: Notify,
-    released: AtomicBool,
-    mutex: Mutex<()>,
+    released: Mutex<bool>,
     changed: Condvar,
 }
 
@@ -55,8 +53,7 @@ impl BlockingGate {
         Arc::new(Self {
             stage,
             entered: Notify::new(),
-            released: AtomicBool::new(false),
-            mutex: Mutex::new(()),
+            released: Mutex::new(false),
             changed: Condvar::new(),
         })
     }
@@ -68,17 +65,68 @@ impl BlockingGate {
                 return;
             }
             gate.entered.notify_one();
-            let mut guard = gate.mutex.lock().unwrap();
-            while !gate.released.load(Ordering::Acquire) {
-                guard = gate.changed.wait(guard).unwrap();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.changed.wait(released).unwrap();
             }
         })
     }
 
     fn release(&self) {
-        self.released.store(true, Ordering::Release);
+        let mut released = self.released.lock().unwrap();
+        *released = true;
         self.changed.notify_all();
     }
+}
+
+#[test]
+fn receipt_wait_cannot_lose_accept_notification() {
+    let receipt = Arc::new(PublicationReceipt::new());
+    let (at_wait_sender, at_wait_receiver) = std::sync::mpsc::channel();
+    let (release_wait_sender, release_wait_receiver) = std::sync::mpsc::channel();
+    let (waited_sender, waited_receiver) = std::sync::mpsc::channel();
+    let waiting_receipt = Arc::clone(&receipt);
+    let waiter = std::thread::spawn(move || {
+        let state = waiting_receipt.wait_for_caller_after(|| {
+            at_wait_sender.send(()).unwrap();
+            release_wait_receiver.recv().unwrap();
+        });
+        waited_sender.send(state).unwrap();
+    });
+
+    at_wait_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let accepting_receipt = Arc::clone(&receipt);
+    let (accepting_sender, accepting_receiver) = std::sync::mpsc::channel();
+    let accepter = std::thread::spawn(move || {
+        accepting_sender.send(()).unwrap();
+        accepting_receipt.accept(Instant::now() + Duration::from_secs(5))
+    });
+    accepting_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    release_wait_sender.send(()).unwrap();
+
+    let waited = waited_receiver.recv_timeout(Duration::from_secs(1));
+    if waited.is_err() {
+        receipt.cancel();
+    }
+    assert_eq!(waited.unwrap(), ReceiptState::Accepted);
+    assert!(accepter.join().unwrap());
+    waiter.join().unwrap();
+}
+
+#[test]
+fn caller_delayed_past_absolute_deadline_cancels_ready_receipt() {
+    let receipt = PublicationReceipt::new();
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap();
+
+    // Worker readiness deliberately leaves the receipt active for caller acceptance.
+    assert!(!receipt.accept(expired));
+    assert_eq!(receipt.wait_for_caller(), ReceiptState::Cancelled);
 }
 
 #[tokio::test]

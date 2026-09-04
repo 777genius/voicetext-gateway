@@ -10,7 +10,7 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -18,9 +18,13 @@ use uuid::Uuid;
 
 const MAX_OBSERVATIONS: usize = 64;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
-const RECEIPT_ACTIVE: u8 = 0;
-const RECEIPT_CANCELLED: u8 = 1;
-const RECEIPT_ACCEPTED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptState {
+    Active,
+    Cancelled,
+    Accepted,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BlockingStage {
@@ -32,7 +36,8 @@ enum BlockingStage {
 #[cfg(test)]
 type BlockingHook = Arc<dyn Fn(BlockingStage) + Send + Sync>;
 #[cfg(not(test))]
-type BlockingHook = ();
+#[derive(Clone)]
+struct BlockingHook;
 
 pub struct FileQualificationSink {
     directory: PathBuf,
@@ -164,7 +169,7 @@ impl FileQualificationSink {
             let result = prepared
                 .await
                 .unwrap_or(Err(ObservationSinkFailure("QUALIFICATION_WRITE_FAILED")));
-            if result.is_ok() && !cancellation.accept() {
+            if result.is_ok() && !cancellation.accept(deadline) {
                 return Err(ObservationSinkFailure("QUALIFICATION_WRITE_TIMEOUT"));
             }
             result
@@ -247,7 +252,7 @@ fn checkpoint(
     receipt: &PublicationReceipt,
     deadline: Instant,
 ) -> Result<(), ObservationSinkFailure> {
-    if receipt.is_active() && Instant::now() <= deadline {
+    if receipt.is_active_before(deadline) {
         Ok(())
     } else {
         Err(ObservationSinkFailure("QUALIFICATION_WRITE_TIMEOUT"))
@@ -255,64 +260,82 @@ fn checkpoint(
 }
 
 struct PublicationReceipt {
-    state: AtomicU8,
-    mutex: Mutex<()>,
+    state: Mutex<ReceiptState>,
     changed: Condvar,
 }
 
 impl PublicationReceipt {
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(RECEIPT_ACTIVE),
-            mutex: Mutex::new(()),
+            state: Mutex::new(ReceiptState::Active),
             changed: Condvar::new(),
         }
     }
 
-    fn is_active(&self) -> bool {
-        self.state.load(Ordering::Acquire) == RECEIPT_ACTIVE
+    fn is_active_before(&self, deadline: Instant) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state == ReceiptState::Active && Instant::now() <= deadline
     }
 
-    fn accept(&self) -> bool {
-        let accepted = self
+    fn accept(&self, deadline: Instant) -> bool {
+        let mut state = self
             .state
-            .compare_exchange(
-                RECEIPT_ACTIVE,
-                RECEIPT_ACCEPTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let accepted = *state == ReceiptState::Active && Instant::now() <= deadline;
+        if *state == ReceiptState::Active {
+            *state = if accepted {
+                ReceiptState::Accepted
+            } else {
+                ReceiptState::Cancelled
+            };
+        }
         self.changed.notify_all();
         accepted
     }
 
     fn cancel(&self) {
-        let _ = self.state.compare_exchange(
-            RECEIPT_ACTIVE,
-            RECEIPT_CANCELLED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *state == ReceiptState::Active {
+            *state = ReceiptState::Cancelled;
+        }
         self.changed.notify_all();
     }
 
-    fn wait_for_caller(&self) {
-        let mut guard = self.mutex.lock().unwrap_or_else(|error| error.into_inner());
-        while self.is_active() {
-            guard = self
+    fn wait_for_caller(&self) -> ReceiptState {
+        self.wait_for_caller_after(|| {})
+    }
+
+    fn wait_for_caller_after(&self, before_first_wait: impl FnOnce()) -> ReceiptState {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut before_first_wait = Some(before_first_wait);
+        while *state == ReceiptState::Active {
+            if let Some(before_first_wait) = before_first_wait.take() {
+                before_first_wait();
+            }
+            state = self
                 .changed
-                .wait(guard)
-                .unwrap_or_else(|error| error.into_inner());
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        *state
     }
 }
 
 struct CallerCancellation(Arc<PublicationReceipt>);
 
 impl CallerCancellation {
-    fn accept(&self) -> bool {
-        self.0.accept()
+    fn accept(&self, deadline: Instant) -> bool {
+        self.0.accept(deadline)
     }
 }
 
@@ -366,8 +389,7 @@ impl PublicationGuard {
     }
 
     fn complete_when_accepted(&mut self, receipt: &PublicationReceipt) {
-        receipt.wait_for_caller();
-        self.complete = receipt.state.load(Ordering::Acquire) == RECEIPT_ACCEPTED;
+        self.complete = receipt.wait_for_caller() == ReceiptState::Accepted;
     }
 }
 
@@ -398,7 +420,9 @@ fn default_hook() -> BlockingHook {
 }
 
 #[cfg(not(test))]
-fn default_hook() -> BlockingHook {}
+fn default_hook() -> BlockingHook {
+    BlockingHook
+}
 
 #[cfg(test)]
 fn run_hook(hook: &BlockingHook, stage: BlockingStage) {
