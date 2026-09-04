@@ -19,8 +19,8 @@ use voicetext_gateway::config::GatewayConfig;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::{MachineSecret, SecretText};
 use voicetext_gateway::server::{
-    GatewayLimits, GatewayState, PostgresSpoolReadiness, reconcile_startup, router,
-    start_startup_recovery,
+    FileQualificationSink, GatewayLimits, GatewayState, PostgresSpoolReadiness, reconcile_startup,
+    router, start_startup_recovery,
 };
 use voicetext_gateway::storage::{DurableFileSpool, PostgresBatchJobStore};
 
@@ -117,7 +117,7 @@ async fn run() -> Result<(), BootstrapFailure> {
         pool.clone(),
         config.spool_directory.clone(),
     ));
-    let state = GatewayState::new(
+    let mut state = GatewayState::new(
         auth,
         jobs.clone(),
         spool.clone(),
@@ -125,6 +125,13 @@ async fn run() -> Result<(), BootstrapFailure> {
         readiness,
         limits,
     );
+    if let Some(qualification) = &config.qualification_observation {
+        let sink = Arc::new(
+            FileQualificationSink::new(&qualification.directory, &qualification.campaign)
+                .map_err(|_| BootstrapFailure::QualificationObservation)?,
+        );
+        state = state.with_qualification_observers(sink.clone(), sink);
+    }
 
     let recovery = reconcile_startup(&state)
         .await
@@ -308,6 +315,7 @@ enum BootstrapFailure {
     Spool,
     ProviderSecret,
     ProviderConfiguration,
+    QualificationObservation,
     NoProvider,
     TransportLimits,
     Bind,
@@ -327,6 +335,7 @@ impl BootstrapFailure {
             Self::Spool => "SPOOL_INVALID",
             Self::ProviderSecret => "PROVIDER_SECRET_INVALID",
             Self::ProviderConfiguration => "PROVIDER_CONFIGURATION_INVALID",
+            Self::QualificationObservation => "QUALIFICATION_OBSERVATION_INVALID",
             Self::NoProvider => "NO_PROVIDER_CONFIGURED",
             Self::TransportLimits => "TRANSPORT_LIMITS_INVALID",
             Self::Bind => "LISTENER_BIND_FAILED",

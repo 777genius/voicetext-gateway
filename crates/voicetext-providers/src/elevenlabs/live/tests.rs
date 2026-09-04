@@ -147,6 +147,9 @@ async fn manual_commit_prevents_delayed_vad_from_preceding_the_explicit_result()
         RecognitionFailure::KnownAcceptedTerminal { .. }
     ));
     assert_eq!(error.provider_reference().unwrap().as_str(), "session-1");
+    let operation = session.provider_operation().await.unwrap();
+    assert_eq!(operation.kind(), ProviderOperationKind::SessionId);
+    assert_eq!(operation.id(), "session-1");
     session.close().await.unwrap();
     let (target, key, audio, commit_audio) = server.await.unwrap();
     assert_eq!(key, "test-secret");

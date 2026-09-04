@@ -7,7 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 use voicetext_speech::application::ports::{
     BatchAudioHandle, BatchJobId, BatchJobSnapshot, BatchReadableSegment, BatchRecognitionResult,
-    BatchSegment, ProviderReference,
+    BatchSegment, ProviderOperationKind, ProviderReference,
 };
 use voicetext_speech::domain::batch::{
     BatchFailure, BatchJob, BatchJobState, BatchProfile, BatchRequestFingerprint,
@@ -84,6 +84,16 @@ struct ResultRecord {
     provider_duration_millis: Option<u64>,
     segments: Vec<SegmentRecord>,
     readable_segments: Option<Vec<ReadableRecord>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_operation_kind: Option<OperationKindRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationKindRecord {
+    RequestId,
+    TranscriptionId,
+    SessionId,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -130,7 +140,7 @@ impl TryFrom<JobRecord> for BatchJobSnapshot {
         let keyterms: Vec<String> =
             serde_json::from_value(record.keyterms).map_err(|_| RecordError("INVALID_KEYTERMS"))?;
         validate_keyterms(&keyterms)?;
-        let provider_reference = reference(record.provider_reference)?;
+        let mut provider_reference = reference(record.provider_reference)?;
         let state = restore_state(
             &record.state,
             record.attempt,
@@ -143,6 +153,9 @@ impl TryFrom<JobRecord> for BatchJobSnapshot {
             duration,
             provider_reference.clone(),
         )?;
+        if let Some(result) = &result {
+            provider_reference.clone_from(&result.provider_reference);
+        }
         validate_result_presence(&state, result.is_some())?;
         let retry_after_millis = restore_retry_after(&state, record.retry_after_millis)?;
         let revision =
@@ -445,6 +458,15 @@ fn serialize_result(
                 })
                 .collect()
         }),
+        provider_operation_kind: result
+            .provider_reference
+            .as_ref()
+            .and_then(ProviderReference::provider_operation)
+            .map(|operation| match operation.kind() {
+                ProviderOperationKind::RequestId => OperationKindRecord::RequestId,
+                ProviderOperationKind::TranscriptionId => OperationKindRecord::TranscriptionId,
+                ProviderOperationKind::SessionId => OperationKindRecord::SessionId,
+            }),
     };
     let value = serde_json::to_string(&record).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
     bounded_json(&value)?;
@@ -461,6 +483,17 @@ fn restore_result(
     bounded_json(&value)?;
     let record: ResultRecord =
         serde_json::from_str(&value).map_err(|_| RecordError("INVALID_RESULT_JSON"))?;
+    let provider_reference = match (record.provider_operation_kind, provider_reference) {
+        (Some(kind), Some(reference)) => Some(ProviderReference::operation(
+            match kind {
+                OperationKindRecord::RequestId => ProviderOperationKind::RequestId,
+                OperationKindRecord::TranscriptionId => ProviderOperationKind::TranscriptionId,
+                OperationKindRecord::SessionId => ProviderOperationKind::SessionId,
+            },
+            reference.as_str(),
+        )),
+        (_, reference) => reference,
+    };
     let result = BatchRecognitionResult {
         profile: profile.clone(),
         text: record.text,

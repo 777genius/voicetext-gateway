@@ -6,7 +6,7 @@ use crate::application::live_timeline::{AcceptedAudioError, LiveTimeline, LiveTi
 use crate::application::ports::RecognitionFailure;
 use crate::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
-    LiveRecognizerSession, LiveTranscript,
+    LiveRecognizerSession, LiveTranscript, ProviderOperation,
 };
 use crate::domain::live::{
     FinalizeOutcome, FinalizeStatus, LiveSession, LiveSessionError, LiveSessionPhase,
@@ -157,6 +157,11 @@ impl LiveCoordinator {
         &self,
     ) -> BoxFuture<'_, Result<Option<LiveRecognitionEvent>, RecognitionFailure>> {
         self.provider.next_event()
+    }
+
+    /// Returns the actual typed provider operation currently known by the bound session.
+    pub fn provider_operation(&self) -> BoxFuture<'_, Option<ProviderOperation>> {
+        self.provider.provider_operation()
     }
 
     /// Validates and applies one result returned by [`Self::receive_provider_event`].

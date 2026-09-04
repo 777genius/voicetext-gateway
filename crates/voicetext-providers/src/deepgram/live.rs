@@ -23,7 +23,8 @@ use voicetext_speech::application::live_capabilities::{
 };
 use voicetext_speech::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
-    LiveRecognizerSession, ProviderReference, RecognitionFailure,
+    LiveRecognizerSession, ProviderOperation, ProviderOperationKind, ProviderReference,
+    RecognitionFailure,
 };
 
 const PROTOCOL_VERSION: u16 = 2;
@@ -167,8 +168,8 @@ impl DeepgramLiveRecognizer {
             ));
         }
 
-        let provider_reference =
-            request_id_from_headers(response.headers()).map(ProviderReference::new);
+        let provider_reference = request_id_from_headers(response.headers())
+            .map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id));
         let (writer, reader) = socket.split();
         Ok(Box::new(DeepgramLiveSession {
             writer: Mutex::new(writer),
@@ -289,7 +290,10 @@ impl DeepgramLiveSession {
                     }
                     Ok(ParsedLiveMessage::Metadata(request_id)) => {
                         if let Some(request_id) = request_id {
-                            state.provider_reference = Some(ProviderReference::new(request_id));
+                            state.provider_reference = Some(ProviderReference::operation(
+                                ProviderOperationKind::RequestId,
+                                request_id,
+                            ));
                         }
                     }
                     Ok(ParsedLiveMessage::TerminalError) => {
@@ -330,6 +334,17 @@ impl fmt::Debug for DeepgramLiveSession {
 }
 
 impl LiveRecognizerSession for DeepgramLiveSession {
+    fn provider_operation(&self) -> BoxFuture<'_, Option<ProviderOperation>> {
+        Box::pin(async move {
+            self.reader
+                .lock()
+                .await
+                .provider_reference
+                .as_ref()
+                .and_then(ProviderReference::provider_operation)
+        })
+    }
+
     fn write_audio(&self, frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
             self.write_message(

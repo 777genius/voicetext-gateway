@@ -2,7 +2,9 @@
 
 use super::error::GatewayHttpError;
 use super::live_error::SafeLiveError;
+use super::live_request::recognition_request;
 use super::metrics::GatewayMetrics;
+use super::qualification_observation::{LiveObservationTracker, ObservationProfile};
 use super::state::GatewayState;
 use crate::auth::authenticate;
 use crate::contracts::live::{
@@ -21,8 +23,7 @@ use voicetext_audio::discord_opus::DiscordOpusDecoder;
 use voicetext_speech::application::live::{LiveCoordinator, LiveCoordinatorEvent};
 use voicetext_speech::application::live_capabilities::{LiveCapabilityRequest, LiveInputFormat};
 use voicetext_speech::application::ports::{
-    LiveRecognitionEvent, LiveRecognitionRequest, LiveTranscript, LiveTranscriptStability,
-    RecognitionFailure,
+    LiveRecognitionEvent, LiveTranscript, LiveTranscriptStability, RecognitionFailure,
 };
 use voicetext_speech::domain::live::FinalizeStatus as DomainFinalizeStatus;
 const FINALIZE_QUIESCENCE: Duration = Duration::from_millis(100);
@@ -61,10 +62,18 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
             return;
         }
     };
-    if send_message(
+    let gateway_session_id = Uuid::new_v4();
+    let mut observation = state.live_observations().enabled().then(|| {
+        LiveObservationTracker::new(
+            opened.client_session_id,
+            gateway_session_id,
+            opened.profile.clone(),
+        )
+    });
+    let terminal_status = if send_message(
         &mut socket,
         OutboundServerMessage::Ready {
-            session_id: Uuid::new_v4(),
+            session_id: gateway_session_id,
             identity: opened.identity,
         },
     )
@@ -72,12 +81,24 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
     .is_err()
     {
         state.metrics().live_failure();
-        close_coordinator(&mut opened.coordinator).await;
-        close_socket(&mut socket).await;
-        return;
+        "ready_delivery_failed".to_owned()
+    } else {
+        stream(&mut socket, &state, &mut opened, observation.as_mut()).await
+    };
+    if let Some(observation) = observation {
+        let operation = timeout(
+            PROVIDER_CLOSE_TIMEOUT,
+            opened.coordinator.provider_operation(),
+        )
+        .await
+        .ok()
+        .flatten();
+        let record = observation.finish(operation, terminal_status);
+        if let Err(failure) = state.live_observations().observe_live(record).await {
+            state.metrics().qualification_observation_failure();
+            tracing::warn!(code = failure.0, "qualification observation missing");
+        }
     }
-
-    stream(&mut socket, &state, &mut opened).await;
     close_coordinator(&mut opened.coordinator).await;
     close_socket(&mut socket).await;
 }
@@ -122,6 +143,12 @@ async fn prepare_session(
         })
         .map_err(|_| SafeLiveError::InvalidConfig)?;
     let request = recognition_request(&config);
+    let profile = ObservationProfile {
+        contract_version: request.profile.protocol_version,
+        provider: request.profile.provider.clone(),
+        model: request.profile.model.clone(),
+        language: request.profile.language.clone(),
+    };
     let coordinator = timeout(
         PROVIDER_CONNECT_TIMEOUT,
         LiveCoordinator::open(factory.as_ref(), request),
@@ -131,12 +158,19 @@ async fn prepare_session(
     .map_err(|error| SafeLiveError::from_coordinator(&error, "open"))?;
     Ok(OpenedSession {
         identity: config.identity,
+        client_session_id: config.client_session_id,
+        profile,
         decoder,
         coordinator,
     })
 }
 
-async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut OpenedSession) {
+async fn stream(
+    socket: &mut WebSocket,
+    state: &GatewayState,
+    opened: &mut OpenedSession,
+    mut observation: Option<&mut LiveObservationTracker>,
+) -> String {
     let limits = state.limits();
     let session_deadline = Instant::now() + LIVE_SESSION_TIMEOUT;
     let mut idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
@@ -164,37 +198,49 @@ async fn stream(socket: &mut WebSocket, state: &GatewayState, opened: &mut Opene
                     limits.live_frame_bytes,
                     &mut accepted_audio,
                     state.metrics(),
+                    observation.as_deref_mut(),
                 )
                 .await
             }
             Raced::Provider(provider) => {
                 idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
-                handle_provider_event(provider, socket, &mut opened.coordinator).await
+                handle_provider_event(
+                    provider,
+                    socket,
+                    &mut opened.coordinator,
+                    observation.as_deref_mut(),
+                )
+                .await
             }
             Raced::IdleTimeout | Raced::SessionTimeout => Err(SafeLiveError::SessionTimeout),
         };
         match control {
             Ok(LoopControl::Continue) => {}
-            Ok(LoopControl::Close) => break,
+            Ok(LoopControl::Close) => return "client_close".into(),
             Ok(LoopControl::Finalize) => {
                 let finalized = finalize(
                     socket,
                     &mut opened.coordinator,
                     accepted_audio,
                     limits.finalize_timeout,
+                    observation.as_deref_mut(),
                 )
                 .await;
                 match finalized {
                     // `finalize_complete` is the protocol terminal. Close immediately so queued
                     // client frames cannot be classified as a second terminal `error`.
-                    Ok(()) => {}
-                    Err(error) => fail_socket(socket, error, state.metrics()).await,
+                    Ok(status) => return format!("finalize_{status:?}").to_ascii_lowercase(),
+                    Err(error) => {
+                        let terminal = error.code().to_owned();
+                        fail_socket(socket, error, state.metrics()).await;
+                        return terminal;
+                    }
                 }
-                break;
             }
             Err(error) => {
+                let terminal = error.code().to_owned();
                 fail_socket(socket, error, state.metrics()).await;
-                break;
+                return terminal;
             }
         }
     }
@@ -227,6 +273,7 @@ async fn handle_client_frame(
     maximum: usize,
     accepted_audio: &mut bool,
     metrics: &GatewayMetrics,
+    mut observation: Option<&mut LiveObservationTracker>,
 ) -> Result<LoopControl, SafeLiveError> {
     let message = received
         .ok_or(SafeLiveError::TransportClosed)?
@@ -240,8 +287,15 @@ async fn handle_client_frame(
                     SafeLiveError::InvalidAudio
                 });
             }
-            let pcm = decode_audio(decoder, frame.to_vec())?;
+            let raw = frame.to_vec();
+            if let Some(observation) = observation.as_deref_mut() {
+                observation.accept_frame();
+            }
+            let pcm = decode_audio(decoder, &raw)?;
             let sequence = write_audio_or_cancel(socket, coordinator, pcm).await?;
+            if let Some(observation) = observation.as_deref_mut() {
+                observation.provider_written(sequence.get());
+            }
             metrics.live_frame();
             send_message(
                 socket,
@@ -253,6 +307,9 @@ async fn handle_client_frame(
             coordinator
                 .ack_sent(sequence)
                 .map_err(|error| SafeLiveError::from_coordinator(&error, "ack"))?;
+            if let Some(observation) = observation {
+                observation.ack_sent(sequence.get(), &raw);
+            }
             *accepted_audio = true;
             Ok(LoopControl::Continue)
         }
@@ -308,14 +365,14 @@ async fn write_audio_or_cancel(
 
 fn decode_audio(
     decoder: &mut Option<DiscordOpusDecoder>,
-    frame: Vec<u8>,
+    frame: &[u8],
 ) -> Result<Vec<u8>, SafeLiveError> {
     match decoder {
         Some(decoder) => decoder
-            .decode(&frame)
+            .decode(frame)
             .map(|decoded| decoded.pcm_s16le)
             .map_err(|_| SafeLiveError::InvalidAudio),
-        None if !frame.is_empty() && (frame.len() & 1) == 0 => Ok(frame),
+        None if !frame.is_empty() && (frame.len() & 1) == 0 => Ok(frame.to_vec()),
         None => Err(SafeLiveError::InvalidAudio),
     }
 }
@@ -324,7 +381,11 @@ async fn handle_provider_event(
     received: Result<Option<LiveRecognitionEvent>, RecognitionFailure>,
     socket: &mut WebSocket,
     coordinator: &mut LiveCoordinator,
+    observation: Option<&mut LiveObservationTracker>,
 ) -> Result<LoopControl, SafeLiveError> {
+    if let (Some(observation), Ok(Some(event))) = (observation, &received) {
+        observation.provider_event(event);
+    }
     let ended = matches!(received, Ok(None));
     let event = coordinator
         .apply_provider_event(received)
@@ -344,7 +405,8 @@ async fn finalize(
     coordinator: &mut LiveCoordinator,
     accepted_audio: bool,
     maximum_wait: Duration,
-) -> Result<(), SafeLiveError> {
+    mut observation: Option<&mut LiveObservationTracker>,
+) -> Result<FinalizeStatus, SafeLiveError> {
     if coordinator.pending_audio_count() != 0 {
         return Err(SafeLiveError::PendingAcknowledgements);
     }
@@ -378,6 +440,9 @@ async fn finalize(
             received,
             Ok(Some(LiveRecognitionEvent::FinalizeResultObserved))
         );
+        if let (Some(observation), Ok(Some(event))) = (observation.as_deref_mut(), &received) {
+            observation.provider_event(event);
+        }
         let event = coordinator
             .apply_provider_event(received)
             .map_err(|error| SafeLiveError::from_coordinator(&error, "finalize_stream"))?;
@@ -400,18 +465,20 @@ async fn finalize(
     let outcome = coordinator
         .complete_finalize(requested)
         .map_err(|error| SafeLiveError::from_coordinator(&error, "finalize_complete"))?;
+    let status = match outcome.status() {
+        DomainFinalizeStatus::Flushed => FinalizeStatus::Flushed,
+        DomainFinalizeStatus::NoProvider => FinalizeStatus::NoProvider,
+        DomainFinalizeStatus::Timeout => FinalizeStatus::Timeout,
+    };
     send_message(
         socket,
         OutboundServerMessage::FinalizeComplete {
-            status: match outcome.status() {
-                DomainFinalizeStatus::Flushed => FinalizeStatus::Flushed,
-                DomainFinalizeStatus::NoProvider => FinalizeStatus::NoProvider,
-                DomainFinalizeStatus::Timeout => FinalizeStatus::Timeout,
-            },
+            status,
             saw_result: outcome.saw_result(),
         },
     )
-    .await
+    .await?;
+    Ok(status)
 }
 
 async fn begin_finalize_or_cancel(
@@ -496,27 +563,6 @@ async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &Gat
     .await;
 }
 
-fn recognition_request(config: &ClientConfig) -> LiveRecognitionRequest {
-    let (provider, model) = match config.identity {
-        LiveIdentity::DeepgramNova3 => ("deepgram", "nova-3"),
-        LiveIdentity::ElevenlabsScribeV2Realtime => ("elevenlabs", "scribe_v2_realtime"),
-    };
-    LiveRecognitionRequest {
-        profile: voicetext_speech::application::ports::LiveProfile {
-            protocol_version: 2,
-            provider: provider.into(),
-            model: model.into(),
-            language: config.language.clone(),
-        },
-        sample_rate_hz: match config.audio_format {
-            AudioFormat::Opus48Khz => 48_000,
-            AudioFormat::PcmS16le16Khz => 16_000,
-        },
-        channels: 1,
-        keyterms: config.keyterms.clone(),
-    }
-}
-
 enum Raced {
     Client(Option<Result<Message, axum::Error>>),
     Provider(Result<Option<LiveRecognitionEvent>, RecognitionFailure>),
@@ -526,6 +572,8 @@ enum Raced {
 
 struct OpenedSession {
     identity: LiveIdentity,
+    client_session_id: Uuid,
+    profile: ObservationProfile,
     decoder: Option<DiscordOpusDecoder>,
     coordinator: LiveCoordinator,
 }

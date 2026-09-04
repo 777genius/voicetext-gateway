@@ -156,6 +156,9 @@ async fn sends_exact_handshake_audio_finalize_close_and_normalizes_events() {
         RecognitionFailureClass::KnownAcceptedTerminal
     );
     assert_eq!(error.provider_reference().unwrap().as_str(), "metadata-2");
+    let operation = session.provider_operation().await.unwrap();
+    assert_eq!(operation.kind(), ProviderOperationKind::RequestId);
+    assert_eq!(operation.id(), "metadata-2");
     session.close().await.unwrap();
     let captured = server.await.unwrap();
     assert_eq!(captured.authorization, "Token test-secret");

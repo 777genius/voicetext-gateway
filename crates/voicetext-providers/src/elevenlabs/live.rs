@@ -23,7 +23,8 @@ use voicetext_speech::application::live_capabilities::{
 };
 use voicetext_speech::application::ports::{
     BoxFuture, LiveAudioFrame, LiveRecognitionEvent, LiveRecognitionRequest, LiveRecognizerFactory,
-    LiveRecognizerSession, ProviderReference, RecognitionFailure,
+    LiveRecognizerSession, ProviderOperation, ProviderOperationKind, ProviderReference,
+    RecognitionFailure,
 };
 
 use super::live_dto::{self, ParsedLiveMessage};
@@ -162,8 +163,8 @@ impl ElevenLabsLiveRecognizer {
                 response.headers(),
             ));
         }
-        let provider_reference =
-            request_id_from_headers(response.headers()).map(ProviderReference::new);
+        let provider_reference = request_id_from_headers(response.headers())
+            .map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id));
         let (writer, reader) = socket.split();
         Ok(Box::new(ElevenLabsLiveSession {
             writer: Mutex::new(writer),
@@ -285,6 +286,17 @@ impl fmt::Debug for ElevenLabsLiveSession {
 }
 
 impl LiveRecognizerSession for ElevenLabsLiveSession {
+    fn provider_operation(&self) -> BoxFuture<'_, Option<ProviderOperation>> {
+        Box::pin(async move {
+            self.state
+                .lock()
+                .await
+                .provider_reference()
+                .as_ref()
+                .and_then(ProviderReference::provider_operation)
+        })
+    }
+
     fn write_audio(&self, frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>> {
         Box::pin(async move {
             if frame.pcm_s16le.is_empty()

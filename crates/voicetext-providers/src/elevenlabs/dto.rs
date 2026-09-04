@@ -18,6 +18,7 @@ pub(super) struct ParsedBatchResult {
     pub provider_duration_millis: Option<u64>,
     pub segments: Vec<ParsedSegment>,
     pub provider_request_id: Option<String>,
+    pub provider_identity_is_transcription: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,11 +122,12 @@ pub(super) fn parse_response(
 ) -> Result<ParsedBatchResult, ParseFailure> {
     let payload: ResponseDto =
         serde_json::from_slice(bytes).map_err(|_| malformed(header_request_id.clone()))?;
-    let provider_request_id = payload
+    let transcription_id = payload
         .transcription_id
         .as_deref()
-        .and_then(safe_request_id)
-        .or(header_request_id);
+        .and_then(safe_request_id);
+    let provider_identity_is_transcription = transcription_id.is_some();
+    let provider_request_id = transcription_id.or(header_request_id);
     validate_envelope(&payload, provider_request_id.clone())?;
 
     let authoritative_seconds = Duration::from_millis(authoritative_duration_millis).as_secs_f64();
@@ -209,6 +211,7 @@ pub(super) fn parse_response(
         provider_duration_millis,
         segments,
         provider_request_id,
+        provider_identity_is_transcription,
     })
 }
 

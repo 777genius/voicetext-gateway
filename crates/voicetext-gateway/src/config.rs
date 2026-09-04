@@ -38,6 +38,10 @@ pub const SHUTDOWN_DRAIN_TIMEOUT_ENV: &str = "VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_M
 pub const MAX_CONNECTIONS_ENV: &str = "VOICETEXT_MAX_CONNECTIONS";
 /// Maximum accepted batch upload size in bytes.
 pub const MAX_UPLOAD_BYTES_ENV: &str = "VOICETEXT_MAX_UPLOAD_BYTES";
+/// Opt-in absolute directory for synthetic qualification observation records.
+pub const QUALIFICATION_OBSERVATION_DIR_ENV: &str = "VOICETEXT_QUALIFICATION_OBSERVATION_DIR";
+/// Bounded pathname-safe synthetic qualification campaign label.
+pub const QUALIFICATION_CAMPAIGN_ENV: &str = "VOICETEXT_QUALIFICATION_CAMPAIGN";
 
 const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0:8080";
 const DEFAULT_DEEPGRAM_BATCH_ENDPOINT: &str = "https://api.deepgram.com/v1/listen";
@@ -85,6 +89,15 @@ pub struct GatewayConfig {
     pub max_upload_bytes: usize,
     /// Whether local-test plaintext provider transports are permitted.
     pub allow_insecure_provider_endpoints: bool,
+    /// Absent by default; both values must be explicitly configured to enable observations.
+    pub qualification_observation: Option<QualificationObservationConfig>,
+}
+
+/// Validated opt-in local qualification observation destination.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QualificationObservationConfig {
+    pub directory: PathBuf,
+    pub campaign: String,
 }
 
 /// Validated provider transport endpoints.
@@ -122,6 +135,7 @@ impl GatewayConfig {
     pub fn from_lookup(
         mut lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
+        let qualification_observation = qualification_observation(&mut lookup)?;
         let allow_insecure_provider_endpoints = parse_boolean(
             optional(&mut lookup, ALLOW_INSECURE_ENDPOINTS_ENV)?,
             ALLOW_INSECURE_ENDPOINTS_ENV,
@@ -200,6 +214,7 @@ impl GatewayConfig {
                 MAX_MAX_UPLOAD_BYTES,
             )?,
             allow_insecure_provider_endpoints,
+            qualification_observation,
         })
     }
 }
@@ -232,6 +247,34 @@ pub enum ConfigError {
     /// A provider endpoint has the wrong structure or transport scheme.
     #[error("environment variable {name} must contain a valid secure provider endpoint")]
     InvalidEndpoint { name: &'static str },
+    /// Qualification directory and campaign must be supplied together.
+    #[error("qualification observation directory and campaign must be configured together")]
+    IncompleteQualificationObservation,
+}
+
+fn qualification_observation(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+) -> Result<Option<QualificationObservationConfig>, ConfigError> {
+    let directory = optional_path(lookup, QUALIFICATION_OBSERVATION_DIR_ENV)?;
+    let campaign = optional(lookup, QUALIFICATION_CAMPAIGN_ENV)?;
+    match (directory, campaign) {
+        (None, None) => Ok(None),
+        (Some(directory), Some(campaign))
+            if (1..=64).contains(&campaign.len())
+                && campaign
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')) =>
+        {
+            Ok(Some(QualificationObservationConfig {
+                directory,
+                campaign,
+            }))
+        }
+        (Some(_), Some(_)) => Err(ConfigError::InvalidValue {
+            name: QUALIFICATION_CAMPAIGN_ENV,
+        }),
+        _ => Err(ConfigError::IncompleteQualificationObservation),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -425,6 +468,23 @@ mod tests {
             DEFAULT_DEEPGRAM_LIVE_ENDPOINT
         );
         assert!(!config.allow_insecure_provider_endpoints);
+        assert_eq!(config.qualification_observation, None);
+    }
+
+    #[test]
+    fn qualification_observation_is_explicit_and_paired() {
+        let mut values = required();
+        values.insert(QUALIFICATION_OBSERVATION_DIR_ENV, "/tmp/qualified".into());
+        assert_eq!(
+            load(&values),
+            Err(ConfigError::IncompleteQualificationObservation)
+        );
+        values.insert(QUALIFICATION_CAMPAIGN_ENV, "synthetic_2026-09-04".into());
+        let configured = load(&values).unwrap().qualification_observation.unwrap();
+        assert_eq!(configured.directory, PathBuf::from("/tmp/qualified"));
+        assert_eq!(configured.campaign, "synthetic_2026-09-04");
+        values.insert(QUALIFICATION_CAMPAIGN_ENV, "../escape".into());
+        assert!(load(&values).is_err());
     }
 
     #[test]

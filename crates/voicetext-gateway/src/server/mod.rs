@@ -17,12 +17,18 @@ mod health;
 mod live;
 mod live_diagnostics;
 mod live_error;
+mod live_request;
 mod metrics;
+mod qualification_observation;
 mod recovery;
 mod state;
 
 pub use health::PostgresSpoolReadiness;
 pub use metrics::GatewayMetrics;
+pub use qualification_observation::{
+    BatchObservation, BatchObservationSink, FileQualificationSink, LiveObservation,
+    LiveObservationSink, ObservationFuture, ObservationSinkFailure,
+};
 pub use recovery::{
     StartupRecoveryFailure, StartupRecoveryPlan, StartupRecoverySummary, reconcile_startup,
     recover_startup, start_startup_recovery,

@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 
 use voicetext_speech::application::ports::{
-    LiveRecognitionEvent, LiveTranscript, LiveTranscriptStability, ProviderReference,
+    LiveRecognitionEvent, LiveTranscript, LiveTranscriptStability, ProviderOperationKind,
+    ProviderReference,
 };
 
 use super::live_dto::{ParsedLiveMessage, TranscriptKind};
@@ -73,7 +74,10 @@ impl LiveState {
         match message {
             ParsedLiveMessage::SessionStarted(reference) => {
                 if let Some(reference) = reference {
-                    self.provider_reference = Some(ProviderReference::new(reference));
+                    self.provider_reference = Some(ProviderReference::operation(
+                        ProviderOperationKind::SessionId,
+                        reference,
+                    ));
                 }
                 None
             }

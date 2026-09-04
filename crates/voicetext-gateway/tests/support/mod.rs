@@ -14,8 +14,8 @@ use voicetext_gateway::contracts::live::LiveIdentity;
 use voicetext_gateway::profiles::ProfileRegistry;
 use voicetext_gateway::secret::MachineSecret;
 use voicetext_gateway::server::{
-    GatewayLimits, GatewayReadiness, GatewayState, ReadinessFailure, reconcile_startup, router,
-    start_startup_recovery,
+    BatchObservationSink, GatewayLimits, GatewayReadiness, GatewayState, LiveObservationSink,
+    ReadinessFailure, reconcile_startup, router, start_startup_recovery,
 };
 use voicetext_speech::application::batch_capabilities::{
     BatchCapabilityDescriptor, BatchFinalizedCapability, BatchInputFormat, BatchLanguageHints,
@@ -140,6 +140,24 @@ impl TestGateway {
     }
 
     pub async fn start_with_live(live_factory: Arc<dyn LiveRecognizerFactory>) -> Self {
+        Self::start_inner(live_factory, None).await
+    }
+
+    pub async fn start_with_observers(
+        batch_observations: Arc<dyn BatchObservationSink>,
+        live_observations: Arc<dyn LiveObservationSink>,
+    ) -> Self {
+        Self::start_inner(
+            Arc::new(FakeLiveFactory(LiveIdentity::DeepgramNova3)),
+            Some((batch_observations, live_observations)),
+        )
+        .await
+    }
+
+    async fn start_inner(
+        live_factory: Arc<dyn LiveRecognizerFactory>,
+        observations: Option<(Arc<dyn BatchObservationSink>, Arc<dyn LiveObservationSink>)>,
+    ) -> Self {
         let batch = Arc::new(FakeBatchInfrastructure::default());
         let jobs: Arc<dyn BatchJobStore> = batch.clone();
         let spool: Arc<dyn BatchAudioSpool> = batch;
@@ -165,7 +183,7 @@ impl TestGateway {
             Duration::from_secs(1),
         )
         .unwrap();
-        let state = GatewayState::new(
+        let mut state = GatewayState::new(
             MachineSecret::from_token(TOKEN.as_bytes()).unwrap(),
             jobs,
             spool,
@@ -173,6 +191,9 @@ impl TestGateway {
             Arc::new(AlwaysReady),
             limits,
         );
+        if let Some((batch, live)) = observations {
+            state = state.with_qualification_observers(batch, live);
+        }
         let recovery = reconcile_startup(&state).await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

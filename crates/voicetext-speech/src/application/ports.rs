@@ -28,19 +28,71 @@ impl BatchJobId {
     }
 }
 
-/// Opaque provider request reference safe to persist and expose diagnostically.
+/// Provider-native identity category, without provider SDK or wire DTO coupling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderOperationKind {
+    RequestId,
+    TranscriptionId,
+    SessionId,
+}
+
+/// A typed provider-native operation identity used only for internal qualification evidence.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProviderReference(Box<str>);
+pub struct ProviderOperation {
+    kind: ProviderOperationKind,
+    id: Box<str>,
+}
+
+impl ProviderOperation {
+    pub fn new(kind: ProviderOperationKind, id: impl Into<String>) -> Self {
+        Self {
+            kind,
+            id: id.into().into_boxed_str(),
+        }
+    }
+
+    pub const fn kind(&self) -> ProviderOperationKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Opaque provider reference safe to persist and expose diagnostically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderReference {
+    id: Box<str>,
+    operation_kind: Option<ProviderOperationKind>,
+}
 
 impl ProviderReference {
     /// Wraps an adapter-normalized provider reference.
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into().into_boxed_str())
+        Self {
+            id: value.into().into_boxed_str(),
+            operation_kind: None,
+        }
+    }
+
+    /// Wraps an actual provider-native operation identity with its source kind.
+    pub fn operation(kind: ProviderOperationKind, value: impl Into<String>) -> Self {
+        Self {
+            id: value.into().into_boxed_str(),
+            operation_kind: Some(kind),
+        }
     }
 
     /// Returns the provider-neutral reference.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.id
+    }
+
+    /// Returns typed qualification identity when its native source is known.
+    pub fn provider_operation(&self) -> Option<ProviderOperation> {
+        self.operation_kind
+            .map(|kind| ProviderOperation::new(kind, self.id.to_string()))
     }
 }
 
@@ -398,6 +450,11 @@ pub trait LiveRecognizerFactory: Send + Sync {
 
 /// One open provider-bound live recognition session.
 pub trait LiveRecognizerSession: Send + Sync {
+    /// Returns the latest actual provider-native operation identity, when one was observed.
+    fn provider_operation(&self) -> BoxFuture<'_, Option<ProviderOperation>> {
+        Box::pin(async { None })
+    }
+
     /// Completes only after the bounded provider write succeeds.
     fn write_audio(&self, frame: LiveAudioFrame) -> BoxFuture<'_, Result<(), RecognitionFailure>>;
 

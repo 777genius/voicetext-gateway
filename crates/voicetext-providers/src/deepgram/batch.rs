@@ -6,7 +6,7 @@ use thiserror::Error;
 use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
 use voicetext_speech::application::ports::{
     BatchReadableSegment, BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer,
-    BatchSegment, BoxFuture, ProviderReference, RecognitionFailure,
+    BatchSegment, BoxFuture, ProviderOperationKind, ProviderReference, RecognitionFailure,
 };
 
 use super::batch_capabilities::{self, CAPABILITIES};
@@ -189,7 +189,9 @@ fn project_result(
                 })
                 .collect(),
         ),
-        provider_reference: reference(parsed.provider_request_id),
+        provider_reference: parsed
+            .provider_request_id
+            .map(|id| ProviderReference::operation(ProviderOperationKind::RequestId, id)),
     }
 }
 
@@ -460,9 +462,11 @@ mod tests {
         assert_eq!(result.duration_millis, 2_500);
         assert_eq!(result.provider_duration_millis, Some(2_750));
         assert_eq!(result.segments[0].speaker.as_deref(), Some("1"));
+        let reference = result.provider_reference.unwrap();
+        assert_eq!(reference.as_str(), "metadata-request");
         assert_eq!(
-            result.provider_reference.unwrap().as_str(),
-            "metadata-request"
+            reference.provider_operation().unwrap().kind(),
+            ProviderOperationKind::RequestId
         );
     }
 

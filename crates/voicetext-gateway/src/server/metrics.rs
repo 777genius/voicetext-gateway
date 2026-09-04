@@ -31,6 +31,7 @@ pub struct GatewayMetrics {
     live_sessions: AtomicU64,
     live_frames: AtomicU64,
     live_failures: AtomicU64,
+    qualification_observation_failures: AtomicU64,
 }
 
 impl GatewayMetrics {
@@ -137,6 +138,11 @@ impl GatewayMetrics {
 
     pub(crate) fn live_failure(&self) {
         self.live_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn qualification_observation_failure(&self) {
+        self.qualification_observation_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn render(&self) -> String {
@@ -250,6 +256,12 @@ impl GatewayMetrics {
 
     fn render_live(&self, output: &mut String) {
         for (name, help, value) in [
+            (
+                "voicetext_qualification_observation_failures_total",
+                "Qualification records missing because their opt-in sink failed.",
+                self.qualification_observation_failures
+                    .load(Ordering::Relaxed),
+            ),
             (
                 "voicetext_live_sessions_total",
                 "Accepted live WebSocket sessions.",

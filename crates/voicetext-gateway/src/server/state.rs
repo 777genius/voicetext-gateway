@@ -16,6 +16,9 @@ use crate::profiles::ProfileRegistry;
 use crate::secret::MachineSecret;
 
 use super::metrics::GatewayMetrics;
+use super::qualification_observation::{
+    BatchObservationSink, LiveObservationSink, NoBatchObservationSink, NoLiveObservationSink,
+};
 
 const MAX_BATCH_UPLOAD_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_LIVE_FRAME_BYTES: usize = 64 * 1_024;
@@ -130,6 +133,8 @@ struct GatewayStateInner {
     batch_tasks: Mutex<Vec<JoinHandle<()>>>,
     batch_task_registration_closed: AtomicBool,
     metrics: GatewayMetrics,
+    batch_observations: Arc<dyn BatchObservationSink>,
+    live_observations: Arc<dyn LiveObservationSink>,
     startup_reconciled: AtomicBool,
     accepting_work: AtomicBool,
 }
@@ -165,9 +170,25 @@ impl GatewayState {
             batch_tasks: Mutex::new(Vec::new()),
             batch_task_registration_closed: AtomicBool::new(false),
             metrics: GatewayMetrics::default(),
+            batch_observations: Arc::new(NoBatchObservationSink),
+            live_observations: Arc::new(NoLiveObservationSink),
             startup_reconciled: AtomicBool::new(false),
             accepting_work: AtomicBool::new(true),
         }))
+    }
+
+    /// Replaces the default no-op qualification capabilities before state is cloned.
+    #[must_use]
+    pub fn with_qualification_observers(
+        mut self,
+        batch: Arc<dyn BatchObservationSink>,
+        live: Arc<dyn LiveObservationSink>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.0)
+            .expect("qualification observers must be composed before GatewayState is cloned");
+        inner.batch_observations = batch;
+        inner.live_observations = live;
+        self
     }
 
     pub(crate) fn auth(&self) -> &MachineSecret {
@@ -301,6 +322,14 @@ impl GatewayState {
 
     pub(crate) fn metrics(&self) -> &GatewayMetrics {
         &self.0.metrics
+    }
+
+    pub(crate) fn batch_observations(&self) -> &dyn BatchObservationSink {
+        self.0.batch_observations.as_ref()
+    }
+
+    pub(crate) fn live_observations(&self) -> &dyn LiveObservationSink {
+        self.0.live_observations.as_ref()
     }
 
     /// Records fixed-cardinality startup recovery and spool capacity evidence.

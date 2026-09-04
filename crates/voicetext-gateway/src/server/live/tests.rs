@@ -3,9 +3,9 @@ use voicetext_speech::application::live::LiveCoordinatorError;
 
 #[test]
 fn pcm_requires_complete_sixteen_bit_samples() {
-    assert_eq!(decode_audio(&mut None, vec![1, 2]).unwrap(), vec![1, 2]);
-    assert!(decode_audio(&mut None, vec![1]).is_err());
-    assert!(decode_audio(&mut None, Vec::new()).is_err());
+    assert_eq!(decode_audio(&mut None, &[1, 2]).unwrap(), vec![1, 2]);
+    assert!(decode_audio(&mut None, &[1]).is_err());
+    assert!(decode_audio(&mut None, &[]).is_err());
 }
 
 #[test]

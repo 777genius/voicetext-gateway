@@ -7,7 +7,7 @@ use thiserror::Error;
 use voicetext_speech::application::batch_capabilities::BatchCapabilityDescriptor;
 use voicetext_speech::application::ports::{
     BatchRecognitionRequest, BatchRecognitionResult, BatchRecognizer, BatchSegment, BoxFuture,
-    ProviderReference, RecognitionFailure,
+    ProviderOperationKind, ProviderReference, RecognitionFailure,
 };
 
 use super::batch_capabilities::{self, CAPABILITIES};
@@ -189,6 +189,11 @@ fn project_result(
     authoritative_duration_millis: u64,
     parsed: ParsedBatchResult,
 ) -> BatchRecognitionResult {
+    let operation_kind = if parsed.provider_identity_is_transcription {
+        ProviderOperationKind::TranscriptionId
+    } else {
+        ProviderOperationKind::RequestId
+    };
     BatchRecognitionResult {
         profile,
         text: parsed.text,
@@ -206,7 +211,9 @@ fn project_result(
             })
             .collect(),
         readable_segments: None,
-        provider_reference: reference(parsed.provider_request_id),
+        provider_reference: parsed
+            .provider_request_id
+            .map(|id| ProviderReference::operation(operation_kind, id)),
     }
 }
 
@@ -479,7 +486,52 @@ mod tests {
         assert_eq!(result.duration_millis, 2_500);
         assert_eq!(result.provider_duration_millis, Some(2_500));
         assert!(result.segments[0].confidence.is_some());
-        assert_eq!(result.provider_reference.unwrap().as_str(), "body-request");
+        let reference = result.provider_reference.unwrap();
+        assert_eq!(reference.as_str(), "body-request");
+        assert_eq!(
+            reference.provider_operation().unwrap().kind(),
+            ProviderOperationKind::TranscriptionId
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_http_request_fallback_and_keeps_missing_identity_absent() {
+        let mut body: serde_json::Value = serde_json::from_slice(&success_body()).unwrap();
+        body.as_object_mut().unwrap().remove("transcription_id");
+        let (endpoint, _) = spawn_fake(FakeResponse {
+            status: "200 OK",
+            headers: vec![("request-id", "http-request".into())],
+            body: serde_json::to_vec(&body).unwrap(),
+            declared_length: None,
+        });
+        let recognizer = ElevenLabsBatchRecognizer::new(Client::new(), "test", endpoint).unwrap();
+        let reference = recognizer
+            .recognize(request())
+            .await
+            .unwrap()
+            .provider_reference
+            .unwrap();
+        assert_eq!(reference.as_str(), "http-request");
+        assert_eq!(
+            reference.provider_operation().unwrap().kind(),
+            ProviderOperationKind::RequestId
+        );
+
+        let (endpoint, _) = spawn_fake(FakeResponse {
+            status: "200 OK",
+            headers: vec![],
+            body: serde_json::to_vec(&body).unwrap(),
+            declared_length: None,
+        });
+        let recognizer = ElevenLabsBatchRecognizer::new(Client::new(), "test", endpoint).unwrap();
+        assert!(
+            recognizer
+                .recognize(request())
+                .await
+                .unwrap()
+                .provider_reference
+                .is_none()
+        );
     }
 
     #[tokio::test]
