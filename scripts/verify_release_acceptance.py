@@ -12,7 +12,12 @@ H40 = re.compile(r"[0-9a-f]{40}$")
 H64 = re.compile(r"[0-9a-f]{64}$")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}$")
 IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$")
-TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+MILLI_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$"
+)
+APPROVAL_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{3})?Z$"
+)
 PROFILES = {
     "deepgram-batch": (("batch", "deepgram", "nova-3", 2),),
     "elevenlabs-batch": (("batch", "elevenlabs", "scribe_v2", 3),),
@@ -21,8 +26,20 @@ PROFILES = {
     "deepgram-batch-elevenlabs-live": (("batch", "deepgram", "nova-3", 2), ("live", "elevenlabs", "scribe_v2_realtime", 2)),
     "elevenlabs-batch-deepgram-live": (("batch", "elevenlabs", "scribe_v2", 3), ("live", "deepgram", "nova-3", 2)),
 }
-BASE = {"position", "provider", "model", "mode", "contract_version", "language", "fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_request_id", "provider_result_id", "started_at", "completed_at", "latency_ms", "outcome", "error_classification"}
-BOUND = ("fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_request_id", "provider_result_id")
+BASE = {"position", "provider", "model", "mode", "contract_version", "language", "fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_operation", "started_at", "completed_at", "latency_ms", "outcome", "error_classification"}
+BOUND = ("fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_operation")
+OPERATION_KINDS = {
+    ("deepgram", "batch"): {"deepgram_request_id"},
+    ("deepgram", "live"): {"deepgram_request_id"},
+    ("elevenlabs", "batch"): {
+        "elevenlabs_transcription_id",
+        "elevenlabs_http_request_id",
+    },
+    ("elevenlabs", "live"): {
+        "elevenlabs_session_id",
+        "elevenlabs_http_request_id",
+    },
+}
 
 
 def fail(message):
@@ -47,12 +64,40 @@ def integer(value, low, high, name):
     return value
 
 
-def timestamp(value, name):
-    value = text(value, TIME, name)
+def timestamp(value, name, pattern=MILLI_TIME):
+    value = text(value, pattern, name)
     try:
-        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        parsed = dt.datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+        if parsed.tzinfo != dt.timezone.utc:
+            fail(f"invalid {name}")
+        return parsed
     except ValueError as error:
         raise InvalidRecord(f"invalid {name}") from error
+
+
+def schema_version(value, expected, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value != expected:
+        fail(f"invalid {name} schema version")
+
+
+def provider_operation(value, provider, mode, name):
+    value = exact(value, {"kind", "id"}, name)
+    kind = text(value["kind"], IDENT, f"{name}.kind")
+    identifier = value["id"]
+    if (
+        not isinstance(identifier, str)
+        or not 1 <= len(identifier) <= 128
+        or any(not 0x20 <= ord(character) <= 0x7E for character in identifier)
+    ):
+        fail(f"invalid {name}.id")
+    if kind not in OPERATION_KINDS[(provider, mode)]:
+        fail(f"invalid {name}.kind for {provider} {mode}")
+    return identifier
+
+
+def elapsed_milliseconds(start, end):
+    delta = end - start
+    return delta.days * 86_400_000 + delta.seconds * 1000 + delta.microseconds // 1000
 
 
 def file_sha(path):
@@ -74,7 +119,8 @@ def runner(value, name):
 
 def fixture_manifest(value):
     value = exact(value, {"schema_version", "campaign_id", "fixtures"}, "fixture manifest")
-    if value["schema_version"] != 1 or not isinstance(value["fixtures"], list):
+    schema_version(value["schema_version"], 1, "fixture manifest")
+    if not isinstance(value["fixtures"], list):
         fail("invalid fixture manifest")
     text(value["campaign_id"], IDENT, "fixture campaign_id")
     fixtures = {}
@@ -91,31 +137,44 @@ def fixture_manifest(value):
 
 def campaign_manifest(value, fixtures):
     value = exact(value, {"schema_version", "source_sha", "image_digest", "campaign_id", "runner", "effects"}, "campaign manifest")
-    if value["schema_version"] != 1 or not isinstance(value["effects"], list):
+    schema_version(value["schema_version"], 2, "campaign manifest")
+    if not isinstance(value["effects"], list):
         fail("invalid campaign manifest")
     text(value["source_sha"], H40, "campaign source_sha")
     text(value["image_digest"], DIGEST, "campaign image_digest")
     text(value["campaign_id"], IDENT, "campaign_id")
     runner(value["runner"], "campaign runner")
-    effects, identifiers = {}, set()
-    keys = {"position", "profile", "kind", "fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_request_id", "provider_result_id"}
+    effects, effect_ids, operations = {}, set(), set()
+    keys = {"position", "profile", "kind", "fixture_id", "fixture_digest", "result_digest", "effect_id", "provider_operation"}
     for item in value["effects"]:
         item = exact(item, keys, "campaign effect")
         position = text(item["position"], IDENT, "effect position")
         if position in effects:
             fail("duplicate effect position")
-        if item["profile"] not in PROFILES or item["kind"] not in ("batch", "live"):
+        profile = text(item["profile"], IDENT, "effect profile")
+        kind = text(item["kind"], IDENT, "effect kind")
+        if profile not in PROFILES or kind not in ("batch", "live"):
             fail("invalid effect profile or kind")
+        matches = [part for part in PROFILES[profile] if part[0] == kind]
+        if len(matches) != 1:
+            fail("effect kind is not part of profile")
+        provider = matches[0][1]
         fixture_id = text(item["fixture_id"], IDENT, "effect fixture_id")
         fixture_digest = text(item["fixture_digest"], DIGEST, "effect fixture digest")
         if fixtures.get(fixture_id) != fixture_digest:
             fail("fixture digest is not bound by fixture manifest")
         text(item["result_digest"], DIGEST, "result digest")
-        for field in ("effect_id", "provider_request_id", "provider_result_id"):
-            identifier = text(item[field], IDENT, field)
-            if identifier in identifiers:
-                fail("provider request/result/effect IDs are not globally unique")
-            identifiers.add(identifier)
+        effect_id = text(item["effect_id"], IDENT, "effect_id")
+        if effect_id in effect_ids:
+            fail("effect IDs are not globally unique")
+        effect_ids.add(effect_id)
+        operation_id = provider_operation(
+            item["provider_operation"], provider, kind, "provider_operation"
+        )
+        operation_key = (provider, operation_id)
+        if operation_key in operations:
+            fail("provider operation was reused")
+        operations.add(operation_key)
         effects[position] = item
     if len(effects) != 8:
         fail("campaign manifest must contain exactly eight fresh effects")
@@ -127,11 +186,12 @@ def effect(value, expected, profile, effects, campaign_end):
     extra = {"provider_terminal"} if kind == "batch" else {"accepted_frame_count", "accepted_frames_digest", "ack_first", "ack_last", "finalize"}
     value = exact(value, BASE | extra, f"{profile} {kind}")
     position = text(value["position"], IDENT, "position")
+    integer(value["contract_version"], version, version, "contract_version")
     if (value["provider"], value["model"], value["mode"], value["contract_version"], value["language"]) != (provider, model, kind, version, "multi"):
         fail(f"wrong provider identity at {position}")
     start, end = timestamp(value["started_at"], "started_at"), timestamp(value["completed_at"], "completed_at")
     latency = integer(value["latency_ms"], 0, 86_400_000, "latency_ms")
-    if end < start or end > campaign_end or int((end - start).total_seconds() * 1000) != latency:
+    if end < start or end > campaign_end or elapsed_milliseconds(start, end) != latency:
         fail(f"invalid timestamps at {position}")
     if value["outcome"] != "pass" or value["error_classification"] != "none":
         fail(f"non-passing effect at {position}")
@@ -140,27 +200,31 @@ def effect(value, expected, profile, effects, campaign_end):
         fail(f"effect position is not campaign-bound: {position}")
     if any(value[field] != bound[field] for field in BOUND):
         fail(f"effect differs from campaign manifest at {position}")
+    provider_operation(value["provider_operation"], provider, kind, "provider_operation")
     if kind == "batch":
-        terminal = exact(value["provider_terminal"], {"status", "provider_result_id", "observed_at"}, "batch terminal")
+        terminal = exact(value["provider_terminal"], {"status", "provider_operation", "effect_id", "result_digest", "observed_at"}, "batch terminal")
         observed = timestamp(terminal["observed_at"], "batch terminal observed_at")
-        if terminal["status"] != "completed" or terminal["provider_result_id"] != value["provider_result_id"] or not start <= observed <= end:
-            fail("batch terminal is not linked to provider result")
+        terminal_bound = ("provider_operation", "effect_id", "result_digest")
+        if terminal["status"] != "completed" or any(terminal[field] != value[field] for field in terminal_bound) or not start <= observed <= end:
+            fail("batch terminal is not linked to the effect and observed result")
     else:
         count = integer(value["accepted_frame_count"], 1, 1_000_000, "accepted_frame_count")
         if integer(value["ack_first"], 1, 1_000_000, "ack_first") != 1 or integer(value["ack_last"], 1, 1_000_000, "ack_last") != count:
             fail("live ACK range does not cover every accepted frame")
         text(value["accepted_frames_digest"], DIGEST, "accepted frames digest")
-        finalize = exact(value["finalize"], {"status", "provider_result_id", "terminal_at"}, "finalize")
+        finalize = exact(value["finalize"], {"status", "provider_operation", "effect_id", "result_digest", "terminal_at"}, "finalize")
         terminal = timestamp(finalize["terminal_at"], "finalize terminal_at")
-        if finalize["status"] != "flushed" or finalize["provider_result_id"] != value["provider_result_id"] or not start <= terminal <= end:
-            fail("live finalize is not linked to provider result")
+        finalize_bound = ("provider_operation", "effect_id", "result_digest")
+        if finalize["status"] != "flushed" or any(finalize[field] != value[field] for field in finalize_bound) or not start <= terminal <= end:
+            fail("live finalize is not linked to the effect and observed result")
     return position
 
 
 def canary_record(value, effects, source_sha, image_digest):
     keys = {"schema_version", "source_sha", "image_digest", "campaign_id", "runner", "credential_owner", "campaign_manifest_sha256", "fixture_manifest_sha256", "result", "completed_at", "checks"}
     value = exact(value, keys, "provider canary")
-    if value["schema_version"] != 1 or value["source_sha"] != source_sha or value["image_digest"] != image_digest:
+    schema_version(value["schema_version"], 2, "provider canary")
+    if value["source_sha"] != source_sha or value["image_digest"] != image_digest:
         fail("provider canary release identity mismatch")
     text(value["campaign_id"], IDENT, "canary campaign_id")
     runner(value["runner"], "canary runner")
@@ -173,7 +237,7 @@ def canary_record(value, effects, source_sha, image_digest):
     profiles, positions = set(), set()
     for check in value["checks"]:
         check = exact(check, {"profile", "result", "batch", "live"}, "canary check")
-        profile = check["profile"]
+        profile = text(check["profile"], IDENT, "canary profile")
         if profile not in PROFILES or profile in profiles or check["result"] != "pass":
             fail("invalid or duplicate canary profile")
         profiles.add(profile)
@@ -197,7 +261,8 @@ def canary_record(value, effects, source_sha, image_digest):
 def approval_record(value, source_sha, image_digest):
     keys = {"schema_version", "source_sha", "image_digest", "campaign_id", "decision", "authorization", "protected_environment", "approval_workflow_revision", "workflow_run_id", "approved_at", "runner", "canary_payload_sha256", "campaign_manifest_sha256", "fixture_manifest_sha256", "trust_policy_sha256"}
     value = exact(value, keys, "reviewer approval")
-    if value["schema_version"] != 1 or value["source_sha"] != source_sha or value["image_digest"] != image_digest:
+    schema_version(value["schema_version"], 1, "reviewer approval")
+    if value["source_sha"] != source_sha or value["image_digest"] != image_digest:
         fail("approval release identity mismatch")
     if value["decision"] != "approved" or value["authorization"] != "github-environment-required-reviewer":
         fail("approval authorization is invalid")
@@ -205,7 +270,7 @@ def approval_record(value, source_sha, image_digest):
         text(value[field], IDENT, field)
     text(value["approval_workflow_revision"], H40, "approval workflow revision")
     text(value["workflow_run_id"], re.compile(r"[1-9][0-9]{0,19}$"), "workflow run ID")
-    timestamp(value["approved_at"], "approved_at")
+    timestamp(value["approved_at"], "approved_at", APPROVAL_TIME)
     runner(value["runner"], "approval runner")
     for field in ("canary_payload_sha256", "campaign_manifest_sha256", "fixture_manifest_sha256", "trust_policy_sha256"):
         text(value[field], H64, field)
@@ -214,8 +279,7 @@ def approval_record(value, source_sha, image_digest):
 
 def trust_policy(value):
     value = exact(value, {"schema_version", "approval_attestation", "canary_runner"}, "trust policy")
-    if value["schema_version"] != 1:
-        fail("invalid trust policy version")
+    schema_version(value["schema_version"], 1, "trust policy")
     attestation = exact(value["approval_attestation"], {"repository", "signer_workflow", "predicate_type", "protected_environment"}, "approval attestation policy")
     for field in attestation:
         text(attestation[field], IDENT, f"approval attestation {field}")

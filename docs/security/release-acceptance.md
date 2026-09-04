@@ -35,10 +35,10 @@ private repository content in that bundle.
 Deterministic evidence proves implementation and conformance, not acoustic quality or provider
 availability. The provider capability matrix is the claim surface. For every row and every language
 claim, retain one bounded canary record containing the exact release SHA and image digest, provider
-and model, mode and contract version, language selection, synthetic-fixture digest, request/result
-identifiers, start/end timestamps, result digest, error classification, latency, ACK counts for
-live, and finalization status. It must also identify the test-only credential owner and campaign
-approval without including the credential.
+and model, mode and contract version, language selection, synthetic-fixture digest, the typed actual
+provider operation, start/end timestamps, normalized-output digest, error classification, latency,
+ACK counts for live, and finalization status. It must also identify the test-only credential owner
+and campaign approval without including the credential.
 
 | Claim | Checked-in conformance evidence | Additional release evidence required |
 | --- | --- | --- |
@@ -119,12 +119,23 @@ Missing, concatenated, non-canonical, duplicate-key, unknown-key, partial, reuse
 digest-mismatched records fail closed. Synthetic fixtures in `scripts/test-release-evidence.sh`
 prove parser/policy behavior only and are never real-provider qualification evidence.
 
-`scripts/verify-release-acceptance.sh` defines the exact six-profile/eight-effect policy. Provider
-request, result, and effect IDs are globally unique, so mixed checks cannot reuse standalone halves.
-Every effect binds outcome and timestamps. Batch terminal status is tied to its provider result; live
-evidence ties the complete ACK range and accepted-frame digest to a flushed finalize and the same
-provider result. Each bounded JSON record is at most 64 KiB and contains exactly one top-level value;
-the Sigstore bundle is bounded separately at 1 MiB.
+`scripts/verify-release-acceptance.sh` defines the exact six-profile/eight-effect policy using
+version 2 campaign and canary records documented in
+`docs/security/provider-canary-evidence-v2.md`. The fixture manifest and reviewer approval remain
+version 1. Version 1 campaign/canary artifacts are retained as history but do not qualify a new
+release. Gateway effect IDs are globally unique. Actual provider operations cannot be reused across
+standalone or mixed effects; their replay identity is the actual provider plus opaque identifier,
+independent of the typed kind label. Every effect binds outcome and exact millisecond timestamps.
+Batch terminal and live flushed-finalize proofs repeat the same provider operation, effect ID, and
+observed normalized-output digest. Live evidence also retains the complete ACK range and
+accepted-frame digest. Each bounded JSON record is at most 64 KiB and contains exactly one top-level
+value; the Sigstore bundle is bounded separately at 1 MiB.
+
+These are structural checks, not proof of authenticated producer origin or acoustic WER/CER,
+terminology, or timeline quality. Protected approval and OIDC verification remain separate, and
+authenticated producer evidence plus quality qualification remain uncompleted requirements. The
+v2 schema defines a concrete versioned length-delimited ACKed-frame digest recipe for the next
+producer slice without claiming that producer implementation exists.
 
 The job rebuilds the image from the exact remote Git ref plus checksum and first assigns only the
 deterministic `quarantine-<source-sha>` GHCR identity. GitHub artifact attestations
