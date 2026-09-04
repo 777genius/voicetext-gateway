@@ -411,7 +411,7 @@ async fn wait_for_completed(client: &reqwest::Client, origin: &str, job_id: &str
             .unwrap();
         if response.status() == StatusCode::OK {
             assert_eq!(
-                response.json::<Value>().await.unwrap()["text"],
+                response.json::<Value>().await.unwrap()["result"]["text"],
                 "authoritative synthetic speech"
             );
             return;
