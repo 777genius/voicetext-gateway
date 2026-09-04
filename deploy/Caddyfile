@@ -1,0 +1,22 @@
+{$VOICETEXT_PUBLIC_HOST} {
+	encode zstd gzip
+
+	@voicetext_contract path \
+		/api/v1/transcribe/batch \
+		/api/v1/transcribe/batch/* \
+		/api/v1/transcribe/stream \
+		/health/live
+
+	handle @voicetext_contract {
+		reverse_proxy @voicetext_contract gateway:8080
+	}
+
+	handle {
+		respond 404
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

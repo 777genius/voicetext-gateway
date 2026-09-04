@@ -1,0 +1,134 @@
+name: voicetext-gateway
+
+services:
+  secret-init:
+    image: voicetext-gateway:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        rm -f /secrets/gateway_token /secrets/deepgram_api_key /secrets/elevenlabs_api_key
+        for name in $${VOICETEXT_SECRET_FILES}; do
+          install -o 10001 -g 10001 -m 0400 "/source/$${name}" "/secrets/$${name}"
+        done
+    environment:
+      VOICETEXT_SECRET_FILES: gateway_token deepgram_api_key elevenlabs_api_key
+    volumes:
+      - type: bind
+        source: ./secrets/gateway_token
+        target: /source/gateway_token
+        read_only: true
+      - type: bind
+        source: ./secrets/deepgram_api_key
+        target: /source/deepgram_api_key
+        read_only: true
+      - type: bind
+        source: ./secrets/elevenlabs_api_key
+        target: /source/elevenlabs_api_key
+        read_only: true
+      - type: volume
+        source: gateway-secrets
+        target: /secrets
+    read_only: true
+    tmpfs:
+      - /tmp:size=1m,mode=0700
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    pids_limit: 32
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  postgres:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    init: true
+    environment:
+      POSTGRES_DB: voicetext
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_USER: voicetext
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicetext -d voicetext"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+    pids_limit: 256
+
+  gateway:
+    image: voicetext-gateway:local
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      secret-init:
+        condition: service_completed_successfully
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      VOICETEXT_BIND_ADDR: ${VOICETEXT_BIND_ADDR:-0.0.0.0:8080}
+      VOICETEXT_BEARER_TOKEN_FILE: /run/secrets/gateway_token
+      VOICETEXT_DEEPGRAM_API_KEY_FILE: /run/secrets/deepgram_api_key
+      VOICETEXT_ELEVENLABS_API_KEY_FILE: /run/secrets/elevenlabs_api_key
+      VOICETEXT_HEALTHCHECK_URL: ${VOICETEXT_HEALTHCHECK_URL:-http://127.0.0.1:8080/health/ready}
+      VOICETEXT_POSTGRES_URL_FILE: /run/secrets/postgres_url
+      VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS: ${VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS:-245000}
+      VOICETEXT_SPOOL_DIR: /var/lib/voicetext/spool
+    secrets:
+      - postgres_url
+    volumes:
+      - gateway-spool:/var/lib/voicetext
+      - type: volume
+        source: gateway-secrets
+        target: /run/secrets
+        read_only: true
+    ports:
+      - "127.0.0.1:${VOICETEXT_HOST_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # 60s request upload + 180s provider deadline + 5s cleanup margin.
+    stop_grace_period: 250s
+    networks:
+      - backend
+      - egress
+    pids_limit: 256
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  postgres_url:
+    file: ./secrets/postgres_url
+
+volumes:
+  postgres-data:
+  gateway-secrets:
+  gateway-spool:
+
+networks:
+  backend:
+    internal: true
+  egress:

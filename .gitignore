@@ -1,0 +1,13 @@
+/target/
+/.idea/
+/.vscode/
+/.env
+/.env.*
+!/\.env.example
+/deploy/.env
+/deploy/.env.*
+!/deploy/.env.example
+/secrets/
+/data/
+*.pem
+*.key

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "approval_attestation": {
+    "repository": "777genius/voicetext-gateway",
+    "signer_workflow": "777genius/voicetext-gateway/.github/workflows/canary-approval.yml",
+    "predicate_type": "https://slsa.dev/provenance/v1",
+    "protected_environment": "canary-approval"
+  },
+  "canary_runner": {
+    "identity": "github.com/777genius/voicetext-canary/.github/workflows/run.yml"
+  }
+}
