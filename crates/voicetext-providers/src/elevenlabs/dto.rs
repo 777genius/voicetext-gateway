@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use serde_json::Value;
 use std::time::Duration;
 
 const MALFORMED_RESPONSE: &str = "ELEVENLABS_MALFORMED_RESPONSE";
@@ -125,14 +126,16 @@ pub(super) fn parse_response(
     authoritative_duration_millis: u64,
     header_request_id: Option<String>,
 ) -> Result<ParsedBatchResult, ParseFailure> {
-    let payload: ResponseDto = serde_json::from_slice(bytes)
+    let payload: Value = serde_json::from_slice(bytes)
         .map_err(|_| malformed(header_request_id.clone().map(ProviderIdentity::RequestId)))?;
     let provider_identity = payload
-        .transcription_id
-        .as_deref()
+        .get("transcription_id")
+        .and_then(Value::as_str)
         .and_then(safe_request_id)
         .map(ProviderIdentity::TranscriptionId)
         .or_else(|| header_request_id.map(ProviderIdentity::RequestId));
+    let payload: ResponseDto =
+        serde_json::from_slice(bytes).map_err(|_| malformed(provider_identity.clone()))?;
     validate_envelope(&payload, provider_identity.clone())?;
 
     let authoritative_seconds = Duration::from_millis(authoritative_duration_millis).as_secs_f64();
@@ -432,5 +435,73 @@ mod tests {
 
         let failure = parse_response(payload.to_string().as_bytes(), 1_000, None).unwrap_err();
         assert_eq!(failure.provider_identity, None);
+    }
+
+    #[test]
+    fn structural_failures_preserve_body_identity_before_typed_decode() {
+        let valid = serde_json::json!({
+            "language_code":"en", "language_probability":1.0,
+            "transcription_id":"body-transcription", "text":"word", "words":[
+                {"type":"word","text":"word","start":0.0,"end":0.5}
+            ]
+        });
+        for (field, replacement) in [
+            ("words", serde_json::json!("invalid")),
+            ("text", serde_json::json!(["invalid"])),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[field] = replacement;
+            let failure = parse_response(
+                malformed.to_string().as_bytes(),
+                1_000,
+                Some("header-request".into()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                failure.provider_identity,
+                Some(ProviderIdentity::TranscriptionId(
+                    "body-transcription".into()
+                ))
+            );
+        }
+
+        for missing in ["words", "text"] {
+            let mut malformed = valid.clone();
+            malformed.as_object_mut().unwrap().remove(missing);
+            let failure =
+                parse_response(malformed.to_string().as_bytes(), 1_000, None).unwrap_err();
+            assert_eq!(
+                failure.provider_identity,
+                Some(ProviderIdentity::TranscriptionId(
+                    "body-transcription".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_json_uses_only_the_valid_header_fallback() {
+        let payload = br#"{"transcription_id":"body-transcription","words":"invalid""#;
+        let failure = parse_response(payload, 1_000, Some("header-request".into())).unwrap_err();
+        assert_eq!(
+            failure.provider_identity,
+            Some(ProviderIdentity::RequestId("header-request".into()))
+        );
+
+        let failure = parse_response(payload, 1_000, None).unwrap_err();
+        assert_eq!(failure.provider_identity, None);
+
+        let duplicate_typed_field = br#"{
+            "language_code":"en", "language_probability":1.0,
+            "transcription_id":"body-transcription",
+            "text":"word", "text":"word", "words":[]
+        }"#;
+        let failure = parse_response(duplicate_typed_field, 1_000, None).unwrap_err();
+        assert_eq!(
+            failure.provider_identity,
+            Some(ProviderIdentity::TranscriptionId(
+                "body-transcription".into()
+            ))
+        );
     }
 }

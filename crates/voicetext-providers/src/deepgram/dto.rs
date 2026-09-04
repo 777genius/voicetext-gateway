@@ -51,18 +51,18 @@ pub(super) fn parse_response(
         .get("metadata")
         .and_then(Value::as_object)
         .ok_or_else(|| malformed(header_request_id.clone()))?;
-    let duration_seconds = metadata
-        .get("duration")
-        .and_then(Value::as_f64)
-        .filter(|duration| duration.is_finite() && *duration >= 0.0)
-        .ok_or_else(|| malformed(header_request_id.clone()))?;
-    let provider_duration_ms =
-        seconds_to_millis(duration_seconds).ok_or_else(|| malformed(header_request_id.clone()))?;
     let provider_request_id = metadata
         .get("request_id")
         .and_then(Value::as_str)
         .and_then(safe_request_id)
         .or(header_request_id);
+    let duration_seconds = metadata
+        .get("duration")
+        .and_then(Value::as_f64)
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        .ok_or_else(|| malformed(provider_request_id.clone()))?;
+    let provider_duration_ms = seconds_to_millis(duration_seconds)
+        .ok_or_else(|| malformed(provider_request_id.clone()))?;
 
     let alternative = payload
         .pointer("/results/channels/0/alternatives/0")
@@ -323,5 +323,92 @@ mod tests {
             assert!(safe_request_id(rejected).is_none(), "accepted {rejected:?}");
         }
         assert_eq!(safe_request_id(&"x".repeat(129)), None);
+    }
+
+    #[test]
+    fn duration_failures_preserve_body_request_id_before_validation() {
+        for duration in [None, Some(serde_json::json!("invalid"))] {
+            let mut metadata = serde_json::json!({"request_id":"body-request"});
+            if let Some(duration) = duration {
+                metadata["duration"] = duration;
+            }
+            let payload = serde_json::json!({"metadata":metadata, "results":{}});
+
+            let failure = parse_response(
+                payload.to_string().as_bytes(),
+                Some("header-request".into()),
+            )
+            .unwrap_err();
+            assert_eq!(failure.provider_request_id.as_deref(), Some("body-request"));
+
+            let failure = parse_response(payload.to_string().as_bytes(), None).unwrap_err();
+            assert_eq!(failure.provider_request_id.as_deref(), Some("body-request"));
+        }
+    }
+
+    #[test]
+    fn later_structural_and_semantic_failures_keep_existing_precedence() {
+        let valid = serde_json::json!({
+            "metadata":{"duration":2.0, "request_id":"body-request"},
+            "results":{
+                "channels":[{"alternatives":[{"transcript":"word"}]}],
+                "utterances":[{"start":0.0,"end":1.0,"transcript":"word"}]
+            }
+        });
+        for transcript in [None, Some(serde_json::json!(["invalid"]))] {
+            let mut malformed = valid.clone();
+            let alternative = malformed
+                .pointer_mut("/results/channels/0/alternatives/0")
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            match transcript {
+                Some(value) => {
+                    alternative.insert("transcript".into(), value);
+                }
+                None => {
+                    alternative.remove("transcript");
+                }
+            }
+            let failure = parse_response(
+                malformed.to_string().as_bytes(),
+                Some("header-request".into()),
+            )
+            .unwrap_err();
+            assert_eq!(failure.provider_request_id.as_deref(), Some("body-request"));
+        }
+
+        let mut semantic_failure = valid;
+        semantic_failure["results"]["utterances"][0]["end"] = serde_json::json!(0.0);
+        semantic_failure["results"]["utterances"][0]["start"] = serde_json::json!(1.0);
+        let failure = parse_response(
+            semantic_failure.to_string().as_bytes(),
+            Some("header-request".into()),
+        )
+        .unwrap_err();
+        assert_eq!(failure.provider_request_id.as_deref(), Some("body-request"));
+    }
+
+    #[test]
+    fn absent_or_invalid_body_request_id_uses_only_a_valid_header() {
+        for request_id in [None, Some(serde_json::json!(" invalid"))] {
+            let mut metadata = serde_json::json!({"duration":"invalid"});
+            if let Some(request_id) = request_id {
+                metadata["request_id"] = request_id;
+            }
+            let payload = serde_json::json!({"metadata":metadata});
+            let failure = parse_response(
+                payload.to_string().as_bytes(),
+                Some("header-request".into()),
+            )
+            .unwrap_err();
+            assert_eq!(
+                failure.provider_request_id.as_deref(),
+                Some("header-request")
+            );
+
+            let failure = parse_response(payload.to_string().as_bytes(), None).unwrap_err();
+            assert_eq!(failure.provider_request_id, None);
+        }
     }
 }
