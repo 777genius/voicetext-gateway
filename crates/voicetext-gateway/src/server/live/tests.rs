@@ -32,6 +32,35 @@ fn provider_failure_mapping_executes_safe_diagnostics() {
     ));
 }
 
+#[test]
+fn failed_ack_emission_is_excluded_while_provider_writes_remain_distinct() {
+    let mut observation = LiveObservationTracker::new(
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        ObservationProfile {
+            contract_version: 2,
+            provider: "deepgram".into(),
+            model: "nova-3".into(),
+            language: "multi".into(),
+        },
+    );
+    observation.provider_written(1);
+    // A failed `socket.send` returns before the production path calls `ack_sent`.
+    observation.provider_written(2);
+    observation.ack_sent(2, b"raw-two");
+
+    let record = observation.finish(None, "transport_closed".into());
+    assert_eq!(record.written_sequences.count, 2);
+    assert_eq!(record.written_sequences.first, Some(1));
+    assert_eq!(record.written_sequences.last, Some(2));
+    assert_eq!(record.acked_sequences.count, 1);
+    assert_eq!(record.acked_sequences.first, Some(2));
+    assert_eq!(
+        record.acked_raw_input_digest,
+        "8fc7d64d95a872603c5278c0c3d10ceb1f7e392c503cc5aa4d2c8453af9ed6a0"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn session_lifetime_deadline_is_absolute_when_idle_activity_resets() {
     let opened = Instant::now();

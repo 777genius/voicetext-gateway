@@ -1,32 +1,8 @@
 use super::*;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::AsyncWrite;
-use voicetext_speech::application::ports::{LiveTranscript, LiveTranscriptStability};
-
-struct FailingWriter;
-
-impl AsyncWrite for FailingWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-        _buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Poll::Ready(Err(std::io::Error::other("synthetic write failure")))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
+use voicetext_audio::discord_opus::DiscordOpusDecoder;
+use voicetext_speech::application::ports::{BatchSegment, LiveTranscript, LiveTranscriptStability};
+use voicetext_speech::domain::batch::BatchProfile;
 
 fn profile() -> ObservationProfile {
     ObservationProfile {
@@ -60,13 +36,72 @@ fn raw_digest_is_length_delimited_and_not_a_decoded_pcm_digest() {
     joined.ack_sent(1, b"abc");
     let joined = joined.finish(None, "flushed".into());
     assert_ne!(split.acked_raw_input_digest, joined.acked_raw_input_digest);
+}
 
-    let mut pcm = Sha256::new();
-    pcm.update(FRAME_DIGEST_PREFIX);
-    pcm.update(1_u64.to_be_bytes());
-    pcm.update(4_u64.to_be_bytes());
-    pcm.update([0_u8; 4]);
-    assert_ne!(split.acked_raw_input_digest, hex::encode(pcm.finalize()));
+#[test]
+fn raw_opus_digest_is_pinned_and_differs_from_its_decoded_pcm() {
+    let raw_opus = [0xf8, 0xff, 0xfe];
+    let pcm = DiscordOpusDecoder::new()
+        .unwrap()
+        .decode(&raw_opus)
+        .unwrap()
+        .pcm_s16le;
+    assert_ne!(raw_opus.as_slice(), pcm.as_slice());
+
+    let mut raw = LiveObservationTracker::new(Uuid::from_u128(1), Uuid::from_u128(2), profile());
+    raw.ack_sent(7, &raw_opus);
+    let raw = raw.finish(None, "flushed".into());
+    assert_eq!(
+        raw.acked_raw_input_digest,
+        "2b4ecbe64e033098006635d87ae235953186114ea396f9886f2f8d3b463fdedd"
+    );
+
+    let mut decoded =
+        LiveObservationTracker::new(Uuid::from_u128(1), Uuid::from_u128(2), profile());
+    decoded.ack_sent(7, &pcm);
+    let decoded = decoded.finish(None, "flushed".into());
+    assert_ne!(raw.acked_raw_input_digest, decoded.acked_raw_input_digest);
+}
+
+#[test]
+fn normalized_batch_and_live_digest_vectors_are_pinned() {
+    let batch = BatchRecognitionResult {
+        profile: BatchProfile::new(3, "elevenlabs", "scribe_v2", "multi").unwrap(),
+        text: "hello Ω".into(),
+        duration_millis: 1_234,
+        provider_duration_millis: None,
+        segments: vec![BatchSegment {
+            start_millis: 12,
+            end_millis: 345,
+            text: "hello".into(),
+            confidence: Some(0.75),
+            speaker: Some("speaker-1".into()),
+        }],
+        readable_segments: None,
+        provider_reference: None,
+    };
+    assert_eq!(
+        batch_result_digest(&batch),
+        "4a727a16f05905bd115d667de9ec608d1f87ce8821372f1d318effa530d8953e"
+    );
+
+    let mut live = LiveObservationTracker::new(Uuid::from_u128(1), Uuid::from_u128(2), profile());
+    live.provider_event(&LiveRecognitionEvent::Transcript(LiveTranscript {
+        text: "hello Ω".into(),
+        start_millis: 12,
+        duration_millis: 333,
+        confidence: Some(0.75),
+        stability: LiveTranscriptStability::SegmentFinal,
+    }));
+    live.provider_event(&LiveRecognitionEvent::UtteranceEnd {
+        last_word_end_millis: 345,
+    });
+    live.provider_event(&LiveRecognitionEvent::FinalizeResultObserved);
+    let live = live.finish(None, "flushed".into());
+    assert_eq!(
+        live.result_digest,
+        "eec9a3372009a5d6f595cdb1d84071714ca7704a552f90988a91afe76435bdde"
+    );
 }
 
 #[test]
@@ -87,6 +122,11 @@ fn failures_are_excluded_and_ranges_report_contiguity() {
     assert!(record.acked_sequences.contiguous);
     assert_eq!(record.terminal_status, "transport_closed");
     assert!(!record.finalize_result_observed);
+    assert!(record.provider_operation.is_none());
+    assert_eq!(
+        record.acked_raw_input_digest,
+        "d2729c9799013e3c1d1209b22ec80d8cca15a9a2d57772da700b2ecccfed3048"
+    );
 }
 
 #[test]
@@ -145,17 +185,4 @@ async fn sink_is_create_only_bounded_and_rejects_unsafe_custody() {
     symlink(temporary.path(), &link).unwrap();
     assert!(FileQualificationSink::new(&link, "campaign").is_err());
     assert!(FileQualificationSink::new(temporary.path(), "../escape").is_err());
-}
-
-#[tokio::test]
-async fn storage_failure_is_classified_and_partial_cleanup_removes_files() {
-    let temporary = tempfile::tempdir().unwrap();
-    let partial = temporary.path().join("partial.json");
-    std::fs::write(&partial, b"partial").unwrap();
-    let result = write_created_bytes(&mut FailingWriter, &partial, b"record").await;
-    assert_eq!(
-        result,
-        Err(ObservationSinkFailure("QUALIFICATION_WRITE_FAILED"))
-    );
-    assert!(!partial.exists());
 }

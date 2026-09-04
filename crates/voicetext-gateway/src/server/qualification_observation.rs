@@ -1,23 +1,16 @@
 //! Opt-in, bounded qualification observations kept outside public `VoiceText` contracts.
 
-use std::fmt;
 use std::future::Future;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 use voicetext_speech::application::ports::{
     BatchRecognitionResult, LiveRecognitionEvent, ProviderOperation, ProviderOperationKind,
 };
 
-const MAX_OBSERVATIONS: usize = 64;
-const MAX_RECORD_BYTES: usize = 16 * 1024;
 const FRAME_DIGEST_PREFIX: &[u8] = b"voicetext-acked-frames-v1\n";
 const RESULT_DIGEST_PREFIX: &[u8] = b"voicetext-normalized-result-v1\n";
 pub(crate) const OBSERVATION_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -133,133 +126,8 @@ pub struct LiveObservation {
     pub finished_at_unix_ms: u64,
 }
 
-pub struct FileQualificationSink {
-    directory: PathBuf,
-    campaign: Box<str>,
-    written: AtomicUsize,
-}
-
-impl fmt::Debug for FileQualificationSink {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FileQualificationSink")
-            .field("directory", &self.directory)
-            .field("campaign", &self.campaign)
-            .finish_non_exhaustive()
-    }
-}
-
-impl FileQualificationSink {
-    /// Opens a validated private output directory for one bounded campaign.
-    ///
-    /// # Errors
-    ///
-    /// Returns a safe failure code when the campaign or directory custody is invalid.
-    pub fn new(directory: &Path, campaign: &str) -> Result<Self, ObservationSinkFailure> {
-        if !valid_campaign(campaign) || !directory.is_absolute() {
-            return Err(ObservationSinkFailure(
-                "INVALID_QUALIFICATION_CONFIGURATION",
-            ));
-        }
-        let metadata = std::fs::symlink_metadata(directory)
-            .map_err(|_| ObservationSinkFailure("QUALIFICATION_DIRECTORY_UNAVAILABLE"))?;
-        let self_uid = std::fs::metadata("/proc/self")
-            .map_err(|_| ObservationSinkFailure("QUALIFICATION_CUSTODY_UNAVAILABLE"))?
-            .uid();
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || metadata.uid() != self_uid
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err(ObservationSinkFailure("QUALIFICATION_DIRECTORY_UNSAFE"));
-        }
-        Ok(Self {
-            directory: directory.to_owned(),
-            campaign: campaign.into(),
-            written: AtomicUsize::new(0),
-        })
-    }
-
-    fn write<T: Serialize + Send + 'static>(
-        &self,
-        mode: &'static str,
-        effect_id: Uuid,
-        record: T,
-    ) -> ObservationFuture<'_> {
-        let slot = self.written.fetch_add(1, Ordering::AcqRel);
-        if slot >= MAX_OBSERVATIONS {
-            self.written.fetch_sub(1, Ordering::AcqRel);
-            return Box::pin(async { Err(ObservationSinkFailure("QUALIFICATION_RECORD_LIMIT")) });
-        }
-        let path = self
-            .directory
-            .join(format!("{}-{mode}-{effect_id}.json", self.campaign));
-        Box::pin(async move {
-            let bytes = serde_json::to_vec(&record)
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_SERIALIZE_FAILED"))?;
-            if bytes.len() > MAX_RECORD_BYTES {
-                return Err(ObservationSinkFailure("QUALIFICATION_RECORD_TOO_LARGE"));
-            }
-            let mut options = tokio::fs::OpenOptions::new();
-            options.write(true).create_new(true).mode(0o600);
-            let file = options
-                .open(&path)
-                .await
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))?;
-            persist_created_record(file, &path, &bytes).await
-        })
-    }
-}
-
-async fn persist_created_record(
-    mut file: tokio::fs::File,
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), ObservationSinkFailure> {
-    write_created_bytes(&mut file, path, bytes).await?;
-    if file.sync_all().await.is_err() {
-        drop(file);
-        remove_partial(path).await;
-        return Err(ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"));
-    }
-    Ok(())
-}
-
-async fn write_created_bytes<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    path: &Path,
-    bytes: &[u8],
-) -> Result<(), ObservationSinkFailure> {
-    if writer.write_all(bytes).await.is_err() {
-        remove_partial(path).await;
-        return Err(ObservationSinkFailure("QUALIFICATION_WRITE_FAILED"));
-    }
-    Ok(())
-}
-
-async fn remove_partial(path: &Path) {
-    let _removed = tokio::fs::remove_file(path).await;
-}
-
-impl BatchObservationSink for FileQualificationSink {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn observe_batch(&self, record: BatchObservation) -> ObservationFuture<'_> {
-        self.write("batch", record.effect_id, record)
-    }
-}
-
-impl LiveObservationSink for FileQualificationSink {
-    fn enabled(&self) -> bool {
-        true
-    }
-
-    fn observe_live(&self, record: LiveObservation) -> ObservationFuture<'_> {
-        self.write("live", record.effect_id, record)
-    }
-}
+mod file_sink;
+pub use file_sink::FileQualificationSink;
 
 #[derive(Debug)]
 pub(crate) struct LiveObservationTracker {
@@ -457,7 +325,7 @@ fn digest_bytes(digest: &mut Sha256, value: &[u8]) {
     digest.update(value);
 }
 
-fn valid_campaign(value: &str) -> bool {
+pub(super) fn valid_campaign(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
             .bytes()

@@ -151,7 +151,7 @@ async fn sink_failure_is_observable_without_invalidating_authoritative_batch() {
 }
 
 #[tokio::test]
-async fn live_observation_separates_provider_write_from_delivered_ack_and_finalize() {
+async fn live_observation_separates_provider_write_from_emitted_ack_and_finalize() {
     let sink = Arc::new(CapturingSink::default());
     let gateway = TestGateway::start_with_observers(sink.clone(), sink.clone()).await;
     let mut request = gateway.websocket_url().into_client_request().unwrap();
