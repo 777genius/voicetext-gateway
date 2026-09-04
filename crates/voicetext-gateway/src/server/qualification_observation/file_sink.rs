@@ -1,27 +1,46 @@
-//! Cancellation-safe, create-only native qualification record publication.
+//! Create-only native qualification record publication on an isolated blocking worker.
 
 use super::{
     BatchObservation, BatchObservationSink, LiveObservation, LiveObservationSink,
-    ObservationFuture, ObservationSinkFailure, valid_campaign,
+    OBSERVATION_WRITE_TIMEOUT, ObservationFuture, ObservationSinkFailure, valid_campaign,
 };
 use serde::Serialize;
 use std::fmt;
-use std::future::Future;
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const MAX_OBSERVATIONS: usize = 64;
 const MAX_RECORD_BYTES: usize = 16 * 1024;
+const RECEIPT_ACTIVE: u8 = 0;
+const RECEIPT_CANCELLED: u8 = 1;
+const RECEIPT_ACCEPTED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockingStage {
+    BeforeCreate,
+    BeforePublish,
+    AfterPublish,
+}
+
+#[cfg(test)]
+type BlockingHook = Arc<dyn Fn(BlockingStage) + Send + Sync>;
+#[cfg(not(test))]
+type BlockingHook = ();
 
 pub struct FileQualificationSink {
     directory: PathBuf,
-    directory_handle: std::fs::File,
+    directory_handle: Option<Arc<std::fs::File>>,
     campaign: Box<str>,
     written: AtomicUsize,
+    deadline: Duration,
+    hook: BlockingHook,
 }
 
 impl fmt::Debug for FileQualificationSink {
@@ -41,6 +60,20 @@ impl FileQualificationSink {
     ///
     /// Returns a safe failure code when the campaign or directory custody is invalid.
     pub fn new(directory: &Path, campaign: &str) -> Result<Self, ObservationSinkFailure> {
+        Self::open(
+            directory,
+            campaign,
+            OBSERVATION_WRITE_TIMEOUT,
+            default_hook(),
+        )
+    }
+
+    fn open(
+        directory: &Path,
+        campaign: &str,
+        deadline: Duration,
+        hook: BlockingHook,
+    ) -> Result<Self, ObservationSinkFailure> {
         if !valid_campaign(campaign) || !directory.is_absolute() {
             return Err(ObservationSinkFailure(
                 "INVALID_QUALIFICATION_CONFIGURATION",
@@ -68,9 +101,11 @@ impl FileQualificationSink {
         }
         Ok(Self {
             directory: directory.to_owned(),
-            directory_handle,
+            directory_handle: Some(Arc::new(directory_handle)),
             campaign: campaign.into(),
             written: AtomicUsize::new(0),
+            deadline,
+            hook,
         })
     }
 
@@ -87,78 +122,204 @@ impl FileQualificationSink {
         }
         let directory = PathBuf::from(format!(
             "/proc/self/fd/{}",
-            self.directory_handle.as_raw_fd()
+            self.directory_handle().as_raw_fd()
         ));
+        let directory_handle = Arc::clone(self.directory_handle());
         let final_path = directory.join(format!("{}-{mode}-{effect_id}.json", self.campaign));
         let temporary_path = directory.join(format!(
             ".{}-{mode}-{effect_id}-{}.pending",
             self.campaign,
             Uuid::new_v4()
         ));
+        let deadline = Instant::now() + self.deadline;
+        let hook = self.hook.clone();
         Box::pin(async move {
-            let bytes = serde_json::to_vec(&record)
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_SERIALIZE_FAILED"))?;
-            if bytes.len() > MAX_RECORD_BYTES {
-                return Err(ObservationSinkFailure("QUALIFICATION_RECORD_TOO_LARGE"));
+            let receipt = Arc::new(PublicationReceipt::new());
+            let cancellation = CallerCancellation(Arc::clone(&receipt));
+            let (ready, prepared) = oneshot::channel();
+            let worker_receipt = Arc::clone(&receipt);
+            let _worker = tokio::task::spawn_blocking(move || {
+                let _directory_handle = directory_handle;
+                match prepare_record(
+                    record,
+                    directory,
+                    temporary_path,
+                    final_path,
+                    deadline,
+                    &worker_receipt,
+                    &hook,
+                ) {
+                    Ok(mut guard) => {
+                        if ready.send(Ok(())).is_err() {
+                            worker_receipt.cancel();
+                        }
+                        guard.complete_when_accepted(&worker_receipt);
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            });
+
+            let result = prepared
+                .await
+                .unwrap_or(Err(ObservationSinkFailure("QUALIFICATION_WRITE_FAILED")));
+            if result.is_ok() && !cancellation.accept() {
+                return Err(ObservationSinkFailure("QUALIFICATION_WRITE_TIMEOUT"));
             }
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&temporary_path)
-                .map_err(|_| ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))?;
-            let guard = PublicationGuard::new(file, temporary_path, final_path)?;
-            persist_record(guard, bytes, directory).await
+            result
         })
+    }
+
+    fn directory_handle(&self) -> &Arc<std::fs::File> {
+        self.directory_handle
+            .as_ref()
+            .expect("qualification directory handle is present until sink drop")
     }
 }
 
-async fn persist_record(
-    guard: PublicationGuard,
-    bytes: Vec<u8>,
+impl Drop for FileQualificationSink {
+    fn drop(&mut self) {
+        let Some(directory_handle) = self.directory_handle.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _worker = runtime.spawn_blocking(move || drop(directory_handle));
+        } else {
+            drop(directory_handle);
+        }
+    }
+}
+
+fn prepare_record<T: Serialize>(
+    record: T,
     directory: PathBuf,
-) -> Result<(), ObservationSinkFailure> {
-    let writer = tokio::fs::File::from_std(
-        guard
-            .file
-            .try_clone()
-            .map_err(|_| ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))?,
-    );
-    let (guard, writer) = write_stage(guard, writer, &bytes).await?;
-    let mut guard = sync_stage(guard, writer.sync_all()).await?;
-    drop(writer);
-    guard.publish()?;
-    guard.remove_temporary()?;
-    let directory_file = tokio::fs::File::open(directory)
-        .await
-        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
-    let guard = sync_stage(guard, directory_file.sync_all()).await?;
-    guard.complete();
-    Ok(())
-}
-
-async fn write_stage<W: AsyncWrite + Unpin>(
-    guard: PublicationGuard,
-    mut writer: W,
-    bytes: &[u8],
-) -> Result<(PublicationGuard, W), ObservationSinkFailure> {
-    writer
-        .write_all(bytes)
-        .await
+    temporary_path: PathBuf,
+    final_path: PathBuf,
+    deadline: Instant,
+    receipt: &PublicationReceipt,
+    hook: &BlockingHook,
+) -> Result<PublicationGuard, ObservationSinkFailure> {
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SERIALIZE_FAILED"))?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(ObservationSinkFailure("QUALIFICATION_RECORD_TOO_LARGE"));
+    }
+    checkpoint(receipt, deadline)?;
+    run_hook(hook, BlockingStage::BeforeCreate);
+    checkpoint(receipt, deadline)?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary_path)
+        .map_err(|_| ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))?;
+    let mut guard = PublicationGuard::new(file, temporary_path, final_path)?;
+    checkpoint(receipt, deadline)?;
+    guard
+        .file
+        .write_all(&bytes)
         .map_err(|_| ObservationSinkFailure("QUALIFICATION_WRITE_FAILED"))?;
-    Ok((guard, writer))
+    checkpoint(receipt, deadline)?;
+    guard
+        .file
+        .sync_all()
+        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
+    checkpoint(receipt, deadline)?;
+    run_hook(hook, BlockingStage::BeforePublish);
+    checkpoint(receipt, deadline)?;
+    guard.publish()?;
+    run_hook(hook, BlockingStage::AfterPublish);
+    checkpoint(receipt, deadline)?;
+    guard.remove_temporary()?;
+    checkpoint(receipt, deadline)?;
+    let directory_file = std::fs::File::open(directory)
+        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
+    checkpoint(receipt, deadline)?;
+    directory_file
+        .sync_all()
+        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
+    checkpoint(receipt, deadline)?;
+    Ok(guard)
 }
 
-async fn sync_stage<F>(
-    guard: PublicationGuard,
-    sync: F,
-) -> Result<PublicationGuard, ObservationSinkFailure>
-where
-    F: Future<Output = std::io::Result<()>>,
-{
-    sync.await
-        .map_err(|_| ObservationSinkFailure("QUALIFICATION_SYNC_FAILED"))?;
-    Ok(guard)
+fn checkpoint(
+    receipt: &PublicationReceipt,
+    deadline: Instant,
+) -> Result<(), ObservationSinkFailure> {
+    if receipt.is_active() && Instant::now() <= deadline {
+        Ok(())
+    } else {
+        Err(ObservationSinkFailure("QUALIFICATION_WRITE_TIMEOUT"))
+    }
+}
+
+struct PublicationReceipt {
+    state: AtomicU8,
+    mutex: Mutex<()>,
+    changed: Condvar,
+}
+
+impl PublicationReceipt {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(RECEIPT_ACTIVE),
+            mutex: Mutex::new(()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RECEIPT_ACTIVE
+    }
+
+    fn accept(&self) -> bool {
+        let accepted = self
+            .state
+            .compare_exchange(
+                RECEIPT_ACTIVE,
+                RECEIPT_ACCEPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        self.changed.notify_all();
+        accepted
+    }
+
+    fn cancel(&self) {
+        let _ = self.state.compare_exchange(
+            RECEIPT_ACTIVE,
+            RECEIPT_CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.changed.notify_all();
+    }
+
+    fn wait_for_caller(&self) {
+        let mut guard = self.mutex.lock().unwrap_or_else(|error| error.into_inner());
+        while self.is_active() {
+            guard = self
+                .changed
+                .wait(guard)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+struct CallerCancellation(Arc<PublicationReceipt>);
+
+impl CallerCancellation {
+    fn accept(&self) -> bool {
+        self.0.accept()
+    }
+}
+
+impl Drop for CallerCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 struct PublicationGuard {
@@ -204,8 +365,9 @@ impl PublicationGuard {
         }
     }
 
-    fn complete(mut self) {
-        self.complete = true;
+    fn complete_when_accepted(&mut self, receipt: &PublicationReceipt) {
+        receipt.wait_for_caller();
+        self.complete = receipt.state.load(Ordering::Acquire) == RECEIPT_ACCEPTED;
     }
 }
 
@@ -225,12 +387,26 @@ fn remove_if_owned(path: &Path, identity: (u64, u64)) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return !path.exists();
     };
-    if metadata.file_type().is_file() && (metadata.dev(), metadata.ino()) == identity {
-        std::fs::remove_file(path).is_ok()
-    } else {
-        false
-    }
+    metadata.file_type().is_file()
+        && (metadata.dev(), metadata.ino()) == identity
+        && std::fs::remove_file(path).is_ok()
 }
+
+#[cfg(test)]
+fn default_hook() -> BlockingHook {
+    Arc::new(|_| {})
+}
+
+#[cfg(not(test))]
+fn default_hook() -> BlockingHook {}
+
+#[cfg(test)]
+fn run_hook(hook: &BlockingHook, stage: BlockingStage) {
+    hook(stage);
+}
+
+#[cfg(not(test))]
+fn run_hook(_hook: &BlockingHook, _stage: BlockingStage) {}
 
 impl BatchObservationSink for FileQualificationSink {
     fn enabled(&self) -> bool {

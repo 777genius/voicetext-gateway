@@ -24,14 +24,22 @@ Sink failures increment `voicetext_qualification_observation_failures_total` and
 machine code. They do not retry a provider effect and do not change the authoritative batch result,
 live terminal message, or recording custody. A missing or incomplete record means qualification
 evidence is missing; total disk failure cannot be rolled back by this facility.
-Each sink call has a one-second gateway-side deadline; the deadline is not extended. Cancellation
-performs bounded inode-checked cleanup and reports `QUALIFICATION_WRITE_TIMEOUT`; later background
-I/O cannot turn that call into qualified evidence. Writing, record sync, no-replace publication,
-temporary-name removal, and directory sync must all finish inside the deadline. On failure the sink
-makes bounded best-effort cleanup only when a path still names the inode it created, so a replaced
-foreign inode is never removed. Filesystem or power-loss behavior can still make cleanup ambiguous;
-file presence alone never proves a successful sink call. The authoritative operation continues
-unchanged.
+Each sink call gives its caller a one-second gateway-side deadline; the deadline is not extended.
+All filesystem work and cleanup run on an isolated blocking worker. The worker checks both its own
+deadline and an explicit caller receipt before and after publication. A published name remains
+provisional until writing, record sync, create-only publication, temporary-name removal, directory
+sync, and the caller's acceptance have all completed. Timeout or cancellation wins that receipt, so
+later worker completion cannot turn the call into qualified evidence.
+
+Native filesystem syscalls are not preemptible and this is not a hard syscall-completion deadline.
+A syscall or inode-checked best-effort cleanup can finish after the caller has reported
+`QUALIFICATION_WRITE_TIMEOUT`; a provisional name can therefore be transiently visible. Cleanup
+checks identity before unlinking, but check-then-unlink is not atomic against a same-UID process
+that can replace names. The directory must remain private mode `0700`, and an untrusted same-UID
+writer is outside the threat model. Filesystem failure, process termination, or power loss can
+leave cleanup ambiguous. Consumers must stop the gateway worker and reject sink-failure metrics,
+extra files, and incomplete campaigns; file presence alone never proves a successful sink call.
+The authoritative operation continues unchanged.
 
 ## Records
 

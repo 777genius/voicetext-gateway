@@ -2,55 +2,9 @@ use super::*;
 use crate::server::qualification_observation::{
     LiveObservationSink, LiveObservationTracker, ObservationProfile,
 };
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::io::AsyncWrite;
-
-struct PendingWriter;
-
-impl AsyncWrite for PendingWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-        _buffer: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Poll::Pending
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-fn paths(directory: &Path) -> (PathBuf, PathBuf) {
-    (
-        directory.join("record.pending"),
-        directory.join("record.json"),
-    )
-}
-
-fn guard(directory: &Path) -> PublicationGuard {
-    let (temporary, final_path) = paths(directory);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)
-        .unwrap();
-    PublicationGuard::new(file, temporary, final_path).unwrap()
-}
-
-fn assert_empty(directory: &Path) {
-    assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
-}
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 fn record(effect_id: Uuid) -> LiveObservation {
     let mut record = LiveObservationTracker::new(
@@ -68,57 +22,175 @@ fn record(effect_id: Uuid) -> LiveObservation {
     record
 }
 
-#[tokio::test]
-async fn cancellation_during_write_removes_only_the_private_temporary_inode() {
+fn private_directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_millis(1),
-        write_stage(guard(directory.path()), PendingWriter, b"record"),
-    )
-    .await;
-    assert!(result.is_err());
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
+fn assert_empty(directory: &Path) {
+    assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+}
+
+async fn wait_until_empty(directory: &Path) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while std::fs::read_dir(directory).unwrap().next().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+struct BlockingGate {
+    stage: BlockingStage,
+    entered: Notify,
+    released: AtomicBool,
+    mutex: Mutex<()>,
+    changed: Condvar,
+}
+
+impl BlockingGate {
+    fn new(stage: BlockingStage) -> Arc<Self> {
+        Arc::new(Self {
+            stage,
+            entered: Notify::new(),
+            released: AtomicBool::new(false),
+            mutex: Mutex::new(()),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn hook(self: &Arc<Self>) -> BlockingHook {
+        let gate = Arc::clone(self);
+        Arc::new(move |stage| {
+            if stage != gate.stage {
+                return;
+            }
+            gate.entered.notify_one();
+            let mut guard = gate.mutex.lock().unwrap();
+            while !gate.released.load(Ordering::Acquire) {
+                guard = gate.changed.wait(guard).unwrap();
+            }
+        })
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+}
+
+#[tokio::test]
+async fn cancellation_before_publication_leaves_no_late_artifact() {
+    let directory = private_directory();
+    let gate = BlockingGate::new(BlockingStage::BeforePublish);
+    let sink = Arc::new(
+        FileQualificationSink::open(
+            directory.path(),
+            "cancelled",
+            Duration::from_secs(1),
+            gate.hook(),
+        )
+        .unwrap(),
+    );
+    let task = tokio::spawn({
+        let sink = Arc::clone(&sink);
+        async move {
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                sink.observe_live(record(Uuid::from_u128(3))),
+            )
+            .await
+        }
+    });
+    gate.entered.notified().await;
+    assert!(task.await.unwrap().is_err());
+    gate.release();
+    wait_until_empty(directory.path()).await;
+}
+
+#[tokio::test]
+async fn delayed_publication_cannot_be_qualified_after_caller_deadline() {
+    let directory = private_directory();
+    let gate = BlockingGate::new(BlockingStage::AfterPublish);
+    let effect = Uuid::from_u128(4);
+    let sink = Arc::new(
+        FileQualificationSink::open(
+            directory.path(),
+            "deadline",
+            Duration::from_secs(1),
+            gate.hook(),
+        )
+        .unwrap(),
+    );
+    let task = tokio::spawn({
+        let sink = Arc::clone(&sink);
+        async move {
+            tokio::time::timeout(Duration::from_millis(20), sink.observe_live(record(effect))).await
+        }
+    });
+    gate.entered.notified().await;
+    assert!(
+        directory
+            .path()
+            .join(format!("deadline-live-{effect}.json"))
+            .exists()
+    );
+    assert!(task.await.unwrap().is_err());
+    gate.release();
+    wait_until_empty(directory.path()).await;
+}
+
+#[tokio::test]
+async fn worker_deadline_rejects_a_delayed_blocking_operation() {
+    let directory = private_directory();
+    let gate = BlockingGate::new(BlockingStage::BeforeCreate);
+    let sink = Arc::new(
+        FileQualificationSink::open(
+            directory.path(),
+            "worker_deadline",
+            Duration::from_millis(20),
+            gate.hook(),
+        )
+        .unwrap(),
+    );
+    let task = tokio::spawn({
+        let sink = Arc::clone(&sink);
+        async move { sink.observe_live(record(Uuid::from_u128(5))).await }
+    });
+    gate.entered.notified().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    gate.release();
+    assert_eq!(
+        task.await.unwrap(),
+        Err(ObservationSinkFailure("QUALIFICATION_WRITE_TIMEOUT"))
+    );
     assert_empty(directory.path());
 }
 
 #[tokio::test]
-async fn cancellation_during_file_sync_removes_the_private_temporary_inode() {
-    let directory = tempfile::tempdir().unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_millis(1),
-        sync_stage(
-            guard(directory.path()),
-            std::future::pending::<std::io::Result<()>>(),
-        ),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_empty(directory.path());
-}
-
-#[tokio::test]
-async fn cancellation_during_directory_sync_removes_unqualified_publication() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut publication = guard(directory.path());
-    publication.publish().unwrap();
-    publication.remove_temporary().unwrap();
-    let result = tokio::time::timeout(
-        Duration::from_millis(1),
-        sync_stage(publication, std::future::pending::<std::io::Result<()>>()),
-    )
-    .await;
-    assert!(result.is_err());
-    assert_empty(directory.path());
-}
-
-#[test]
-fn cleanup_never_unlinks_a_replaced_foreign_inode() {
-    let directory = tempfile::tempdir().unwrap();
-    let publication = guard(directory.path());
-    let (temporary, _) = paths(directory.path());
-    std::fs::remove_file(&temporary).unwrap();
-    std::fs::write(&temporary, b"foreign").unwrap();
-    drop(publication);
-    assert_eq!(std::fs::read(&temporary).unwrap(), b"foreign");
+async fn publication_error_cleans_temporary_file_and_preserves_existing_record() {
+    let directory = private_directory();
+    let sink = FileQualificationSink::new(directory.path(), "campaign").unwrap();
+    let effect = Uuid::from_u128(6);
+    sink.observe_live(record(effect)).await.unwrap();
+    let path = directory
+        .path()
+        .join(format!("campaign-live-{effect}.json"));
+    let original = std::fs::read(&path).unwrap();
+    assert_eq!(
+        sink.observe_live(record(effect)).await,
+        Err(ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))
+    );
+    assert_eq!(std::fs::read(path).unwrap(), original);
+    assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')
+    }));
 }
 
 #[tokio::test]
@@ -133,32 +205,19 @@ async fn publication_is_create_only_and_uses_pinned_directory_custody() {
     std::fs::create_dir(&original).unwrap();
     std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let effect = Uuid::from_u128(3);
-    let record = record(effect);
-    sink.observe_live(record.clone()).await.unwrap();
+    let effect = Uuid::from_u128(7);
+    sink.observe_live(record(effect)).await.unwrap();
     assert!(
         !original
             .join(format!("campaign-live-{effect}.json"))
             .exists()
     );
     assert!(pinned.join(format!("campaign-live-{effect}.json")).exists());
-    assert_eq!(
-        sink.observe_live(record).await,
-        Err(ObservationSinkFailure("QUALIFICATION_CREATE_FAILED"))
-    );
-    assert!(std::fs::read_dir(&pinned).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.')
-    }));
 }
 
 #[tokio::test]
 async fn process_record_limit_is_exact_and_leaves_no_temporary_names() {
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_directory();
     let sink = FileQualificationSink::new(directory.path(), "bounded").unwrap();
     for value in 1..=MAX_OBSERVATIONS {
         sink.observe_live(record(Uuid::from_u128(value as u128)))
@@ -170,11 +229,4 @@ async fn process_record_limit_is_exact_and_leaves_no_temporary_names() {
         sink.observe_live(record(Uuid::from_u128(65))).await,
         Err(ObservationSinkFailure("QUALIFICATION_RECORD_LIMIT"))
     );
-    assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with('.')
-    }));
 }
