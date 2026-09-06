@@ -105,11 +105,11 @@ async fn run(
     let auth = captured
         .machine(&config.bearer_token_file)
         .await
-        .map_err(|_| BootstrapFailure::BearerSecret)?;
+        .map_err(|()| BootstrapFailure::BearerSecret)?;
     let database_url = captured
         .text(&config.postgres_url_file)
         .await
-        .map_err(|_| BootstrapFailure::DatabaseSecret)?;
+        .map_err(|()| BootstrapFailure::DatabaseSecret)?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .min_connections(1)
@@ -251,7 +251,7 @@ async fn build_profiles(
         let key = captured
             .text(path)
             .await
-            .map_err(|_| BootstrapFailure::ProviderSecret)?;
+            .map_err(|()| BootstrapFailure::ProviderSecret)?;
         let batch = DeepgramBatchRecognizer::new(
             client.clone(),
             key.expose_secret(),
@@ -269,7 +269,7 @@ async fn build_profiles(
         let key = captured
             .text(path)
             .await
-            .map_err(|_| BootstrapFailure::ProviderSecret)?;
+            .map_err(|()| BootstrapFailure::ProviderSecret)?;
         let batch = ElevenLabsBatchRecognizer::new(
             client,
             key.expose_secret(),
