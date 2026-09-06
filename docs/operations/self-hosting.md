@@ -44,6 +44,7 @@ policy; do not treat the spool as a replacement for the original Craig recording
 | Limit | Default or invariant |
 | --- | --- |
 | Batch upload | 64 MiB; configurable from 1 MiB through 64 MiB |
+| PostgreSQL pool connections | `VOICETEXT_DATABASE_MAX_CONNECTIONS`: integer 1 through 10, default 10; minimum pool size 1 |
 | Concurrent inbound connections | 128; configurable from 1 through 10,000 |
 | Live client frame | 64 KiB gateway bound |
 | Raw Discord Opus packet | at most 1,275 bytes, mono 48 kHz |
@@ -57,6 +58,29 @@ policy; do not treat the spool as a replacement for the original Craig recording
 Capacity rejection happens before accepting additional work. Missing or mismatched profiles fail
 closed; the gateway never changes providers automatically. Tune connection and upload limits only
 after measuring memory, provider concurrency, PostgreSQL capacity, and spool disk usage.
+
+Set `VOICETEXT_DATABASE_MAX_CONNECTIONS=1` in the gateway process environment when its
+PostgreSQL role/database permits only one connection. The bound applies per gateway process;
+budget other processes separately against role, database, and server limits. Concurrent polling
+and execution share the pool and wait for a lease, with the existing 10-second acquisition timeout.
+The inbound `VOICETEXT_MAX_CONNECTIONS` setting is independent. Invalid database limits fail
+configuration at startup. The default remains 10 for existing deployments.
+
+The providerless regression requires a disposable local database named `voicetext_test_<unique>`
+and a non-superuser login role, **both** configured with `CONNECTION LIMIT 1`. The role must own
+or have access to the database; no provider credentials are needed. Run:
+
+```sh
+VOICETEXT_TEST_DATABASE_URL=postgresql://.../voicetext_test_<unique> \
+  cargo test -p voicetext-gateway --bin voicetext-gateway \
+  database_pool_composition::constrained_database_serializes_poll_and_execution_acquisition \
+  -- --ignored --exact
+```
+
+This test checks the server constraints and proves overlapping polling/execution acquisitions
+wait and reuse one PostgreSQL backend. It is ignored in ordinary offline tests; an ignored result
+is not PostgreSQL execution evidence. Run the existing durable startup recovery and production
+composition gates separately to cover accepted-state recovery and provider exactly-once behavior.
 
 ## Health and observability
 

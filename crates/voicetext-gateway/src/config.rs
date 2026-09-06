@@ -34,6 +34,8 @@ pub const ALLOW_INSECURE_ENDPOINTS_ENV: &str = "VOICETEXT_ALLOW_INSECURE_PROVIDE
 pub const FINALIZE_TIMEOUT_ENV: &str = "VOICETEXT_FINALIZE_TIMEOUT_MS";
 /// Maximum graceful batch-task drain interval in milliseconds.
 pub const SHUTDOWN_DRAIN_TIMEOUT_ENV: &str = "VOICETEXT_SHUTDOWN_DRAIN_TIMEOUT_MS";
+/// Maximum `PostgreSQL` connections per gateway process (1 through 10).
+pub const DATABASE_MAX_CONNECTIONS_ENV: &str = "VOICETEXT_DATABASE_MAX_CONNECTIONS";
 /// Maximum concurrent inbound connections.
 pub const MAX_CONNECTIONS_ENV: &str = "VOICETEXT_MAX_CONNECTIONS";
 /// Maximum accepted batch upload size in bytes.
@@ -83,6 +85,8 @@ pub struct GatewayConfig {
     pub finalize_timeout: Duration,
     /// Maximum time to preserve in-flight paid batch work after shutdown begins.
     pub shutdown_drain_timeout: Duration,
+    /// Maximum `PostgreSQL` connections per gateway process.
+    pub database_max_connections: u32,
     /// Maximum concurrent inbound connections.
     pub max_connections: usize,
     /// Maximum accepted batch upload size.
@@ -207,6 +211,18 @@ impl GatewayConfig {
                 MIN_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
                 MAX_SHUTDOWN_DRAIN_TIMEOUT_MILLIS,
             )?),
+            database_max_connections: u32::try_from(parse_bounded_u64(
+                optional(&mut lookup, DATABASE_MAX_CONNECTIONS_ENV)?,
+                DATABASE_MAX_CONNECTIONS_ENV,
+                10,
+                1,
+                10,
+            )?)
+            .map_err(|_| ConfigError::OutOfRange {
+                name: DATABASE_MAX_CONNECTIONS_ENV,
+                minimum: 1,
+                maximum: 10,
+            })?,
             max_connections: parse_bounded_usize(
                 optional(&mut lookup, MAX_CONNECTIONS_ENV)?,
                 MAX_CONNECTIONS_ENV,

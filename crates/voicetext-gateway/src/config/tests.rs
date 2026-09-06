@@ -194,3 +194,48 @@ fn explicit_descriptor_slots_reject_ambiguous_values_and_conflicts() {
     values.insert(SECRET_FD_ENVS[3], "3".into());
     assert!(load(&values).is_err());
 }
+
+#[test]
+fn database_pool_limit_defaults_and_valid_bounds() {
+    assert_eq!(load(&required()).unwrap().database_max_connections, 10);
+    for expected in 1..=10 {
+        let mut values = required();
+        values.insert(DATABASE_MAX_CONNECTIONS_ENV, expected.to_string());
+        assert_eq!(load(&values).unwrap().database_max_connections, expected);
+    }
+}
+
+#[test]
+fn database_pool_limit_rejects_invalid_values_without_echoing_them() {
+    for value in [
+        "0",
+        "11",
+        "-1",
+        "1.5",
+        "nope",
+        "18446744073709551616",
+        " 1",
+        "1 ",
+    ] {
+        let mut values = required();
+        values.insert(DATABASE_MAX_CONNECTIONS_ENV, value.into());
+        assert_eq!(
+            load(&values),
+            Err(ConfigError::OutOfRange {
+                name: DATABASE_MAX_CONNECTIONS_ENV,
+                minimum: 1,
+                maximum: 10,
+            })
+        );
+    }
+    for value in ["", "1\n", "\0"] {
+        let mut values = required();
+        values.insert(DATABASE_MAX_CONNECTIONS_ENV, value.into());
+        assert_eq!(
+            load(&values),
+            Err(ConfigError::InvalidValue {
+                name: DATABASE_MAX_CONNECTIONS_ENV,
+            })
+        );
+    }
+}

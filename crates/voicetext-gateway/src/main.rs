@@ -110,10 +110,7 @@ async fn run(
         .text(&config.postgres_url_file)
         .await
         .map_err(|()| BootstrapFailure::DatabaseSecret)?;
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .min_connections(1)
-        .acquire_timeout(Duration::from_secs(10))
+    let pool = database_pool_options(&config)
         .connect(database_url.expose_secret())
         .await
         .map_err(|_| BootstrapFailure::DatabaseConnect)?;
@@ -193,6 +190,13 @@ async fn run(
     log_listening(config.bind_address);
     start_startup_recovery(&state, recovery);
     serve_until_shutdown(listener, state, pool, config.shutdown_drain_timeout).await
+}
+
+fn database_pool_options(config: &GatewayConfig) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(config.database_max_connections)
+        .min_connections(1)
+        .acquire_timeout(Duration::from_secs(10))
 }
 
 async fn serve_until_shutdown(
@@ -408,5 +412,104 @@ mod tests {
         send_signal.send(()).unwrap();
         transition.await.unwrap();
         assert!(stopped.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod database_pool_composition {
+    use super::*;
+    use voicetext_gateway::config::{
+        BEARER_TOKEN_FILE_ENV, DATABASE_MAX_CONNECTIONS_ENV, POSTGRES_URL_FILE_ENV,
+        SPOOL_DIRECTORY_ENV,
+    };
+
+    fn config(limit: Option<&str>) -> GatewayConfig {
+        GatewayConfig::from_lookup(|name| {
+            match name {
+                POSTGRES_URL_FILE_ENV => Some("/unused/database"),
+                BEARER_TOKEN_FILE_ENV => Some("/unused/bearer"),
+                SPOOL_DIRECTORY_ENV => Some("/unused/spool"),
+                DATABASE_MAX_CONNECTIONS_ENV => limit,
+                _ => None,
+            }
+            .map(str::to_owned)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn database_pool_composes_validated_limit_and_preserves_timeouts() {
+        for (limit, expected) in [(None, 10), (Some("1"), 1), (Some("7"), 7)] {
+            let options = database_pool_options(&config(limit));
+            assert_eq!(options.get_max_connections(), expected);
+            assert_eq!(options.get_min_connections(), 1);
+            assert_eq!(options.get_acquire_timeout(), Duration::from_secs(10));
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable local PostgreSQL database and non-superuser role, both CONNECTION LIMIT 1"]
+    async fn constrained_database_serializes_poll_and_execution_acquisition() {
+        use sqlx::postgres::PgConnectOptions;
+        use std::str::FromStr;
+
+        let url = std::env::var("VOICETEXT_TEST_DATABASE_URL")
+            .expect("set VOICETEXT_TEST_DATABASE_URL to a disposable local database");
+        let options = PgConnectOptions::from_str(&url).expect("valid database URL");
+        assert!(matches!(
+            options.get_host(),
+            "localhost" | "127.0.0.1" | "::1"
+        ));
+        assert!(
+            options
+                .get_database()
+                .unwrap()
+                .starts_with("voicetext_test_")
+        );
+        let pool = database_pool_options(&config(Some("1")))
+            .connect_with(options)
+            .await
+            .unwrap();
+        let constraints: (bool, i32, i32) = sqlx::query_as(
+            "SELECT r.rolsuper, r.rolconnlimit, d.datconnlimit FROM pg_roles r, pg_database d \
+             WHERE r.rolname = current_user AND d.datname = current_database()",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            constraints,
+            (false, 1, 1),
+            "fixture must enforce both connection limits"
+        );
+
+        // Hold the polling connection while the execution acquisition is actually polled.
+        // With the previous maximum of 10, this tries a second connection and receives
+        // PostgreSQL SQLSTATE 53300 instead of waiting for the polling lease.
+        let mut poll = pool.acquire().await.unwrap();
+        let poll_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *poll)
+            .await
+            .unwrap();
+        let execution = pool.acquire();
+        tokio::pin!(execution);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut execution)
+                .await
+                .is_err()
+        );
+        drop(poll);
+        let mut execution = tokio::time::timeout(Duration::from_secs(2), execution)
+            .await
+            .unwrap()
+            .unwrap();
+        let execution_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *execution)
+            .await
+            .unwrap();
+        assert_eq!(execution_pid, poll_pid);
+        assert_eq!(pool.size(), 1);
+        drop(execution);
+        pool.close().await;
     }
 }
