@@ -117,6 +117,15 @@ fn parse_results(object: &Map<String, Value>) -> Result<ParsedLiveMessage, Parse
         .to_owned();
     let confidence = parse_confidence(alternative.get("confidence"))?;
 
+    // A textless Finalize acknowledgement is control evidence, not a transcript.
+    // Validate all Results fields above before accepting that evidence. Ordinary
+    // final results retain their existing segment/utterance boundary semantics.
+    if text.is_empty() && from_finalize {
+        return Ok(ParsedLiveMessage::Events {
+            primary: LiveRecognitionEvent::FinalizeResultObserved,
+            follow_up: None,
+        });
+    }
     if text.is_empty() && !is_final && !speech_final && !from_finalize {
         return Ok(ParsedLiveMessage::Ignore);
     }
@@ -247,11 +256,113 @@ mod tests {
         let ParsedLiveMessage::Events { primary, follow_up } = parse_text(payload).unwrap() else {
             panic!("expected events");
         };
-        assert!(matches!(primary, LiveRecognitionEvent::Transcript(_)));
+        assert_eq!(
+            primary,
+            LiveRecognitionEvent::Transcript(LiveTranscript {
+                text: "tail".into(),
+                start_millis: 0,
+                duration_millis: 100,
+                confidence: None,
+                stability: LiveTranscriptStability::SegmentFinal,
+            })
+        );
         assert_eq!(
             follow_up,
             Some(LiveRecognitionEvent::FinalizeResultObserved)
         );
+    }
+
+    #[test]
+    fn empty_finalize_tail_emits_only_the_observation_marker() {
+        for is_final in [false, true] {
+            for speech_final in [false, true] {
+                let payload = serde_json::json!({
+                    "type": "Results", "start": 25.9, "duration": 0.22,
+                    "is_final": is_final, "speech_final": speech_final,
+                    "from_finalize": true,
+                    "channel": {"alternatives": [{"transcript": "", "confidence": 0.0}]}
+                });
+                assert_eq!(
+                    parse_text(&payload.to_string()).unwrap(),
+                    ParsedLiveMessage::Events {
+                        primary: LiveRecognitionEvent::FinalizeResultObserved,
+                        follow_up: None,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_final_without_finalize_preserves_existing_boundary_semantics() {
+        for from_finalize in [None, Some(false)] {
+            for (is_final, speech_final, stability) in [
+                (true, false, LiveTranscriptStability::SegmentFinal),
+                (true, true, LiveTranscriptStability::UtteranceFinal),
+                (false, true, LiveTranscriptStability::UtteranceFinal),
+            ] {
+                let mut payload = serde_json::json!({
+                    "type": "Results", "start": 25.9, "duration": 0.22,
+                    "is_final": is_final, "speech_final": speech_final,
+                    "channel": {"alternatives": [{"transcript": ""}]}
+                });
+                if let Some(flag) = from_finalize {
+                    payload["from_finalize"] = flag.into();
+                }
+                assert_eq!(
+                    parse_text(&payload.to_string()).unwrap(),
+                    ParsedLiveMessage::Events {
+                        primary: LiveRecognitionEvent::Transcript(LiveTranscript {
+                            text: String::new(),
+                            start_millis: 25_900,
+                            duration_millis: 220,
+                            confidence: None,
+                            stability,
+                        }),
+                        follow_up: None,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_finalize_does_not_bypass_malformed_field_checks() {
+        let valid = serde_json::json!({
+            "type": "Results", "start": 25.9, "duration": 0.22,
+            "is_final": true, "speech_final": false, "from_finalize": true,
+            "channel": {"alternatives": [{"transcript": "", "confidence": 0.0}]}
+        });
+        for (pointer, invalid) in [
+            ("/start", serde_json::json!(-1)),
+            ("/start", serde_json::json!(1e100)),
+            ("/duration", serde_json::json!("0.22")),
+            ("/duration", serde_json::json!(null)),
+            ("/is_final", serde_json::json!("true")),
+            ("/speech_final", serde_json::json!(1)),
+            ("/from_finalize", serde_json::json!(null)),
+            ("/channel", serde_json::json!([])),
+            ("/channel/alternatives", serde_json::json!([])),
+            (
+                "/channel/alternatives/0/transcript",
+                serde_json::json!(null),
+            ),
+            ("/channel/alternatives/0/confidence", serde_json::json!(2)),
+            ("/channel/alternatives/0/confidence", serde_json::json!("0")),
+        ] {
+            let mut payload = valid.clone();
+            *payload.pointer_mut(pointer).unwrap() = invalid;
+            assert_eq!(
+                parse_text(&payload.to_string()),
+                Err(malformed()),
+                "{pointer}"
+            );
+        }
+        for field in ["start", "duration", "channel"] {
+            let mut payload = valid.clone();
+            payload.as_object_mut().unwrap().remove(field);
+            assert_eq!(parse_text(&payload.to_string()), Err(malformed()));
+        }
     }
 
     #[test]
