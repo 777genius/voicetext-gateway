@@ -9,6 +9,8 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+zeroize = "=1.9.0"
+libc = "=0.2.189"
 axum.workspace = true
 hex.workspace = true
 reqwest.workspace = true

@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum accepted size of a mounted secret file, including its final newline.
 pub const MAX_SECRET_FILE_BYTES: usize = 16 * 1024;
@@ -49,7 +50,7 @@ impl MachineSecret {
     pub async fn read_from_file(path: impl AsRef<Path>) -> Result<Self, SecretFileError> {
         let mut bytes = read_secret_bytes(path.as_ref()).await?;
         let result = Self::from_token(&bytes).map_err(SecretFileError::InvalidToken);
-        bytes.fill(0);
+        bytes.zeroize();
         result
     }
 
@@ -95,7 +96,7 @@ impl SecretText {
     /// content validation fails.
     pub async fn read_from_file(path: impl AsRef<Path>) -> Result<Self, SecretFileError> {
         let bytes = read_secret_bytes(path.as_ref()).await?;
-        Self::from_owned_bytes(bytes).map_err(SecretFileError::InvalidText)
+        Self::from_owned_bytes(bytes.to_vec()).map_err(SecretFileError::InvalidText)
     }
 
     /// Exposes plaintext only at the final composition boundary that needs it.
@@ -112,14 +113,14 @@ impl SecretText {
             Err(_) => Err(SecretTextError::InvalidUtf8),
         };
         if let Err(error) = validation {
-            bytes.fill(0);
+            bytes.zeroize();
             return Err(error);
         }
         Ok(Self { bytes })
     }
 
     fn erase(&mut self) {
-        self.bytes.fill(0);
+        self.bytes.zeroize();
     }
 }
 
@@ -244,7 +245,7 @@ fn validate_secret_text(text: &str) -> Result<(), SecretTextError> {
     Ok(())
 }
 
-async fn read_secret_bytes(path: &Path) -> Result<Vec<u8>, SecretFileError> {
+async fn read_secret_bytes(path: &Path) -> Result<Zeroizing<Vec<u8>>, SecretFileError> {
     let before = tokio::fs::symlink_metadata(path)
         .await
         .map_err(SecretFileError::Metadata)?;
@@ -257,14 +258,14 @@ async fn read_secret_bytes(path: &Path) -> Result<Vec<u8>, SecretFileError> {
     validate_metadata(&opened)?;
     ensure_same_file(&before, &opened)?;
 
-    let expected_length = usize::try_from(opened.len()).unwrap_or(MAX_SECRET_FILE_BYTES);
-    let mut bytes = Vec::with_capacity(MAX_SECRET_FILE_BYTES.min(expected_length));
+    // Reserve the entire bounded read so reallocations cannot leave plaintext behind.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_SECRET_FILE_BYTES + 1));
     file.take(MAX_SECRET_READ_BYTES)
         .read_to_end(&mut bytes)
         .await
         .map_err(SecretFileError::Read)?;
     if bytes.len() > MAX_SECRET_FILE_BYTES {
-        bytes.fill(0);
+        bytes.zeroize();
         return Err(SecretFileError::TooLarge {
             maximum: MAX_SECRET_FILE_BYTES,
         });

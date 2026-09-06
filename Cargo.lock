@@ -2480,6 +2480,7 @@ dependencies = [
  "axum",
  "futures-util",
  "hex",
+ "libc",
  "ogg",
  "reqwest",
  "rustls",
@@ -2500,6 +2501,7 @@ dependencies = [
  "voicetext-audio",
  "voicetext-providers",
  "voicetext-speech",
+ "zeroize",
 ]
 
 [[package]]

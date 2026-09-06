@@ -3,7 +3,6 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
-use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +16,6 @@ use tracing_subscriber::prelude::*;
 use url::Url;
 use voicetext_gateway::config::GatewayConfig;
 use voicetext_gateway::profiles::ProfileRegistry;
-use voicetext_gateway::secret::{MachineSecret, SecretText};
 use voicetext_gateway::server::{
     FileQualificationSink, GatewayLimits, GatewayState, PostgresSpoolReadiness, reconcile_startup,
     router, start_startup_recovery,
@@ -28,8 +26,33 @@ const SPOOL_ORPHAN_RETENTION: Duration = Duration::from_hours(24);
 use voicetext_providers::deepgram::{DeepgramBatchRecognizer, DeepgramLiveRecognizer};
 use voicetext_providers::elevenlabs::{ElevenLabsBatchRecognizer, ElevenLabsLiveRecognizer};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+mod inherited_fd;
+
+fn main() -> ExitCode {
+    let health = std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck"));
+    let startup = if health {
+        None
+    } else {
+        let Ok(config) = GatewayConfig::from_env() else {
+            eprintln!("{}", BootstrapFailure::Configuration.code());
+            return ExitCode::FAILURE;
+        };
+        let Ok(captured) = inherited_fd::Captured::capture(&config) else {
+            eprintln!("SECRET_FD_INVALID");
+            return ExitCode::FAILURE;
+        };
+        Some((config, captured))
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    else {
+        return ExitCode::FAILURE;
+    };
+    runtime.block_on(async_main(startup))
+}
+
+async fn async_main(startup: Option<(GatewayConfig, inherited_fd::Captured)>) -> ExitCode {
     initialize_tracing();
     if install_crypto_provider().is_err() {
         tracing::error!(
@@ -38,14 +61,15 @@ async fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("healthcheck")) {
+    if startup.is_none() {
         return if healthcheck().await {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
         };
     }
-    match run().await {
+    let (config, captured) = startup.expect("normal startup captured before runtime");
+    match run(config, captured).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!(code = error.code(), "gateway terminated");
@@ -74,12 +98,16 @@ async fn healthcheck() -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
-async fn run() -> Result<(), BootstrapFailure> {
-    let config = GatewayConfig::from_env().map_err(|_| BootstrapFailure::Configuration)?;
-    let auth = MachineSecret::read_from_file(&config.bearer_token_file)
+async fn run(
+    config: GatewayConfig,
+    captured: inherited_fd::Captured,
+) -> Result<(), BootstrapFailure> {
+    let auth = captured
+        .machine(&config.bearer_token_file)
         .await
         .map_err(|_| BootstrapFailure::BearerSecret)?;
-    let database_url = SecretText::read_from_file(&config.postgres_url_file)
+    let database_url = captured
+        .text(&config.postgres_url_file)
         .await
         .map_err(|_| BootstrapFailure::DatabaseSecret)?;
     let pool = PgPoolOptions::new()
@@ -98,7 +126,8 @@ async fn run() -> Result<(), BootstrapFailure> {
         DurableFileSpool::new(&config.spool_directory, config.max_upload_bytes)
             .map_err(|_| BootstrapFailure::Spool)?,
     );
-    let profiles = build_profiles(&config).await?;
+    let profiles = build_profiles(&config, &captured).await?;
+    drop(captured);
     if !profiles.is_operational() {
         return Err(BootstrapFailure::NoProvider);
     }
@@ -210,13 +239,19 @@ async fn serve_until_shutdown(
     serve_result
 }
 
-async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, BootstrapFailure> {
+async fn build_profiles(
+    config: &GatewayConfig,
+    captured: &inherited_fd::Captured,
+) -> Result<ProfileRegistry, BootstrapFailure> {
     let client = provider_http_client(config.allow_insecure_provider_endpoints)?;
     let endpoints = &config.provider_endpoints;
     let mut profiles = ProfileRegistry::new();
 
     if let Some(path) = &config.deepgram_api_key_file {
-        let key = provider_secret(path).await?;
+        let key = captured
+            .text(path)
+            .await
+            .map_err(|_| BootstrapFailure::ProviderSecret)?;
         let batch = DeepgramBatchRecognizer::new(
             client.clone(),
             key.expose_secret(),
@@ -231,7 +266,10 @@ async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, Boots
             .with_live(Arc::new(live));
     }
     if let Some(path) = &config.elevenlabs_api_key_file {
-        let key = provider_secret(path).await?;
+        let key = captured
+            .text(path)
+            .await
+            .map_err(|_| BootstrapFailure::ProviderSecret)?;
         let batch = ElevenLabsBatchRecognizer::new(
             client,
             key.expose_secret(),
@@ -248,12 +286,6 @@ async fn build_profiles(config: &GatewayConfig) -> Result<ProfileRegistry, Boots
             .with_live(Arc::new(live));
     }
     Ok(profiles)
-}
-
-async fn provider_secret(path: &Path) -> Result<SecretText, BootstrapFailure> {
-    SecretText::read_from_file(path)
-        .await
-        .map_err(|_| BootstrapFailure::ProviderSecret)
 }
 
 fn parse_url(value: &str) -> Result<Url, BootstrapFailure> {

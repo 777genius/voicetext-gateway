@@ -16,8 +16,11 @@ gateway.identity|crates/voicetext-gateway/src/identity.rs|speech.domain
 gateway.profiles|crates/voicetext-gateway/src/profiles.rs|gateway.contracts,speech.application
 gateway.secret|crates/voicetext-gateway/src/secret.rs|
 gateway.server|crates/voicetext-gateway/src/server|audio.discord-opus,audio.ogg-opus,gateway.auth,gateway.contracts,gateway.identity,gateway.profiles,gateway.secret,gateway.storage,speech.application,speech.domain
-gateway.composition|crates/voicetext-gateway/src/main.rs|gateway.config,gateway.contracts,gateway.profiles,gateway.secret,gateway.server,gateway.storage,providers.deepgram,providers.elevenlabs
+gateway.composition|crates/voicetext-gateway/src/main.rs|gateway.fd,gateway.config,gateway.contracts,gateway.profiles,gateway.secret,gateway.server,gateway.storage,providers.deepgram,providers.elevenlabs
 gateway.storage|crates/voicetext-gateway/src/storage|speech.application,speech.domain
 gateway.entrypoint|crates/voicetext-gateway/src/lib.rs|gateway.auth,gateway.config,gateway.contracts,gateway.identity,gateway.profiles,gateway.secret,gateway.server,gateway.storage
 gateway.tests|crates/voicetext-gateway/tests|audio.entrypoint,gateway.entrypoint,providers.entrypoint,speech.application,speech.domain
 tooling.xtask|xtask/src|
+gateway.config-tests|crates/voicetext-gateway/src/config|gateway.config
+gateway.fd|crates/voicetext-gateway/src/inherited_fd.rs|gateway.config,gateway.secret
+gateway.fd-tests|crates/voicetext-gateway/src/inherited_fd|gateway.config,gateway.secret,gateway.fd

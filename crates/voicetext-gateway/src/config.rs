@@ -67,16 +67,16 @@ const MAX_ENDPOINT_BYTES: usize = 2_048;
 pub struct GatewayConfig {
     /// Gateway HTTP/WebSocket listen address.
     pub bind_address: SocketAddr,
-    /// Mounted file containing the `PostgreSQL` connection URL.
-    pub postgres_url_file: PathBuf,
-    /// Mounted file containing the gateway machine bearer token.
-    pub bearer_token_file: PathBuf,
+    /// File or inherited descriptor containing the `PostgreSQL` connection URL.
+    pub postgres_url_file: SecretSource,
+    /// File or inherited descriptor containing the gateway machine bearer token.
+    pub bearer_token_file: SecretSource,
     /// Durable directory holding accepted authoritative batch audio.
     pub spool_directory: PathBuf,
-    /// Optional mounted Deepgram API-key file.
-    pub deepgram_api_key_file: Option<PathBuf>,
-    /// Optional mounted `ElevenLabs` API-key file.
-    pub elevenlabs_api_key_file: Option<PathBuf>,
+    /// Optional Deepgram API-key source.
+    pub deepgram_api_key_file: Option<SecretSource>,
+    /// Optional `ElevenLabs` API-key source.
+    pub elevenlabs_api_key_file: Option<SecretSource>,
     /// Provider endpoints selected by composition.
     pub provider_endpoints: ProviderEndpoints,
     /// Maximum time to drain final provider results after finalize begins.
@@ -121,7 +121,11 @@ impl GatewayConfig {
     /// Returns a typed, value-redacting error when required variables are absent or
     /// when a value falls outside the documented syntax and resource bounds.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_lookup(|name| env::var(name).ok())
+        Self::from_lookup(|name| match env::var(name) {
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => Some("\0".into()),
+        })
     }
 
     /// Loads configuration through an injected lookup function.
@@ -172,18 +176,22 @@ impl GatewayConfig {
             )?,
         };
 
-        Ok(Self {
+        let config = Self {
             bind_address: optional(&mut lookup, BIND_ADDRESS_ENV)?
                 .unwrap_or_else(|| DEFAULT_BIND_ADDRESS.to_owned())
                 .parse()
                 .map_err(|_| ConfigError::InvalidSocketAddress {
                     name: BIND_ADDRESS_ENV,
                 })?,
-            postgres_url_file: required_path(&mut lookup, POSTGRES_URL_FILE_ENV)?,
-            bearer_token_file: required_path(&mut lookup, BEARER_TOKEN_FILE_ENV)?,
+            postgres_url_file: secret_source(&mut lookup, 1)?.ok_or(ConfigError::Missing {
+                name: POSTGRES_URL_FILE_ENV,
+            })?,
+            bearer_token_file: secret_source(&mut lookup, 0)?.ok_or(ConfigError::Missing {
+                name: BEARER_TOKEN_FILE_ENV,
+            })?,
             spool_directory: required_path(&mut lookup, SPOOL_DIRECTORY_ENV)?,
-            deepgram_api_key_file: optional_path(&mut lookup, DEEPGRAM_API_KEY_FILE_ENV)?,
-            elevenlabs_api_key_file: optional_path(&mut lookup, ELEVENLABS_API_KEY_FILE_ENV)?,
+            deepgram_api_key_file: secret_source(&mut lookup, 2)?,
+            elevenlabs_api_key_file: secret_source(&mut lookup, 3)?,
             provider_endpoints,
             finalize_timeout: Duration::from_millis(parse_bounded_u64(
                 optional(&mut lookup, FINALIZE_TIMEOUT_ENV)?,
@@ -215,13 +223,39 @@ impl GatewayConfig {
             )?,
             allow_insecure_provider_endpoints,
             qualification_observation,
-        })
+        };
+        config.validate_sources()?;
+        Ok(config)
+    }
+
+    fn validate_sources(&self) -> Result<(), ConfigError> {
+        let sources = [
+            Some(&self.bearer_token_file),
+            Some(&self.postgres_url_file),
+            self.deepgram_api_key_file.as_ref(),
+            self.elevenlabs_api_key_file.as_ref(),
+        ];
+        let mut descriptors = Vec::new();
+        for (slot, source) in sources.into_iter().enumerate() {
+            if let Some(SecretSource::Descriptor(fd)) = source {
+                if descriptors.contains(fd) {
+                    return Err(ConfigError::InvalidValue {
+                        name: SECRET_FD_ENVS[slot],
+                    });
+                }
+                descriptors.push(*fd);
+            }
+        }
+        Ok(())
     }
 }
 
 /// Safe configuration failure which never includes a rejected value.
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    /// Inherited descriptor capture is implemented only for Linux.
+    #[error("inherited secret descriptors are unsupported on this platform")]
+    UnsupportedDescriptorPlatform,
     /// A required variable is absent.
     #[error("required environment variable {name} is missing")]
     Missing { name: &'static str },
@@ -436,164 +470,59 @@ fn parse_endpoint(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
+mod tests;
 
-    use super::*;
+/// Fixed launcher capability slots: bearer, database, Deepgram, `ElevenLabs`.
+pub const SECRET_FD_ENVS: [&str; 4] = [
+    "VOICETEXT_BEARER_TOKEN_FD",
+    "VOICETEXT_POSTGRES_URL_FD",
+    "VOICETEXT_DEEPGRAM_API_KEY_FD",
+    "VOICETEXT_ELEVENLABS_API_KEY_FD",
+];
+const SECRET_FILE_ENVS: [&str; 4] = [
+    BEARER_TOKEN_FILE_ENV,
+    POSTGRES_URL_FILE_ENV,
+    DEEPGRAM_API_KEY_FILE_ENV,
+    ELEVENLABS_API_KEY_FILE_ENV,
+];
 
-    fn required() -> HashMap<&'static str, String> {
-        HashMap::from([
-            (POSTGRES_URL_FILE_ENV, "/run/secrets/postgres-url".into()),
-            (BEARER_TOKEN_FILE_ENV, "/run/secrets/gateway-token".into()),
-            (SPOOL_DIRECTORY_ENV, "/var/lib/voicetext/spool".into()),
-        ])
+/// Explicit named-file or inherited capability source; never a proc-fd pathname.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SecretSource {
+    File(PathBuf),
+    Descriptor(i32),
+}
+
+fn parse_descriptor(value: &str, name: &'static str) -> Result<i32, ConfigError> {
+    let invalid = || ConfigError::InvalidValue { name };
+    if !cfg!(target_os = "linux") {
+        return Err(ConfigError::UnsupportedDescriptorPlatform);
     }
-
-    fn load(values: &HashMap<&'static str, String>) -> Result<GatewayConfig, ConfigError> {
-        GatewayConfig::from_lookup(|name| values.get(name).cloned())
+    if value.len() > 10 || value.starts_with('0') || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
     }
-
-    #[test]
-    fn defaults_are_secure_and_providers_are_optional() {
-        let config = load(&required()).unwrap();
-        assert_eq!(config.bind_address, "0.0.0.0:8080".parse().unwrap());
-        assert_eq!(config.finalize_timeout, Duration::from_secs(5));
-        assert_eq!(config.shutdown_drain_timeout, Duration::from_secs(245));
-        assert_eq!(config.max_connections, 128);
-        assert_eq!(config.max_upload_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.deepgram_api_key_file, None);
-        assert_eq!(config.elevenlabs_api_key_file, None);
-        assert_eq!(
-            config.provider_endpoints.deepgram_live,
-            DEFAULT_DEEPGRAM_LIVE_ENDPOINT
-        );
-        assert!(!config.allow_insecure_provider_endpoints);
-        assert_eq!(config.qualification_observation, None);
+    let fd: i32 = value.parse().map_err(|_| invalid())?;
+    if !(3..i32::MAX).contains(&fd) {
+        return Err(invalid());
     }
+    Ok(fd)
+}
 
-    #[test]
-    fn qualification_observation_is_explicit_and_paired() {
-        let mut values = required();
-        values.insert(QUALIFICATION_OBSERVATION_DIR_ENV, "/tmp/qualified".into());
-        assert_eq!(
-            load(&values),
-            Err(ConfigError::IncompleteQualificationObservation)
-        );
-        values.insert(QUALIFICATION_CAMPAIGN_ENV, "synthetic_2026-09-04".into());
-        let configured = load(&values).unwrap().qualification_observation.unwrap();
-        assert_eq!(configured.directory, PathBuf::from("/tmp/qualified"));
-        assert_eq!(configured.campaign, "synthetic_2026-09-04");
-        values.insert(QUALIFICATION_CAMPAIGN_ENV, "../escape".into());
-        assert!(load(&values).is_err());
-    }
-
-    #[test]
-    fn accepts_bounded_overrides_and_absolute_provider_secret_paths() {
-        let mut values = required();
-        values.extend([
-            (BIND_ADDRESS_ENV, "127.0.0.1:9080".into()),
-            (DEEPGRAM_API_KEY_FILE_ENV, "/run/secrets/deepgram".into()),
-            (
-                ELEVENLABS_API_KEY_FILE_ENV,
-                "/run/secrets/elevenlabs".into(),
-            ),
-            (FINALIZE_TIMEOUT_ENV, "750".into()),
-            (SHUTDOWN_DRAIN_TIMEOUT_ENV, "120000".into()),
-            (MAX_CONNECTIONS_ENV, "32".into()),
-            (MAX_UPLOAD_BYTES_ENV, (2 * 1024 * 1024).to_string()),
-        ]);
-        let config = load(&values).unwrap();
-        assert_eq!(config.bind_address, "127.0.0.1:9080".parse().unwrap());
-        assert_eq!(config.finalize_timeout, Duration::from_millis(750));
-        assert_eq!(config.shutdown_drain_timeout, Duration::from_mins(2));
-        assert_eq!(config.max_connections, 32);
-        assert_eq!(config.max_upload_bytes, 2 * 1024 * 1024);
-        assert_eq!(
-            config.deepgram_api_key_file,
-            Some(PathBuf::from("/run/secrets/deepgram"))
-        );
-    }
-
-    #[test]
-    fn requires_absolute_non_control_paths_without_reading_them() {
-        let mut missing = required();
-        missing.remove(POSTGRES_URL_FILE_ENV);
-        assert_eq!(
-            load(&missing),
-            Err(ConfigError::Missing {
-                name: POSTGRES_URL_FILE_ENV
-            })
-        );
-
-        for rejected in ["relative/secret", "/run/secrets/key\n"] {
-            let mut values = required();
-            values.insert(BEARER_TOKEN_FILE_ENV, rejected.into());
-            assert!(load(&values).is_err());
-        }
-    }
-
-    #[test]
-    fn plaintext_provider_endpoints_need_explicit_test_escape_hatch() {
-        let mut values = required();
-        values.insert(
-            DEEPGRAM_BATCH_ENDPOINT_ENV,
-            "http://127.0.0.1:8090/v1/listen".into(),
-        );
-        assert_eq!(
-            load(&values),
-            Err(ConfigError::InvalidEndpoint {
-                name: DEEPGRAM_BATCH_ENDPOINT_ENV
-            })
-        );
-
-        values.insert(ALLOW_INSECURE_ENDPOINTS_ENV, "true".into());
-        values.insert(
-            DEEPGRAM_LIVE_ENDPOINT_ENV,
-            "ws://127.0.0.1:8091/v1/listen".into(),
-        );
-        let config = load(&values).unwrap();
-        assert!(config.allow_insecure_provider_endpoints);
-    }
-
-    #[test]
-    fn rejects_wrong_schemes_credentials_and_invalid_bounds() {
-        for (name, value) in [
-            (DEEPGRAM_BATCH_ENDPOINT_ENV, "wss://api.example.test/path"),
-            (DEEPGRAM_LIVE_ENDPOINT_ENV, "https://api.example.test/path"),
-            (
-                ELEVENLABS_BATCH_ENDPOINT_ENV,
-                "https://user:password@api.example.test/path",
-            ),
-        ] {
-            let mut values = required();
-            values.insert(name, value.into());
-            assert!(load(&values).is_err());
-        }
-
-        for (name, value) in [
-            (FINALIZE_TIMEOUT_ENV, "249"),
-            (SHUTDOWN_DRAIN_TIMEOUT_ENV, "999"),
-            (MAX_CONNECTIONS_ENV, "0"),
-            (MAX_UPLOAD_BYTES_ENV, "67108865"),
-        ] {
-            let mut values = required();
-            values.insert(name, value.into());
-            assert!(matches!(load(&values), Err(ConfigError::OutOfRange { .. })));
-        }
-    }
-
-    #[test]
-    fn errors_never_echo_rejected_values() {
-        let mut values = required();
-        let rejected = "relative-super-secret-location";
-        values.insert(POSTGRES_URL_FILE_ENV, rejected.into());
-        let rendered = load(&values).unwrap_err().to_string();
-        assert!(!rendered.contains(rejected));
-
-        values.insert(POSTGRES_URL_FILE_ENV, "/run/secrets/postgres".into());
-        let endpoint_secret = "https://user:password@api.example.test/path";
-        values.insert(DEEPGRAM_BATCH_ENDPOINT_ENV, endpoint_secret.into());
-        let rendered = load(&values).unwrap_err().to_string();
-        assert!(!rendered.contains(endpoint_secret));
+fn secret_source(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    slot: usize,
+) -> Result<Option<SecretSource>, ConfigError> {
+    let file = optional_path(lookup, SECRET_FILE_ENVS[slot])?;
+    let fd = optional(lookup, SECRET_FD_ENVS[slot])?;
+    match (file, fd) {
+        (Some(_), Some(_)) => Err(ConfigError::InvalidValue {
+            name: SECRET_FD_ENVS[slot],
+        }),
+        (Some(path), None) => Ok(Some(SecretSource::File(path))),
+        (None, Some(value)) => Ok(Some(SecretSource::Descriptor(parse_descriptor(
+            &value,
+            SECRET_FD_ENVS[slot],
+        )?))),
+        (None, None) => Ok(None),
     }
 }
