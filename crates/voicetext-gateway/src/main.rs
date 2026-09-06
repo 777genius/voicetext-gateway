@@ -486,9 +486,9 @@ mod database_pool_composition {
         // Hold the polling connection while the execution acquisition is actually polled.
         // With the previous maximum of 10, this tries a second connection and receives
         // PostgreSQL SQLSTATE 53300 instead of waiting for the polling lease.
-        let mut poll = pool.acquire().await.unwrap();
+        let mut held_lease = pool.acquire().await.unwrap();
         let poll_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *poll)
+            .fetch_one(&mut *held_lease)
             .await
             .unwrap();
         let execution = pool.acquire();
@@ -498,7 +498,7 @@ mod database_pool_composition {
                 .await
                 .is_err()
         );
-        drop(poll);
+        drop(held_lease);
         let mut execution = tokio::time::timeout(Duration::from_secs(2), execution)
             .await
             .unwrap()
