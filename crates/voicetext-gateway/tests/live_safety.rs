@@ -351,7 +351,11 @@ async fn provider_error_and_queued_client_frames_emit_one_protocol_terminal() {
                     Some("error" | "finalize_complete")
                 ));
             }
-            None | Some(Err(_) | Ok(Message::Close(_))) => break,
+            Some(Ok(Message::Close(frame))) => {
+                assert!(frame.is_none_or(|frame| u16::from(frame.code) != 1000));
+                break;
+            }
+            None | Some(Err(_)) => break,
             Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_))) => {}
             Some(Ok(Message::Frame(_))) => unreachable!("raw frame is not exposed by tungstenite"),
         }
@@ -433,3 +437,5 @@ async fn close_stall_is_cancelled_at_the_gateway_bound() {
     drop(socket);
     gateway.stop().await;
 }
+
+mod terminal_close;

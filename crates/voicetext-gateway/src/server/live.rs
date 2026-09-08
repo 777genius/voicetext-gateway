@@ -15,7 +15,7 @@ use crate::contracts::live::{
 };
 use crate::contracts::live_outbound::{OutboundServerMessage, serialize_server_message};
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::http::HeaderMap;
 use axum::response::Response;
 use std::time::Duration;
@@ -54,13 +54,12 @@ pub(crate) async fn upgrade(
             run(socket, state).await;
         }))
 }
-
 async fn run(mut socket: WebSocket, state: GatewayState) {
     let mut opened = match prepare_session(&mut socket, &state).await {
         Ok(opened) => opened,
         Err(error) => {
             fail_socket(&mut socket, error, state.metrics()).await;
-            close_socket(&mut socket).await;
+            close_socket(&mut socket, false).await;
             return;
         }
     };
@@ -72,7 +71,7 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
             opened.profile.clone(),
         )
     });
-    let terminal_status = if send_message(
+    let (terminal_status, successful) = if send_message(
         &mut socket,
         OutboundServerMessage::Ready {
             session_id: gateway_session_id,
@@ -83,7 +82,7 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
     .is_err()
     {
         state.metrics().live_failure();
-        "ready_delivery_failed".to_owned()
+        ("ready_delivery_failed".to_owned(), false)
     } else {
         stream(&mut socket, &state, &mut opened, observation.as_mut()).await
     };
@@ -108,9 +107,8 @@ async fn run(mut socket: WebSocket, state: GatewayState) {
         }
     }
     close_coordinator(&mut opened.coordinator).await;
-    close_socket(&mut socket).await;
+    close_socket(&mut socket, successful).await;
 }
-
 async fn prepare_session(
     socket: &mut WebSocket,
     state: &GatewayState,
@@ -172,13 +170,12 @@ async fn prepare_session(
         coordinator,
     })
 }
-
 async fn stream(
     socket: &mut WebSocket,
     state: &GatewayState,
     opened: &mut OpenedSession,
     mut observation: Option<&mut LiveObservationTracker>,
-) -> String {
+) -> (String, bool) {
     let limits = state.limits();
     let session_deadline = Instant::now() + LIVE_SESSION_TIMEOUT;
     let mut idle_deadline = Instant::now() + LIVE_IDLE_TIMEOUT;
@@ -223,7 +220,7 @@ async fn stream(
         };
         match control {
             Ok(LoopControl::Continue) => {}
-            Ok(LoopControl::Close) => return "client_close".into(),
+            Ok(LoopControl::Close) => return ("client_close".into(), false),
             Ok(LoopControl::Finalize) => {
                 let finalized = finalize(
                     socket,
@@ -234,23 +231,27 @@ async fn stream(
                 )
                 .await;
                 match finalized {
-                    Ok(status) => return format!("finalize_{status:?}").to_ascii_lowercase(),
+                    Ok(status) => {
+                        return (
+                            format!("finalize_{status:?}").to_ascii_lowercase(),
+                            matches!(status, FinalizeStatus::Flushed | FinalizeStatus::NoProvider),
+                        );
+                    }
                     Err(error) => {
                         let terminal = error.code().to_owned();
                         fail_socket(socket, error, state.metrics()).await;
-                        return terminal;
+                        return (terminal, false);
                     }
                 }
             }
             Err(error) => {
                 let terminal = error.code().to_owned();
                 fail_socket(socket, error, state.metrics()).await;
-                return terminal;
+                return (terminal, false);
             }
         }
     }
 }
-
 async fn receive_config(
     socket: &mut WebSocket,
     maximum: usize,
@@ -269,7 +270,6 @@ async fn receive_config(
     }
     parse_client_config(&text).map_err(|_| SafeLiveError::InvalidConfig)
 }
-
 async fn handle_client_frame(
     received: Option<Result<Message, axum::Error>>,
     socket: &mut WebSocket,
@@ -334,7 +334,6 @@ async fn handle_client_frame(
         Message::Close(_) => Ok(LoopControl::Close),
     }
 }
-
 async fn write_audio_or_cancel(
     socket: &mut WebSocket,
     coordinator: &mut LiveCoordinator,
@@ -367,7 +366,6 @@ async fn write_audio_or_cancel(
         }
     }
 }
-
 fn decode_audio(
     decoder: &mut Option<DiscordOpusDecoder>,
     frame: &[u8],
@@ -381,7 +379,6 @@ fn decode_audio(
         None => Err(SafeLiveError::InvalidAudio),
     }
 }
-
 async fn handle_provider_event(
     received: Result<Option<LiveRecognitionEvent>, RecognitionFailure>,
     socket: &mut WebSocket,
@@ -404,7 +401,6 @@ async fn handle_provider_event(
         Ok(LoopControl::Continue)
     }
 }
-
 async fn finalize(
     socket: &mut WebSocket,
     coordinator: &mut LiveCoordinator,
@@ -485,7 +481,6 @@ async fn finalize(
     .await?;
     Ok(status)
 }
-
 async fn begin_finalize_or_cancel(
     socket: &mut WebSocket,
     coordinator: &mut LiveCoordinator,
@@ -506,7 +501,6 @@ async fn begin_finalize_or_cancel(
         () = sleep_until(deadline) => Err(SafeLiveError::ProviderOperationTimeout),
     }
 }
-
 async fn send_coordinator_event(
     socket: &mut WebSocket,
     event: LiveCoordinatorEvent,
@@ -518,7 +512,6 @@ async fn send_coordinator_event(
         LiveCoordinatorEvent::UtteranceEnd { .. } => Ok(()),
     }
 }
-
 fn transcript_message(transcript: LiveTranscript) -> OutboundServerMessage {
     let segment = TranscriptSegment {
         text: transcript.text,
@@ -532,7 +525,6 @@ fn transcript_message(transcript: LiveTranscript) -> OutboundServerMessage {
         LiveTranscriptStability::UtteranceFinal => OutboundServerMessage::Final(segment),
     }
 }
-
 async fn send_message(
     socket: &mut WebSocket,
     message: OutboundServerMessage,
@@ -547,15 +539,28 @@ async fn send_message(
     .map_err(|_| SafeLiveError::TransportClosed)?
     .map_err(|_| SafeLiveError::TransportClosed)
 }
-
 async fn close_coordinator(coordinator: &mut LiveCoordinator) {
     let _ = timeout(PROVIDER_CLOSE_TIMEOUT, coordinator.close()).await;
 }
-
-async fn close_socket(socket: &mut WebSocket) {
-    let _ = timeout(CLIENT_WRITE_TIMEOUT, socket.send(Message::Close(None))).await;
+async fn close_socket(socket: &mut WebSocket, successful: bool) {
+    // Only a delivered successful finalize earns normal closure. Keep failures distinct.
+    let frame = successful.then_some(CloseFrame {
+        code: close_code::NORMAL,
+        reason: "".into(),
+    });
+    let _ = timeout(CLIENT_WRITE_TIMEOUT, async {
+        socket.send(Message::Close(frame)).await?;
+        // Drive the server handshake until the peer replies; an unresponsive peer
+        // must not retain the session permit indefinitely.
+        while let Some(message) = socket.recv().await {
+            if matches!(message?, Message::Close(_)) {
+                break;
+            }
+        }
+        Ok::<(), axum::Error>(())
+    })
+    .await;
 }
-
 async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &GatewayMetrics) {
     metrics.live_failure();
     let _ = send_message(
@@ -567,19 +572,16 @@ async fn fail_socket(socket: &mut WebSocket, error: SafeLiveError, metrics: &Gat
     )
     .await;
 }
-
 fn observation_failure(state: &GatewayState, code: &'static str) {
     state.metrics().qualification_observation_failure();
     tracing::warn!(code, "qualification observation missing");
 }
-
 enum Raced {
     Client(Option<Result<Message, axum::Error>>),
     Provider(Result<Option<LiveRecognitionEvent>, RecognitionFailure>),
     IdleTimeout,
     SessionTimeout,
 }
-
 struct OpenedSession {
     identity: LiveIdentity,
     client_session_id: Uuid,
@@ -587,12 +589,10 @@ struct OpenedSession {
     decoder: Option<DiscordOpusDecoder>,
     coordinator: LiveCoordinator,
 }
-
 enum LoopControl {
     Continue,
     Finalize,
     Close,
 }
-
 #[cfg(test)]
 mod tests;
