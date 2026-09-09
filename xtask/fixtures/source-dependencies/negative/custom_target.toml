@@ -1,0 +1,6 @@
+[package]
+name = "demo"
+
+[[bin]]
+name = "hidden"
+path = "generated/hidden.rs"

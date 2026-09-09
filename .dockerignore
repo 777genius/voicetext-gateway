@@ -1,0 +1,8 @@
+.git
+.github
+.codex-tmp
+target
+**/secrets/*
+*.log
+.env
+.env.*

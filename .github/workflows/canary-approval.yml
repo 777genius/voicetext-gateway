@@ -1,0 +1,127 @@
+name: canary-approval
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag containing retained real-canary records
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character release source SHA
+        required: true
+        type: string
+      image_digest:
+        description: Exact sha256 quarantine image digest tested by the canary
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+  attestations: write
+  id-token: write
+
+jobs:
+  attest-approval:
+    runs-on: ubuntu-latest
+    environment: canary-approval
+    steps:
+      - name: Check out the exact candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          ref: ${{ inputs.source_sha }}
+
+      - name: Verify actual independent canary environment review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/verify-github-environment-review.py \
+            '${{ github.repository }}' canary-approval '${{ github.run_id }}' \
+            '${{ github.run_attempt }}' '${{ github.actor }}' '${{ github.actor_id }}'
+
+      - name: Validate immutable candidate identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          test "${{ github.workflow_sha }}" = "$SOURCE_SHA"
+          test "$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")" = "$SOURCE_SHA"
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          case "$SOURCE_SHA" in *[!0-9a-f]*|'') exit 1 ;; esac
+          test "${#SOURCE_SHA}" -eq 40
+          case "$IMAGE_DIGEST" in sha256:[0-9a-f]*) ;; *) exit 1 ;; esac
+          test "${#IMAGE_DIGEST}" -eq 71
+
+      - name: Download retained real-canary records
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          mkdir -p evidence/acceptance
+          gh release download "$RELEASE_TAG" --dir evidence/acceptance \
+            --pattern provider-canary.json \
+            --pattern campaign-manifest.json \
+            --pattern fixture-manifest.json
+          scripts/verify_json_record.py \
+            evidence/acceptance/provider-canary.json \
+            evidence/acceptance/campaign-manifest.json \
+            evidence/acceptance/fixture-manifest.json
+
+      - name: Create canonical protected-environment approval
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_DIGEST: ${{ inputs.image_digest }}
+          APPROVAL_WORKFLOW_REVISION: ${{ github.workflow_sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+        run: |
+          canary=evidence/acceptance/provider-canary.json
+          campaign=evidence/acceptance/campaign-manifest.json
+          fixtures=evidence/acceptance/fixture-manifest.json
+          test "$(jq -er .source_sha "$canary")" = "$SOURCE_SHA"
+          test "$(jq -er .image_digest "$canary")" = "$IMAGE_DIGEST"
+          test "$(jq -er .runner.identity "$canary")" = "$(jq -er .canary_runner.identity security/release-trust-policy.json)"
+          canary_sha=$(sha256sum "$canary" | cut -d' ' -f1)
+          campaign_sha=$(sha256sum "$campaign" | cut -d' ' -f1)
+          fixture_sha=$(sha256sum "$fixtures" | cut -d' ' -f1)
+          policy_sha=$(sha256sum security/release-trust-policy.json | cut -d' ' -f1)
+          approved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq -S -c -n \
+            --arg source "$SOURCE_SHA" --arg image "$IMAGE_DIGEST" \
+            --arg campaign_id "$(jq -er .campaign_id "$canary")" \
+            --argjson runner "$(jq -ec .runner "$canary")" \
+            --arg revision "$APPROVAL_WORKFLOW_REVISION" --arg run_id "$WORKFLOW_RUN_ID" \
+            --arg approved_at "$approved_at" --arg canary_sha "$canary_sha" \
+            --arg campaign_sha "$campaign_sha" --arg fixture_sha "$fixture_sha" \
+            --arg policy_sha "$policy_sha" '
+            {schema_version:1,source_sha:$source,image_digest:$image,campaign_id:$campaign_id,
+             decision:"approved",authorization:"github-environment-required-reviewer",
+             protected_environment:"canary-approval",approval_workflow_revision:$revision,
+             workflow_run_id:$run_id,approved_at:$approved_at,runner:$runner,
+             canary_payload_sha256:$canary_sha,campaign_manifest_sha256:$campaign_sha,
+             fixture_manifest_sha256:$fixture_sha,trust_policy_sha256:$policy_sha}' \
+            > evidence/acceptance/reviewer-approval.json
+          scripts/verify_release_acceptance.py "$SOURCE_SHA" "$IMAGE_DIGEST" evidence
+
+      - name: Attest approval with GitHub OIDC identity
+        id: approval-attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: evidence/acceptance/reviewer-approval.json
+
+      - name: Attach authenticated approval without overwriting existing evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          BUNDLE_PATH: ${{ steps.approval-attestation.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" evidence/acceptance/reviewer-approval.sigstore.json
+          scripts/verify_json_record.py evidence/acceptance/reviewer-approval.sigstore.json
+          gh release upload "$RELEASE_TAG" \
+            evidence/acceptance/reviewer-approval.json \
+            evidence/acceptance/reviewer-approval.sigstore.json

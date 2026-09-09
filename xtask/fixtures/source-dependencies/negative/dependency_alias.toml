@@ -1,0 +1,5 @@
+[package]
+name = "demo"
+
+[dependencies]
+alias = { package = "first-party", path = "../first-party" }

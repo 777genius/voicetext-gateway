@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic 64-hex idempotency fixture committed before secret scanning"
+condition = "AND"
+commits = ["1d8ed514e458e86b82e5719a4e2acd62115aee09"]
